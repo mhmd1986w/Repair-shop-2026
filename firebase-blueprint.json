@@ -1,0 +1,91 @@
+{
+  "entities": {
+    "order": {
+      "title": "MaintenanceOrder",
+      "description": "Represents a maintenance/repair order for a device.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "customerName": { "type": "string" },
+        "customerPhone": { "type": "string" },
+        "deviceType": { "type": "string" },
+        "brandModel": { "type": "string" },
+        "serialNumber": { "type": "string" },
+        "faultDescription": { "type": "string" },
+        "estimatedCost": { "type": "number" },
+        "actualCost": { "type": "number" },
+        "expectedDeliveryDate": { "type": "string" },
+        "status": { "type": "string" },
+        "notes": { "type": "string" },
+        "technician": { "type": "string" },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" },
+        "statusHistory": { "type": "array" },
+        "deviceBarcode": { "type": "string" },
+        "deliveryInfo": { "type": "object" }
+      },
+      "required": ["id", "customerName", "customerPhone", "deviceType", "brandModel", "status", "createdAt", "updatedAt"]
+    },
+    "notification_log": {
+      "title": "NotificationLog",
+      "description": "Represents a log of notifications sent to the user.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "orderId": { "type": "string" },
+        "customerName": { "type": "string" },
+        "customerPhone": { "type": "string" },
+        "type": { "type": "string" },
+        "content": { "type": "string" },
+        "status": { "type": "string" },
+        "timestamp": { "type": "number" },
+        "triggerEvent": { "type": "string" }
+      },
+      "required": ["id", "orderId", "customerName", "customerPhone", "type", "content", "status", "timestamp"]
+    },
+    "app_setting": {
+      "title": "AppSetting",
+      "description": "Represents the comprehensive settings and configurations of the application.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "settings": { "type": "object" },
+        "templates": { "type": "array" },
+        "users": { "type": "array" },
+        "printers": { "type": "array" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["id", "settings", "updatedAt"]
+    },
+    "user_profile": {
+      "title": "UserProfile",
+      "description": "User profile information.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "displayName": { "type": "string" },
+        "email": { "type": "string" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["userId"]
+    }
+  },
+  "firestore": {
+    "users/{userId}": {
+      "schema": "user_profile",
+      "description": "Root document for each isolated user account."
+    },
+    "users/{userId}/orders/{orderId}": {
+      "schema": "order",
+      "description": "Subcollection of maintenance/repair orders strictly isolated per user."
+    },
+    "users/{userId}/notification_logs/{logId}": {
+      "schema": "notification_log",
+      "description": "Subcollection of notification logs strictly isolated per user."
+    },
+    "users/{userId}/app_settings/{settingId}": {
+      "schema": "app_setting",
+      "description": "Subcollection of application settings strictly isolated per user."
+    }
+  }
+}

@@ -1,0 +1,301 @@
+            {!canAdd ? "إضافة طلب (غير مصرح)" : "إضافة طلب صيانة جديد"}
+          </button>
+          
+
+
+
+        </div>
+      </div>
+
+
+
+      {/* Complete Maintenance Details Panel & Controls (Moved to Top of Table) */}
+      {selectedOrder ? (
+        <div className="bg-white rounded-3xl border border-gray-100 shadow-md p-6 space-y-6 animate-in fade-in slide-in-from-top-4 duration-200">
+          
+          {/* Header Row: Order ID, customer, device and quick actions */}
+          <div className="border-b border-gray-100 pb-4 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="font-mono text-xs text-teal-600 font-extrabold bg-teal-50 px-2.5 py-1 rounded-lg border border-teal-100">{selectedOrder.id}</span>
+                {getStatusBadge(selectedOrder.status)}
+              </div>
+              <h3 className="font-sans text-gray-900 font-extrabold text-base md:text-lg mt-1">
+                تفاصيل طلب الصيانة: {selectedOrder.customerName}
+              </h3>
+              <p className="text-xs text-gray-400 font-sans">
+                جهاز {selectedOrder.deviceType} • <strong>{selectedOrder.brandModel}</strong>
+              </p>
+            </div>
+            
+            {/* Quick Action Buttons */}
+            <div className="flex flex-wrap items-center gap-1.5 w-full sm:w-auto justify-start sm:justify-end">
+              <button
+                onClick={() => handleOpenEditModal(selectedOrder)}
+                disabled={!canEdit}
+                className="text-gray-600 hover:text-gray-950 disabled:opacity-40 disabled:cursor-not-allowed px-3 py-2 bg-gray-50 hover:bg-gray-100 border border-gray-200/60 rounded-xl text-xs font-sans font-bold transition-colors flex items-center gap-1 active:scale-95 duration-100"
+                title={!canEdit ? "عذراً، ليس لديك صلاحية لتعديل الطلب" : "تعديل بيانات العميل أو الجهاز"}
+              >
+                تعديل البيانات
+              </button>
+              <button
+                onClick={() => setShowSimplePrintLabel(selectedOrder)}
+                className="text-gray-700 hover:text-gray-950 px-3 py-2 bg-gray-50 hover:bg-gray-100 border border-gray-200/60 rounded-xl text-xs transition-all flex items-center gap-1 font-sans font-bold active:scale-95 duration-100"
+                title="طباعة ملصق لاصق مبسط للسيريال للجهاز"
+              >
+                <Printer className="w-4 h-4" />
+                <span>طباعة ملصق</span>
+              </button>
+              <button
+                onClick={() => setShowPrintLabel(selectedOrder)}
+                className="text-gray-700 hover:text-gray-950 px-3 py-2 bg-gray-50 hover:bg-gray-100 border border-gray-200/60 rounded-xl text-xs transition-all flex items-center gap-1 font-sans font-bold active:scale-95 duration-100"
+                title="عرض ملصق الباركود الحراري للرف والتعريف (مخصص)"
+              >
+                <Printer className="w-4 h-4 text-teal-600" />
+                <span>ملصق مخصص</span>
+              </button>
+              <button
+                onClick={() => setShowCustomerTicket(selectedOrder)}
+                className="text-teal-700 hover:text-teal-900 px-3 py-2 bg-teal-50 hover:bg-teal-100 border border-teal-200/60 rounded-xl text-xs transition-all flex items-center gap-1 font-sans font-bold active:scale-95 duration-100"
+                title="طباعة إيصال استلام العميل"
+              >
+                <FileText className="w-4 h-4" />
+                <span>إيصال العميل</span>
+              </button>
+              <button
+                onClick={() => handleDeleteClick(selectedOrder.id)}
+                className="text-rose-600 hover:text-rose-800 p-2.5 bg-rose-50 hover:bg-rose-100 rounded-xl transition-all active:scale-95 duration-100"
+                title="حذف طلب الصيانة نهائياً"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+              <button
+                onClick={() => setSelectedOrder(null)}
+                className="text-gray-400 hover:text-gray-600 p-2 bg-gray-50 hover:bg-gray-100 rounded-xl transition-all border border-gray-200/40 mr-1"
+                title="إغلاق لوحة التفاصيل"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          {/* 3-Column Content Layout */}
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
+            
+            {/* Column 1: Core Maintenance Details Card & Real Delivery info */}
+            <div className="space-y-4">
+              <div className="bg-gray-50/50 p-4 rounded-2xl border border-gray-100/80 space-y-3">
+                <h4 className="font-sans font-extrabold text-gray-800 text-xs border-b border-gray-200/60 pb-2">📋 بيانات بطاقة الصيانة</h4>
+                <div className="space-y-2 text-xs font-sans text-gray-600">
+                  <div className="flex justify-between items-center">
+                    <span>الهاتف:</span>
+                    <strong className="text-gray-900 font-mono text-sm">{selectedOrder.customerPhone}</strong>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span>الرقم التسلسلي (S/N):</span>
+                    <strong className="text-gray-800 font-mono text-[10px] bg-white px-2 py-0.5 rounded border border-gray-200/50">{selectedOrder.serialNumber || 'غير متوفر'}</strong>
+                  </div>
+                  <div className="flex justify-between items-start gap-4">
+                    <span>المشكلة/العطل:</span>
+                    <strong className="text-gray-900 text-left bg-white px-2 py-0.5 rounded border border-gray-200/50 max-w-[180px] break-words">{selectedOrder.faultDescription}</strong>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span>التكلفة المتوقعة:</span>
+                    <strong className="text-gray-950 font-bold">{selectedOrder.estimatedCost} {selectedOrder.currency || currencyName}</strong>
+                  </div>
+                  {selectedOrder.actualCost !== undefined && (
+                    <div className="flex justify-between border-t border-gray-100 pt-1.5 text-emerald-800 font-bold">
+                      <span>التكلفة النهائية:</span>
+                      <span className="text-emerald-700 font-extrabold">{selectedOrder.actualCost} {selectedOrder.currency || currencyName}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between items-center">
+                    <span>الفني المسؤول:</span>
+                    <strong className="text-gray-800 bg-white px-2 py-0.5 rounded border border-gray-200/50">{selectedOrder.technician}</strong>
+                  </div>
+                </div>
+              </div>
+
+              {/* Real Delivery summary info if DELIVERED */}
+              {selectedOrder.status === DeviceStatus.DELIVERED && selectedOrder.deliveryInfo && (
+                <div className="bg-emerald-50 border border-emerald-100 p-4 rounded-2xl text-xs font-sans text-emerald-900 space-y-1.5 animate-in slide-in-from-top-2">
+                  <h5 className="font-extrabold text-emerald-950 flex items-center gap-1 border-b border-emerald-200/60 pb-1.5">
+                    <span>🎁 تم الاستلام الفعلي بنجاح</span>
+                  </h5>
+                  <p>المستلم: <strong>{selectedOrder.deliveryInfo.recipientName}</strong></p>
+                  <p>صلة القرابة: <strong>{selectedOrder.deliveryInfo.relationToCustomer}</strong></p>
+                  <p>تاريخ التسليم: <span className="font-mono">{new Date(selectedOrder.deliveryInfo.deliveryDate).toLocaleString('ar-SA')}</span></p>
+                </div>
+              )}
+            </div>
+
+            {/* Column 2: Status updates and Notes workflow */}
+            <div className="space-y-4">
+              <div className="bg-gray-50/50 p-4 rounded-2xl border border-gray-100/80 space-y-3">
+                <h4 className="font-sans font-extrabold text-gray-800 text-xs border-b border-gray-200/60 pb-2 flex items-center gap-1">
+                  <Wrench className="w-3.5 h-3.5 text-teal-600" />
+                  تحديث مرحلة الإصلاح وحالة الجهاز:
+                </h4>
+                
+                {/* Custom text note for state history logs */}
+                <input
+                  type="text"
+                  placeholder={!canEdit ? "ليس لديك صلاحية لتعديل حالة الجهاز" : "ملاحظة التعديل (اختياري، مثلاً: بانتظار الشاشة من المورد)"}
+                  value={statusNote}
+                  disabled={!canEdit}
+                  onChange={(e) => setStatusNote(e.target.value)}
+                  className="w-full bg-white border border-gray-200 rounded-xl py-2 px-3 text-xs font-sans focus:outline-none focus:ring-1 focus:ring-teal-500 disabled:opacity-50 disabled:cursor-not-allowed text-gray-800 placeholder-gray-400"
+                />
+
+                <div className="grid grid-cols-2 gap-1.5 pt-1">
+                  {Object.values(DeviceStatus).map((status) => (
+                    <button
+                      key={status}
+                      onClick={() => handleStatusChange(status)}
+                      disabled={selectedOrder.status === status || !canEdit}
+                      className={`py-2 px-1 text-[10px] md:text-xs font-sans font-bold rounded-xl border transition-all ${
+                        selectedOrder.status === status
+                          ? 'bg-teal-600 text-white border-teal-700 shadow-sm'
+                          : 'bg-white hover:bg-gray-100 text-gray-750 border-gray-200 disabled:opacity-40 disabled:cursor-not-allowed'
+                      }`}
+                    >
+                      {status === DeviceStatus.RECEIVED && 'تم الاستلام'}
+                      {status === DeviceStatus.DIAGNOSING && 'تحت الفحص'}
+                      {status === DeviceStatus.REPAIRING && 'تحت الإصلاح'}
+                      {status === DeviceStatus.PENDING && 'قيد الانتظار ⏳'}
+                      {status === DeviceStatus.READY && 'جاهز للتسليم 🎉'}
+                      {status === DeviceStatus.DELIVERED && 'تسليم العميل ✅'}
+                      {status === DeviceStatus.UNREPAIRABLE && 'تعذر الإصلاح'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Column 3: Instant WhatsApp triggers & Past devices history */}
+            <div className="space-y-4">
+              {/* WhatsApp direct notifications */}
+              <div className="bg-gray-50/50 p-4 rounded-2xl border border-gray-100/80 space-y-2.5">
+                <h4 className="font-sans font-extrabold text-gray-800 text-xs border-b border-gray-200/60 pb-2 flex items-center gap-1">
+                  <MessageSquare className="w-3.5 h-3.5 text-emerald-600" />
+                  إرسال إشعار فوري عبر الواتساب:
+                </h4>
+                
+                <div className="grid grid-cols-1 gap-1.5">
+                  <button
+                    onClick={() => triggerDirectWhatsApp('received')}
+                    className="py-2 px-3 bg-white hover:bg-teal-50 border border-gray-200/70 hover:border-teal-300 rounded-xl text-right text-[11px] font-sans font-bold text-gray-700 transition-colors flex items-center justify-between"
+                  >
+                    <span>📱 إرسال تأكيد الاستلام المباشر</span>
+                    <Send className="w-3 h-3 text-emerald-600" />
+                  </button>
+                  <button
+                    onClick={() => triggerDirectWhatsApp('ready')}
+                    className="py-2 px-3 bg-white hover:bg-emerald-50 border border-gray-200/70 hover:border-emerald-300 rounded-xl text-right text-[11px] font-sans font-bold text-gray-700 transition-colors flex items-center justify-between"
+                  >
+                    <span>🎉 إرسال جاهزية الجهاز للتسليم</span>
+                    <Send className="w-3 h-3 text-emerald-600" />
+                  </button>
+                  <button
+                    onClick={() => triggerDirectWhatsApp('reminder')}
+                    className="py-2 px-3 bg-white hover:bg-amber-50 border border-gray-200/70 hover:border-amber-300 rounded-xl text-right text-[11px] font-sans font-bold text-gray-700 transition-colors flex items-center justify-between"
+                  >
+                    <span>⏰ إرسال تذكير بموعد التسليم</span>
+                    <Send className="w-3 h-3 text-emerald-600" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Past Repair history inside the dashboard details panel */}
+              <div className="bg-gray-50/55 p-4 rounded-2xl border border-gray-100/80 space-y-2">
+                <h4 className="font-sans font-extrabold text-gray-800 text-xs border-b border-gray-200/60 pb-2 flex items-center gap-1.5">
+                  <History className="w-3.5 h-3.5 text-teal-600" />
+                  سجل الأجهزة السابقة للعميل ({selectedCustomerHistory.length}):
+                </h4>
+                
+                {selectedCustomerHistory.length === 0 ? (
+                  <p className="text-gray-400 text-[10px] bg-white p-2.5 rounded-xl text-center border border-gray-100/50">
+                    هذا هو أول جهاز صيانة مسجل لهذا العميل في النظام.
+                  </p>
+                ) : (
+                  <div className="space-y-1.5 max-h-32 overflow-y-auto pr-1">
+                    {selectedCustomerHistory.map((pastOrder) => (
+                      <div 
+                        key={pastOrder.id}
+                        onClick={() => {
+                          setSelectedOrder(pastOrder);
+                          setStatusNote(''); // Reset update note
+                        }}
+                        className="p-2 bg-white hover:bg-teal-50/40 border border-gray-100 hover:border-teal-100 rounded-xl transition-all cursor-pointer text-[10px] font-sans flex flex-col gap-0.5 text-right"
+                        title="اضغط للذهاب وتفحص هذا الطلب"
+                      >
+                        <div className="flex justify-between items-center">
+                          <span className="font-mono font-bold text-teal-600 bg-gray-50 px-1.5 py-0.5 rounded text-[9px]">
+                            {pastOrder.id}
+                          </span>
+                          <span className="scale-90 origin-left">
+                            {getStatusBadge(pastOrder.status)}
+                          </span>
+                        </div>
+                        <div className="font-bold text-gray-800 text-[10px]">
+                          جهاز {pastOrder.deviceType} • {pastOrder.brandModel}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+          </div>
+
+        </div>
+      ) : (
+        <div className="bg-teal-50/35 border border-dashed border-teal-200/70 rounded-3xl p-5 text-center text-teal-900 text-xs font-sans animate-pulse">
+          💡 <strong>معلومة:</strong> اضغط على أي طلب صيانة في الجدول بالأسفل لعرض تفاصيله الكاملة، تحديث حالته، طباعة ملصق التتبع والحراري، أو إرسال تأكيد الواتساب مباشرة هنا في الأعلى!
+        </div>
+      )}
+
+      {/* Main filters and list container (Occupies full-width now!) */}
+      <div className="space-y-4">
+        
+        {/* Filters card */}
+        <div className="bg-white rounded-3xl border border-gray-100 p-4 shadow-sm flex flex-col md:flex-row gap-4 items-center">
+          
+          {/* Search Input */}
+          <div className="relative w-full md:flex-1">
+            <input
+              type="text"
+              placeholder="ابحث باسم العميل، الهاتف، الموديل أو رقم الطلب..."
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="w-full bg-gray-50 border border-gray-200 rounded-2xl py-3 px-4 pr-11 text-xs font-sans focus:outline-none focus:ring-2 focus:ring-teal-500 focus:bg-white text-gray-800"
+            />
+            <Search className="absolute right-4 top-3.5 text-gray-400 w-4 h-4" />
+          </div>
+
+          {/* Status dropdown filter */}
+          <div className="flex items-center gap-2 w-full md:w-auto shrink-0">
+            <Filter className="w-4 h-4 text-gray-400" />
+            <select
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value)}
+              className="flex-1 md:flex-initial bg-gray-50 border border-gray-200 rounded-2xl py-2.5 px-4 text-xs font-sans text-gray-700 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:bg-white"
+            >
+              <option value="all">كل حالات الأجهزة</option>
+              <option value={DeviceStatus.RECEIVED}>تم الاستلام</option>
+              <option value={DeviceStatus.DIAGNOSING}>تحت الفحص</option>
+              <option value={DeviceStatus.REPAIRING}>تحت الإصلاح</option>
+              <option value={DeviceStatus.PENDING}>قيد الانتظار</option>
+              <option value={DeviceStatus.READY}>جاهز للتسليم</option>
+              <option value={DeviceStatus.DELIVERED}>تم التسليم بنجاح</option>
+              <option value={DeviceStatus.UNREPAIRABLE}>غير قابل للإصلاح</option>
+            </select>
+
+            <select
+              value={deviceFilter}
+              onChange={(e) => setDeviceFilter(e.target.value)}
+              className="flex-1 md:flex-initial bg-gray-50 border border-gray-200 rounded-2xl py-2.5 px-4 text-xs font-sans text-gray-700 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:bg-white"
+            >
+              <option value="all">كل أنواع الأجهزة</option>
+              {uniqueDevices.map(device => (

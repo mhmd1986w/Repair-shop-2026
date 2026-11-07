@@ -1,0 +1,333 @@
+  const handlePrintLabelThermal = (order: MaintenanceOrder) => {
+    const mainCenterName = localStorage.getItem('centerName') || 'TECHNO';
+    const centerMobile = localStorage.getItem('centerMobile') || '962790000000';
+
+    // Custom Label Settings - Dynamic values from states
+    const lblCenterNameText = mainCenterName;
+    const lblMobileText = centerMobile;
+    const lblSize = lblPaperSize || '50x30';
+    const lblOrientation: string = 'landscape';
+
+    // Advanced Label Settings - Load calibration offsets from localStorage
+    const lblCustomText = '';
+    const lblFontSizeDetails = '7.5';
+    const lblFontSizeCustomText = '7';
+    const savedAlign = localStorage.getItem('lblAlign') || '50';
+    const numAlign = isNaN(Number(savedAlign)) ? (savedAlign === 'left' ? 0 : savedAlign === 'right' ? 100 : 50) : Number(savedAlign);
+    const lblAlign: string = numAlign < 35 ? 'left' : numAlign > 65 ? 'right' : 'center';
+
+    const savedVerticalAlign = localStorage.getItem('lblVerticalAlign') || '50';
+    const numVerticalAlign = isNaN(Number(savedVerticalAlign)) ? (savedVerticalAlign === 'start' || savedVerticalAlign === 'top' ? 0 : savedVerticalAlign === 'end' || savedVerticalAlign === 'bottom' ? 100 : 50) : Number(savedVerticalAlign);
+    const lblVerticalAlign: string = numVerticalAlign < 35 ? 'start' : numVerticalAlign > 65 ? 'end' : 'center';
+    const lblZoom = '100';
+
+    // Label dimensions mapping dynamically parsed based on selected size and orientation
+    const dims = lblSize.split('x');
+    const widthVal = dims[0] ? parseFloat(dims[0]) : 30;
+    const heightVal = dims[1] ? parseFloat(dims[1]) : 20;
+
+    const widthLabel = lblOrientation === 'portrait' ? `${heightVal}mm` : `${widthVal}mm`;
+    const heightLabel = lblOrientation === 'portrait' ? `${widthVal}mm` : `${heightVal}mm`;
+
+let barcodeBase64 = '';
+    if (lblShowBarcode) {
+      try {
+        const canvas = document.createElement('canvas');
+        JsBarcode(canvas, order.id, {
+          width: 2,
+          height: 45,
+          displayValue: true,
+          margin: 2,
+          background: '#ffffff',
+          lineColor: '#000000',
+          fontSize: 14,
+          fontOptions: "bold"
+        });
+        barcodeBase64 = canvas.toDataURL('image/png');
+      } catch (err) {
+        console.error('Barcode generation error', err);
+      }
+    }
+    const printWindow = window.open('', '_blank', 'width=350,height=250');
+    if (!printWindow) {
+      alert("يرجى تفعيل السماح للنوافذ المنبثقة (Popups) أو فتح التطبيق في متصفح خارجي/نافذة جديدة للطباعة.");
+      return;
+    }
+
+    const orderDate = order.createdAt ? new Date(order.createdAt).toLocaleDateString('ar-SA') : new Date().toLocaleDateString('ar-SA');
+    const showDetails = lblShowCustomerName || lblShowDeviceModel || lblShowDate;
+    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(`${window.location.origin}?track=${order.id}`)}`;
+
+    printWindow.document.write(`
+      <!DOCTYPE html>
+      <html dir="rtl" lang="ar">
+        <head>
+          <meta charset="utf-8">
+          <title>${lblCenterNameText} - ملصق باركود</title>
+          <style>
+            @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@700;800;900&display=swap');
+            @page {
+              size: ${widthLabel} ${heightLabel};
+              margin: 0 !important;
+            }
+            html, body {
+              margin: 0 !important;
+              padding: 0 !important;
+              width: ${widthLabel} !important;
+              height: ${heightLabel} !important;
+              box-sizing: border-box !important;
+              background-color: white !important;
+              color: black !important;
+              font-family: 'Cairo', system-ui, -apple-system, sans-serif !important;
+              text-align: center !important;
+              -webkit-print-color-adjust: exact !important;
+              print-color-adjust: exact !important;
+              display: block !important;
+            }
+            .label-wrapper-outer {
+              width: 100% !important;
+              height: 100% !important;
+              max-width: ${widthLabel} !important;
+              max-height: ${heightLabel} !important;
+              display: flex !important;
+              flex-direction: column !important;
+              box-sizing: border-box !important;
+              text-align: center !important;
+              align-items: center !important;
+              justify-content: center !important;
+              gap: ${lblLineSpacing * 0.1}mm !important;
+              padding: ${Math.max(0.15, lblLineSpacing * 0.25)}mm ${Math.max(0.3, lblLineSpacing * 0.35)}mm !important;
+              margin: 0 auto !important;
+              transform: scale(${parseFloat(lblZoom) / 100}) translate(${((numAlign - 50) * 0.2).toFixed(2)}mm, ${((numVerticalAlign - 50) * 0.15).toFixed(2)}mm) !important;
+              transform-origin: center center !important;
+            }
+            .header-container {
+              width: 100% !important;
+              display: flex !important;
+              flex-direction: column !important;
+              align-items: center !important;
+              justify-content: center !important;
+              line-height: ${1 + lblLineSpacing * 0.02} !important;
+              box-sizing: border-box !important;
+              gap: ${lblLineSpacing * 0.05}mm !important;
+            }
+            .center-name {
+              font-size: ${lblFontSizeCenterName}pt !important;
+              font-weight: 900 !important;
+              white-space: nowrap !important;
+              overflow: hidden !important;
+              text-overflow: ellipsis !important;
+              width: 100% !important;
+              color: black !important;
+              display: block !important;
+              visibility: visible !important;
+              text-align: center !important;
+            }
+            .center-mobile {
+              font-size: ${lblFontSizeMobile}pt !important;
+              font-weight: 800 !important;
+              white-space: nowrap !important;
+              overflow: hidden !important;
+              text-overflow: ellipsis !important;
+              width: 100% !important;
+              color: black !important;
+              display: ${lblShowMobile ? 'block !important' : 'none !important'};
+              visibility: ${lblShowMobile ? 'visible !important' : 'hidden !important'};
+              margin-top: ${lblLineSpacing * 0.02}mm !important;
+              text-align: center !important;
+            }
+            .details-container {
+              width: 100% !important;
+              display: flex !important;
+              flex-direction: column !important;
+              align-items: center !important;
+              justify-content: center !important;
+              border-top: 0.15mm dashed black !important;
+              border-bottom: 0.15mm dashed black !important;
+              padding: ${lblLineSpacing * 0.1}mm 0 !important;
+              margin: ${lblLineSpacing * 0.1}mm 0 !important;
+              box-sizing: border-box !important;
+              font-size: ${lblFontSizeDetails}pt !important;
+              line-height: ${1 + lblLineSpacing * 0.03} !important;
+              color: black !important;
+              font-weight: bold !important;
+              text-align: center !important;
+            }
+            .qr-container {
+              width: 100% !important;
+              display: flex !important;
+              justify-content: center !important;
+              align-items: center !important;
+              box-sizing: border-box !important;
+              overflow: hidden !important;
+              margin-top: ${lblLineSpacing * 0.05}mm !important;
+            }
+            .qr-container img {
+              display: block !important;
+              margin: 0 auto !important;
+              max-width: 15mm !important;
+              max-height: 15mm !important;
+            }
+            .custom-text {
+              width: 100% !important;
+              text-align: center !important;
+              font-size: ${lblFontSizeCustomText}pt !important;
+              font-weight: bold !important;
+              margin-top: ${lblLineSpacing * 0.05}mm !important;
+              color: black !important;
+              line-height: 1 !important;
+            }
+            @media print {
+              @page {
+                size: ${widthLabel} ${heightLabel};
+                margin: 0 !important;
+              }
+              html, body {
+                width: ${widthLabel} !important;
+                height: ${heightLabel} !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                background-color: white !important;
+                color: black !important;
+                visibility: visible !important;
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+                display: block !important;
+              }
+              body * {
+                visibility: visible !important;
+              }
+              .label-wrapper-outer {
+                width: 100% !important;
+                height: 100% !important;
+                display: flex !important;
+                flex-direction: column !important;
+                box-sizing: border-box !important;
+                text-align: center !important;
+                align-items: center !important;
+                justify-content: center !important;
+                margin: 0 auto !important;
+                padding: 1.2mm 1.5mm !important;
+                transform: scale(${parseFloat(lblZoom) / 100}) translate(${((numAlign - 50) * 0.2).toFixed(2)}mm, ${((numVerticalAlign - 50) * 0.15).toFixed(2)}mm) !important;
+                transform-origin: center center !important;
+              }
+              .header-container {
+                display: flex !important;
+                flex-direction: column !important;
+                align-items: center !important;
+                justify-content: center !important;
+              }
+              .center-name {
+                display: block !important;
+                visibility: visible !important;
+                color: black !important;
+                font-size: ${lblFontSizeCenterName}pt !important;
+                font-weight: 900 !important;
+                text-align: center !important;
+              }
+              .center-mobile {
+                display: ${lblShowMobile ? 'block !important' : 'none !important'};
+                visibility: ${lblShowMobile ? 'visible !important' : 'hidden !important'};
+                color: black !important;
+                font-size: ${lblFontSizeMobile}pt !important;
+                font-weight: 800 !important;
+                text-align: center !important;
+              }
+              .details-container {
+                display: flex !important;
+                flex-direction: column !important;
+                align-items: center !important;
+                text-align: center !important;
+                visibility: visible !important;
+              }
+              .qr-container {
+                display: flex !important;
+                justify-content: center !important;
+                align-items: center !important;
+              }
+              .qr-container img {
+                display: block !important;
+                margin: 0 auto !important;
+              }
+              .custom-text {
+                display: block !important;
+                visibility: visible !important;
+                text-align: center !important;
+              }
+            }
+          </style>
+        </head>
+        <body>
+          <div class="label-wrapper-outer">
+            <div class="header-container">
+              ${lblShowCenterName ? `<div class="center-name" style="font-size: ${lblFontSizeCenterName}pt !important;">${lblCenterNameText}</div>` : ''}
+              ${lblShowMobile && lblMobileText ? `<div class="center-mobile" style="font-size: ${lblFontSizeMobile}pt !important;">${lblMobileText}</div>` : ''}
+            </div>
+            
+            ${showDetails ? `
+              <div class="details-container">
+                ${lblShowCustomerName ? `<div style="font-size: ${lblFontSizeCustomerName}pt !important; font-weight: bold; line-height: 1.1; margin-bottom: 0.1mm;">العميل: ${order.customerName}</div>` : ''}
+                ${lblShowDeviceModel ? `<div style="font-size: ${lblFontSizeDeviceModel}pt !important; font-weight: bold; line-height: 1.1; margin-bottom: 0.1mm;">الجهاز: ${order.brandModel}</div>` : ''}
+                ${lblShowDate ? `<div style="font-size: ${lblFontSizeDate}pt !important; font-weight: bold; line-height: 1.1;">التاريخ: ${orderDate}</div>` : ''}
+              </div>
+            ` : ''}
+
+${barcodeBase64 ? `
+              <div class="qr-container" style="margin-top: 1mm !important;">
+                <img src="${barcodeBase64}" style="max-height: 16mm !important; width: auto !important; max-width: 95% !important; margin: 0 auto !important; image-rendering: crisp-edges !important; image-rendering: pixelated !important;" />
+              </div>
+            ` : ''}
+            ${lblShowQR ? `
+              <div class="qr-container">
+                <img src="${qrCodeUrl}" />
+              </div>
+            ` : ''}
+
+            ${lblCustomText ? `
+              <div class="custom-text">
+                ${lblCustomText}
+              </div>
+            ` : ''}
+          </div>
+
+          <script>
+            function triggerPrint() {
+              setTimeout(() => {
+                window.print();
+                setTimeout(() => {
+                  window.close();
+                }, 500);
+              }, 400);
+            }
+
+            if (document.fonts && document.fonts.ready) {
+              document.fonts.ready.then(triggerPrint).catch(triggerPrint);
+            } else {
+              window.addEventListener('load', triggerPrint);
+            }
+          </script>
+        </body>
+      </html>
+    `);
+    printWindow.document.close();
+  };
+  
+  // Form fields for adding/editing
+  const [isEditing, setIsEditing] = useState(false);
+  const [formCustomerName, setFormCustomerName] = useState('');
+  const [formCustomerPhone, setFormCustomerPhone] = useState('');
+  const [formDeviceType, setFormDeviceType] = useState('جوال');
+  const [formBrandModel, setFormBrandModel] = useState('');
+  const [formSerialNumber, setFormSerialNumber] = useState('');
+  const [formFaultDescription, setFormFaultDescription] = useState('');
+  const [formEstimatedCost, setFormEstimatedCost] = useState<number>(0);
+  const [formCurrency, setFormCurrency] = useState('');
+  const [formExpectedDeliveryDate, setFormExpectedDeliveryDate] = useState('');
+  const [formNotes, setFormNotes] = useState('');
+  const [formTechnician, setFormTechnician] = useState('');
+
+  // Unique customers derived from all orders to act as autocomplete database
+  const uniqueCustomers = useMemo(() => {
+    const map = new Map<string, string>(); // phone -> name
+    orders.forEach(o => {
+      const p = (o.customerPhone || '').trim();
