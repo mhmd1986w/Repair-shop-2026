@@ -3,6 +3,9 @@ import { MaintenanceOrder, DeviceStatus, isContactOrder } from '../types';
 import { dbService } from '../lib/firebase';
 import { Search, MapPin, Calendar, CreditCard, Clock, Wrench, ShieldCheck, HelpCircle, Smartphone, Camera, CheckCircle2, History, Layers, Star, MessageSquareQuote, Mic, MicOff } from 'lucide-react';
 import { QRCodeGenerator } from './QRCodeGenerator';
+import { buildTrackingUrl } from '../utils/appDomain';
+import { extractScannedBarcodeId } from '../utils/barcode';
+import { StatusSnapshotBadges } from './StatusSnapshotBadges';
 
 interface CustomerTrackingViewProps {
   initialOrderId?: string;
@@ -48,7 +51,8 @@ export const CustomerTrackingView: React.FC<CustomerTrackingViewProps> = ({
     setDeviceOrders([]);
     try {
       const allOrders = await dbService.getOrders();
-      const term = idToSearch.trim().toUpperCase();
+      const extracted = extractScannedBarcodeId(idToSearch);
+      const term = (extracted || idToSearch.trim()).toUpperCase();
       
       // Find orders matching the ID, phone, serial number, or customer name
       const cleanTerm = term.replace(/[\s-+]/g, '');
@@ -412,12 +416,12 @@ export const CustomerTrackingView: React.FC<CustomerTrackingViewProps> = ({
                         bgClass = 'bg-teal-500 text-white border-2 border-teal-500';
                         textClass = 'text-teal-700 font-bold';
                         statusLabel = 'اكتملت';
-                        Class = ' -500/20';
+                        Class = 'shadow-lg shadow-teal-500/20';
                       } else if (state === 'active') {
                         bgClass = 'bg-emerald-600 text-white border-4 border-emerald-100 animate-pulse';
                         textClass = 'text-emerald-800 font-bold';
                         statusLabel = 'جاري العمل الآن';
-                        Class = ' -600/30 scale-110';
+                        Class = 'shadow-lg shadow-emerald-600/30 scale-110';
                       } else if (state === 'unrepairable') {
                         bgClass = 'bg-rose-50 text-rose-300 border-2 border-rose-200';
                         textClass = 'text-rose-400 line-through';
@@ -478,7 +482,7 @@ export const CustomerTrackingView: React.FC<CustomerTrackingViewProps> = ({
                         موعد التسليم المتوقع:
                       </span>
                       <span className="text-gray-800 font-semibold">
-                        {new Date(order.expectedDeliveryDate).toLocaleDateString('ar-SA')}
+                        {order.expectedDeliveryDate && !isNaN(new Date(order.expectedDeliveryDate).getTime()) ? new Date(order.expectedDeliveryDate).toLocaleDateString('ar-SA') : (order.expectedDeliveryDate || 'غير محدد')}
                       </span>
                     </div>
                     <div className="flex justify-between items-center text-sm font-sans">
@@ -588,7 +592,7 @@ export const CustomerTrackingView: React.FC<CustomerTrackingViewProps> = ({
                             className="focus:outline-none transition-transform hover:scale-110 active:scale-95"
                           >
                             <Star 
-                              className={`w-10 h-10 ${star <= reviewRating ? 'fill-amber-400 text-amber-400 drop-' : 'fill-gray-100 text-gray-200 hover:text-amber-200 hover:fill-amber-100'} transition-colors`} 
+                              className={`w-10 h-10 ${star <= reviewRating ? 'fill-amber-400 text-amber-400 drop-shadow' : 'fill-gray-100 text-gray-200 hover:text-amber-200 hover:fill-amber-100'} transition-colors`} 
                             />
                           </button>
                         ))}
@@ -606,7 +610,7 @@ export const CustomerTrackingView: React.FC<CustomerTrackingViewProps> = ({
                           <button
                             onClick={handleSubmitReview}
                             disabled={reviewSubmitting}
-                            className="w-full bg-amber-500 hover:bg-amber-600 text-white font-bold py-3 px-4 rounded-xl transition-colors text-xs flex justify-center items-center gap-2  -500/20 disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="w-full bg-amber-500 hover:bg-amber-600 text-white font-bold py-3 px-4 rounded-xl transition-colors text-xs flex justify-center items-center gap-2 shadow-lg shadow-amber-500/20 disabled:opacity-50 disabled:cursor-not-allowed"
                           >
                             {reviewSubmitting ? (
                               <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
@@ -632,7 +636,7 @@ export const CustomerTrackingView: React.FC<CustomerTrackingViewProps> = ({
                 </div>
                 <div className="shrink-0 flex gap-4 items-center">
                   <div className="text-center">
-                    <QRCodeGenerator value={`${window.location.origin}?track=${order.id}`} size={90} />
+                    <QRCodeGenerator value={buildTrackingUrl(order.id)} size={90} />
                     <span className="text-[10px] font-mono text-gray-400 mt-1 block">رابط التتبع المباشر</span>
                   </div>
                 </div>
@@ -669,7 +673,7 @@ export const CustomerTrackingView: React.FC<CustomerTrackingViewProps> = ({
                       }}
                       className={`group cursor-pointer rounded-2xl p-4 transition-all duration-200 flex flex-col justify-between text-right border ${
                         isActive 
-                          ? 'bg-emerald-50/50 border-emerald-500  -500/5' 
+                          ? 'bg-emerald-50/50 border-emerald-500 shadow-md shadow-emerald-500/5' 
                           : 'bg-gray-50/60 hover:bg-emerald-50/20 border-gray-100 hover:border-emerald-200'
                       }`}
                       title={isActive ? "طلب الصيانة المعروض حالياً" : "اضغط لتتبع هذا الطلب من الزيارة السابقة"}
@@ -779,14 +783,15 @@ export const CustomerTrackingView: React.FC<CustomerTrackingViewProps> = ({
                     {/* Circle marker on line */}
                     <div className="absolute right-1.5 top-1.5 w-4 h-4 rounded-full border-4 border-white bg-teal-500 ring-2 ring-teal-200" />
                     
-                    <div className="bg-gray-50/60 rounded-2xl p-4 border border-gray-100 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                      <div>
+                    <div className="bg-gray-50/60 rounded-2xl p-4 border border-gray-100 flex flex-col sm:flex-row sm:items-start justify-between gap-2">
+                      <div className="flex-1 min-w-0">
                         <span className={`px-2.5 py-0.5 rounded-lg text-[11px] font-bold border ${statusMeta.color}`}>
                           {statusMeta.label}
                         </span>
                         <p className="text-gray-700 text-sm mt-2 font-sans font-medium">
                           {history.note}
                         </p>
+                        <StatusSnapshotBadges snapshot={history.snapshot} hideMessagePreview />
                       </div>
                       
                       <div className="text-right sm:shrink-0 flex sm:flex-col items-center sm:items-end justify-between sm:justify-center border-t sm:border-t-0 border-gray-100/70 pt-2 sm:pt-0">

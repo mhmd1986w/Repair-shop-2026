@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { NotificationTemplate, NotificationLog, DeviceStatus, MaintenanceOrder, AppUser } from '../types';
-import { dbService, getCurrentUserId } from '../lib/firebase';
+import { dbService, logoutUser } from '../lib/firebase';
+import { COUNTRIES_LIST } from '../utils/countries';
 import * as XLSX from 'xlsx';
 import { saveFileToDevice, excelWorkbookToBlob } from '../utils/fileSaver';
 import { BackupModal } from './BackupModal';
@@ -12,10 +13,22 @@ import { ClearDataModal } from './ClearDataModal';
 import { FileSpreadsheet } from 'lucide-react';
 import { QRCodeGenerator } from './QRCodeGenerator';
 import { BarcodeGenerator } from './BarcodeGenerator';
-import { DEFAULT_BARCODE_PREFIX, sanitizeBarcodePrefix, formatDateTimeForBarcode, generateBarcodeId, parseBarcodeId } from '../utils/barcode';
+import { DEFAULT_BARCODE_PREFIX, sanitizeBarcodePrefix, formatDateTimeForBarcode, formatCountryDateTime24h, formatCountryDateYmd, resolveCountryTimeZone, generateBarcodeId, parseBarcodeId } from '../utils/barcode';
 import { PrintFormatToolbar } from './PrintFormatToolbar';
 import { PrintFormatConfig, getStoredReceiptFormat, getStoredLabelFormat, ARABIC_FONTS, RECEIPT_FONT_SIZES, LABEL_FONT_SIZES } from '../utils/printFormatting';
 import { LabelDesigner } from './LabelDesigner';
+import { ReceiptDesigner } from './ReceiptDesigner';
+import {
+  getStoredLabelLayout,
+  getLabelPreviewMetrics,
+  getLabelContainerStyles,
+  getLabelElementMetrics,
+  getSplitThermalLabelMetrics,
+  FIXED_LABEL_PAPER_SIZE
+} from '../utils/labelDesigner';
+import { printPureContent, printHtmlViaIframe } from '../lib/printUtils';
+import { BUILT_IN_APP_DOMAIN, FIREBASE_HOSTING_DOMAIN, buildTrackingUrl, getDefaultBuiltInDomain, normalizeDomainUrl } from '../utils/appDomain';
+import { buildOrderCustomerQrPayload } from '../utils/customerBarcode';
 import { 
   MessageSquare, 
   MessageCircle,
@@ -46,7 +59,6 @@ import {
   Database,
   Copy,
   ExternalLink,
-  ShieldCheck,
   ShieldAlert,
   Store,
   Coins,
@@ -71,64 +83,11 @@ export interface PrinterConfig {
   ipAddress?: string;
   port?: number;
   protocol: 'esc_pos' | 'tspl' | 'zpl' | 'system';
-  paperSize?: '80mm' | '58mm' | 'label_4x6' | 'label_2x1' | 'label_30x20';
+  paperSize?: '80mm' | '58mm' | 'label_4x6' | 'label_2x1' | 'label_30x20' | 'label_38x25';
   isDefaultInvoices: boolean;
   isDefaultLabels: boolean;
   status: 'online' | 'offline' | 'unknown';
 }
-
-const CODE39_MAP: { [key: string]: string } = {
-  '0': '000110100', '1': '100100001', '2': '001100001', '3': '101100000',
-  '4': '000110001', '5': '100110000', '6': '001110000', '7': '000100101',
-  '8': '100100100', '9': '001100100', 'A': '100001001', 'B': '001001001',
-  'C': '101001000', 'D': '000011001', 'E': '100011000', 'F': '001011000',
-  'G': '000001101', 'H': '100001100', 'I': '001001100', 'J': '000011100',
-  'K': '100000011', 'L': '001000011', 'M': '101000010', 'N': '000010011',
-  'O': '100010010', 'P': '001010010', 'Q': '000000111', 'R': '100000110',
-  'S': '001000110', 'T': '000010110', 'U': '110000001', 'V': '011000001',
-  'W': '111000000', 'X': '010010001', 'Y': '110010000', 'Z': '011010000',
-  '-': '010000101', '.': '110000100', ' ': '011000100', '*': '010010100',
-  '$': '010101000', '/': '010100010', '+': '010001010', '%': '000101010'
-};
-
-const renderPreviewBarcodeSVG = (value: string, widthFactor: number = 1.0, barcodeHeight: number = 25) => {
-  const normalized = `*${value.toUpperCase()}*`;
-  const width = 1.0 * widthFactor;
-  const quietZone = width * 10;
-  let currentX = quietZone;
-  const bars: { x: number; width: number }[] = [];
-
-  for (let i = 0; i < normalized.length; i++) {
-    const char = normalized[i];
-    const pattern = CODE39_MAP[char] || CODE39_MAP[' '];
-    if (!pattern) continue;
-
-    for (let j = 0; j < 9; j++) {
-      const isBar = j % 2 === 0;
-      const isWide = pattern[j] === '1';
-      const elWidth = isWide ? width * 2.5 : width;
-
-      if (isBar) {
-        bars.push({ x: currentX, width: elWidth });
-      }
-      currentX += elWidth;
-    }
-    currentX += width;
-  }
-
-  const totalWidth = currentX + quietZone;
-
-  return (
-    <svg width="100%" height="100%" viewBox={`0 0 ${totalWidth} ${barcodeHeight}`} shapeRendering="crispEdges" preserveAspectRatio="xMidYMid meet" className="mx-auto block">
-      <rect x="0" y="0" width={totalWidth} height={barcodeHeight} fill="white" />
-      <g>
-        {bars.map((bar, idx) => (
-          <rect key={idx} x={bar.x} y="0" width={bar.width} height={barcodeHeight} fill="black" />
-        ))}
-      </g>
-    </svg>
-  );
-};
 
 interface NotificationSettingsViewProps {
   templates: NotificationTemplate[];
@@ -186,6 +145,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
   const [editingTemplateId, setEditingTemplateId] = useState<string | null>(null);
   const [smsContent, setSmsContent] = useState('');
   const [whatsappContent, setWhatsappContent] = useState('');
+  const [activeTemplateField, setActiveTemplateField] = useState<'whatsapp' | 'sms'>('whatsapp');
   const [saveSuccess, setSaveSuccess] = useState(false);
 
   // Advanced search states for notification logs
@@ -202,15 +162,35 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
   const [currencyName, setCurrencyName] = useState(() => localStorage.getItem('currencyName') || 'دينار');
   const [countryName, setCountryName] = useState(() => localStorage.getItem('countryName') || 'الأردن');
   const [countryDialCode, setCountryDialCode] = useState(() => localStorage.getItem('countryDialCode') || '962');
+  const [websiteDomain, setWebsiteDomain] = useState(() => localStorage.getItem('websiteDomain') || getDefaultBuiltInDomain());
+  const [domainCopied, setDomainCopied] = useState(false);
+
+  const handleCountrySelectChange = (selectedName: string) => {
+    setCountryName(selectedName);
+    if (selectedName) {
+      localStorage.setItem('countryName', selectedName);
+    }
+    const matched = COUNTRIES_LIST.find((c) => c.name === selectedName);
+    if (matched) {
+      setCurrencyName(matched.currency);
+      setCountryDialCode(matched.dialCode);
+      localStorage.setItem('currencyName', matched.currency);
+      localStorage.setItem('countryDialCode', matched.dialCode);
+    }
+    window.dispatchEvent(new Event('storage'));
+  };
 
   // Barcode and serial number customization states
   const [barcodePrefix, setBarcodePrefix] = useState(() => sanitizeBarcodePrefix(localStorage.getItem('barcodePrefix') || 'TEC'));
   const [barcodeStartNum, setBarcodeStartNum] = useState(() => localStorage.getItem('barcodeStartNum') || '1001');
 
-  // Compute live current barcode according to: 3-letter prefix + YY + MM + HH (24h) + mm
+  // Compute live current barcode according to: ***yymmddhhmm in country local 24h time
   const currentLiveBarcode = useMemo(() => {
-    return generateBarcodeId(barcodePrefix);
-  }, [barcodePrefix]);
+    return generateBarcodeId(barcodePrefix, [], new Date(), {
+      countryName,
+      countryDialCode,
+    });
+  }, [barcodePrefix, countryName, countryDialCode]);
   
 
   // Login credentials states
@@ -420,15 +400,26 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
     setUsersList(updatedUsers);
     localStorage.setItem('appUsersList', JSON.stringify(updatedUsers));
     
-    // If the edited user is the current user logged in, let's update sessionStorage!
-    const sessionUserJson = sessionStorage.getItem('appCurrentUser');
+    // If the edited user is the current user logged in, let's update sessionStorage and localStorage!
+    const sessionUserJson = sessionStorage.getItem('appCurrentUser') || localStorage.getItem('appCurrentUser');
     if (sessionUserJson) {
-      const sessionUser = JSON.parse(sessionUserJson);
-      if (sessionUser.username.toLowerCase() === userFormUsername.trim().toLowerCase() || (editingUser && sessionUser.id === editingUser.id)) {
-        const matchingSavedUser = updatedUsers.find(u => u.username.toLowerCase() === userFormUsername.trim().toLowerCase() || u.id === editingUser?.id);
-        if (matchingSavedUser) {
-          sessionStorage.setItem('appCurrentUser', JSON.stringify(matchingSavedUser));
+      try {
+        const sessionUser = JSON.parse(sessionUserJson);
+        const targetUsername = userFormUsername.trim().toLowerCase();
+        if (
+          (sessionUser?.username && String(sessionUser.username).toLowerCase() === targetUsername) ||
+          (editingUser && sessionUser?.id === editingUser.id)
+        ) {
+          const matchingSavedUser = updatedUsers.find(
+            u => (u.username && u.username.toLowerCase() === targetUsername) || u.id === editingUser?.id
+          );
+          if (matchingSavedUser) {
+            sessionStorage.setItem('appCurrentUser', JSON.stringify(matchingSavedUser));
+            localStorage.setItem('appCurrentUser', JSON.stringify(matchingSavedUser));
+          }
         }
+      } catch (e) {
+        console.warn("Could not parse active session user:", e);
       }
     }
 
@@ -452,11 +443,13 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
     // Prevent deleting yourself if logged in
     const sessionUserJson = sessionStorage.getItem('appCurrentUser');
     if (sessionUserJson) {
-      const sessionUser = JSON.parse(sessionUserJson);
-      if (sessionUser.id === userId) {
-        alert('⚠️ لا يمكنك حذف حسابك الشخصي أثناء تسجيل الدخول منه!');
-        return;
-      }
+      try {
+        const sessionUser = JSON.parse(sessionUserJson);
+        if (sessionUser?.id === userId) {
+          alert('⚠️ لا يمكنك حذف حسابك الشخصي أثناء تسجيل الدخول منه!');
+          return;
+        }
+      } catch (_) {}
     }
 
     if (window.confirm(`هل أنت متأكد من رغبتك في حذف حساب الموظف "${userToDelete.displayName}" وصلاحياته نهائياً؟`)) {
@@ -667,94 +660,78 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
   });
 
   const [lblFontSizeCenterName, setLblFontSizeCenterName] = useState<number>(() => {
-    const saved = localStorage.getItem('lblFontSizeCenterName');
-    return saved ? Number(saved) : 13;
+    const saved = Number(localStorage.getItem('lblFontSizeCenterName'));
+    return saved && !isNaN(saved) ? Math.max(10, Math.min(99, saved)) : 13;
   });
   const [lblFontSizeMobile, setLblFontSizeMobile] = useState<number>(() => {
-    const saved = localStorage.getItem('lblFontSizeMobile');
-    return saved ? Number(saved) : 8.5;
+    const saved = Number(localStorage.getItem('lblFontSizeMobile'));
+    return saved && !isNaN(saved) ? Math.max(10, Math.min(99, saved)) : 10;
   });
   const [lblFontSizeBarcodeText, setLblFontSizeBarcodeText] = useState<number>(() => {
-    const saved = localStorage.getItem('lblFontSizeBarcodeText');
-    return saved ? Number(saved) : 10;
+    const saved = Number(localStorage.getItem('lblFontSizeBarcodeText'));
+    return saved && !isNaN(saved) ? Math.max(10, Math.min(99, saved)) : 10;
   });
   const [lblBarcodeHeight, setLblBarcodeHeight] = useState<number>(() => {
-    const saved = localStorage.getItem('lblBarcodeHeight');
-    return saved ? Number(saved) : 25;
+    const saved = Number(localStorage.getItem('lblBarcodeHeight'));
+    return saved && !isNaN(saved) ? Math.max(10, Math.min(99, saved)) : 25;
   });
   const [lblBarcodeWidth, setLblBarcodeWidth] = useState<number>(() => {
     const saved = localStorage.getItem('lblBarcodeWidth');
-    return saved ? Number(saved) : 1.2;
+    return saved && !isNaN(Number(saved)) ? Number(saved) : 1.2;
   });
   const [lblBarcodeFormat, setLblBarcodeFormat] = useState<string>(() => {
-    return localStorage.getItem('lblBarcodeFormat') || 'CODE128';
+    return localStorage.getItem('lblBarcodeFormat') || 'AUTO';
   });
   const [lblFontSizeCustomerName, setLblFontSizeCustomerName] = useState<number>(() => {
-    const saved = localStorage.getItem('lblFontSizeCustomerName');
-    return saved ? Number(saved) : 8;
+    const saved = Number(localStorage.getItem('lblFontSizeCustomerName'));
+    return saved && !isNaN(saved) ? Math.max(10, Math.min(99, saved)) : 10;
   });
   const [lblFontSizeDeviceModel, setLblFontSizeDeviceModel] = useState<number>(() => {
-    const saved = localStorage.getItem('lblFontSizeDeviceModel');
-    return saved ? Number(saved) : 8;
+    const saved = Number(localStorage.getItem('lblFontSizeDeviceModel'));
+    return saved && !isNaN(saved) ? Math.max(10, Math.min(99, saved)) : 10;
   });
   const [lblFontSizeDate, setLblFontSizeDate] = useState<number>(() => {
-    const saved = localStorage.getItem('lblFontSizeDate');
-    return saved ? Number(saved) : 8;
+    const saved = Number(localStorage.getItem('lblFontSizeDate'));
+    return saved && !isNaN(saved) ? Math.max(10, Math.min(99, saved)) : 10;
   });
-  const [lblPaperSize, setLblPaperSize] = useState<string>(() => {
-    return localStorage.getItem('lblPaperSize') || '50x30';
-  });
+  const [lblPaperSize, setLblPaperSize] = useState<string>(() => FIXED_LABEL_PAPER_SIZE);
   const [lblLineSpacing, setLblLineSpacing] = useState<number>(() => {
     const saved = localStorage.getItem('lblLineSpacing');
-    return saved ? Number(saved) : 0;
+    return saved !== null && !isNaN(Number(saved)) ? Number(saved) : 1.15;
   });
 
-  const [pWidth, pHeight] = lblPaperSize.split('x').map(Number);
-  const paperWidthMm = `${pWidth || 50}mm`;
-  const paperHeightMm = `${pHeight || 30}mm`;
+  const [pWidth, pHeight] = FIXED_LABEL_PAPER_SIZE.split('x').map(Number);
+  const paperWidthMm = `${pWidth || 38}mm`;
+  const paperHeightMm = `${pHeight || 25}mm`;
   const screenWidthPx = 240;
-  const screenHeightPx = Math.round(screenWidthPx * ((pHeight || 30) / (pWidth || 50)));
+  const screenHeightPx = Math.round(screenWidthPx * ((pHeight || 25) / (pWidth || 38)));
 
   useEffect(() => {
-    localStorage.setItem('lblShowCenterName', String(lblShowCenterName));
-    localStorage.setItem('lblShowBarcode', String(lblShowBarcode));
-    localStorage.setItem('lblShowQR', String(lblShowQR));
-    localStorage.setItem('lblShowCustomerName', String(lblShowCustomerName));
-    localStorage.setItem('lblShowDeviceModel', String(lblShowDeviceModel));
-    localStorage.setItem('lblShowDate', String(lblShowDate));
-    localStorage.setItem('lblShowMobile', String(lblShowMobile));
-    localStorage.setItem('lblFontSizeCenterName', String(lblFontSizeCenterName));
-    localStorage.setItem('lblFontSizeMobile', String(lblFontSizeMobile));
-    localStorage.setItem('lblFontSizeBarcodeText', String(lblFontSizeBarcodeText));
-    localStorage.setItem('lblBarcodeHeight', String(lblBarcodeHeight));
-    localStorage.setItem('lblBarcodeWidth', String(lblBarcodeWidth));
-    localStorage.setItem('lblBarcodeFormat', lblBarcodeFormat);
-    localStorage.setItem('lblFontSizeCustomerName', String(lblFontSizeCustomerName));
-    localStorage.setItem('lblFontSizeDeviceModel', String(lblFontSizeDeviceModel));
-    localStorage.setItem('lblFontSizeDate', String(lblFontSizeDate));
-    localStorage.setItem('lblPaperSize', lblPaperSize);
-    localStorage.setItem('lblLineSpacing', String(lblLineSpacing));
-    window.dispatchEvent(new Event('storage'));
-  }, [
-    lblShowCenterName,
-    lblShowBarcode,
-    lblShowQR,
-    lblShowCustomerName,
-    lblShowDeviceModel,
-    lblShowDate,
-    lblShowMobile,
-    lblFontSizeCenterName,
-    lblFontSizeMobile,
-    lblFontSizeBarcodeText,
-    lblBarcodeHeight,
-    lblBarcodeWidth,
-    lblBarcodeFormat,
-    lblFontSizeCustomerName,
-    lblFontSizeDeviceModel,
-    lblFontSizeDate,
-    lblPaperSize,
-    lblLineSpacing
-  ]);
+    const syncFromStorage = () => {
+      const storedFmt = localStorage.getItem('lblBarcodeFormat') || 'AUTO';
+      setLblBarcodeFormat(prev => (prev !== storedFmt ? storedFmt : prev));
+      setLblPaperSize(FIXED_LABEL_PAPER_SIZE);
+      const storedRcptSize = localStorage.getItem('rcptSize') || '80mm';
+      setRcptSize(prev => (prev !== storedRcptSize ? storedRcptSize : prev));
+      const storedSpacing = localStorage.getItem('lblLineSpacing');
+      if (storedSpacing !== null && !isNaN(Number(storedSpacing))) {
+        const val = Number(storedSpacing);
+        setLblLineSpacing(prev => (prev !== val ? val : prev));
+      }
+      const clampFont = (key: string, fallback: number) => {
+        const n = Number(localStorage.getItem(key));
+        return n && !isNaN(n) ? Math.max(10, Math.min(99, n)) : fallback;
+      };
+      setLblFontSizeCenterName(prev => { const v = clampFont('lblFontSizeCenterName', 13); return prev !== v ? v : prev; });
+      setLblFontSizeMobile(prev => { const v = clampFont('lblFontSizeMobile', 10); return prev !== v ? v : prev; });
+      setLblFontSizeBarcodeText(prev => { const v = clampFont('lblFontSizeBarcodeText', 10); return prev !== v ? v : prev; });
+      setLblFontSizeCustomerName(prev => { const v = clampFont('lblFontSizeCustomerName', 10); return prev !== v ? v : prev; });
+      setLblFontSizeDeviceModel(prev => { const v = clampFont('lblFontSizeDeviceModel', 10); return prev !== v ? v : prev; });
+      setLblFontSizeDate(prev => { const v = clampFont('lblFontSizeDate', 10); return prev !== v ? v : prev; });
+    };
+    window.addEventListener('storage', syncFromStorage);
+    return () => window.removeEventListener('storage', syncFromStorage);
+  }, []);
 
   // Printers state
   const [printers, setPrinters] = useState<PrinterConfig[]>([]);
@@ -786,7 +763,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
   const [testResult, setTestResult] = useState<{ id: string; success: boolean; message: string } | null>(null);
   const [showTestPrintModal, setShowTestPrintModal] = useState(false);
   const [showLabelTestModal, setShowLabelTestModal] = useState(false);
-  const [testPrintSize, setTestPrintSize] = useState<'80mm' | '58mm' | 'label_30x20'>('80mm');
+  const [testPrintSize, setTestPrintSize] = useState<'80mm' | '58mm' | 'label_38x25'>('80mm');
 
   // Names/Contacts Search State
   const [customerSearch, setCustomerSearch] = useState('');
@@ -846,7 +823,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
         status: DeviceStatus.RECEIVED,
         createdAt: Date.now(),
         updatedAt: Date.now(),
-        expectedDeliveryDate: new Date().toISOString().split('T')[0],
+        expectedDeliveryDate: formatCountryDateYmd(),
         statusHistory: [
           {
             status: DeviceStatus.RECEIVED,
@@ -974,7 +951,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
       if (!phone) return;
       
       const isContactOnly = order.deviceType === 'جهة اتصال';
-      const cost = isContactOnly ? 0 : (parseFloat(order.estimatedCost) || 0);
+      const cost = isContactOnly ? 0 : (Number(order.estimatedCost) || 0);
       const isActive = !isContactOnly && (order.status !== DeviceStatus.DELIVERED && order.status !== DeviceStatus.UNREPAIRABLE);
       const isCompleted = !isContactOnly && (order.status === DeviceStatus.READY);
 
@@ -1014,102 +991,98 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
     );
   }, [customers, customerSearch]);
 
-  const handlePrintElement = (elementId: string, title: string = 'طباعة') => {
+  const handlePrintElement = (elementId: string, _title: string = 'طباعة') => {
     const element = document.getElementById(elementId);
     if (!element) {
-      alert("عنصر الطباعة غير موجود");
+      console.warn("عنصر الطباعة غير موجود:", elementId);
       return;
     }
 
-    const printWindow = window.open('', '_blank', 'width=800,height=800');
-    if (!printWindow) {
-      // Fallback to standard window.print if blocked
-      try {
-        window.print();
-      } catch (e) {
-        alert("يرجى تفعيل السماح للنوافذ المنبثقة (Popups) أو فتح التطبيق في متصفح خارجي/نافذة جديدة للطباعة.");
-      }
-      return;
-    }
+    const clone = element.cloneNode(true) as HTMLElement;
+    clone.querySelectorAll('.no-print, button, input, textarea, select').forEach(el => el.remove());
+    clone.style.boxShadow = 'none';
+    clone.style.border = 'none';
+    clone.style.borderRadius = '0';
+    clone.style.margin = '0 auto';
+    clone.style.background = 'white';
+    clone.style.color = 'black';
 
-    // Capture stylesheet references to keep layout and Tailwind CSS styling
-    let stylesHtml = '';
-    for (let i = 0; i < document.styleSheets.length; i++) {
-      try {
-        const sheet = document.styleSheets[i];
-        let rules = '';
-        if (sheet.cssRules) {
-          for (let j = 0; j < sheet.cssRules.length; j++) {
-            rules += sheet.cssRules[j].cssText;
-          }
+    if (elementId === 'test-label-print-modal') {
+      const storedLayout = getStoredLabelLayout();
+      const activeLayout = { ...storedLayout, paperSize: FIXED_LABEL_PAPER_SIZE };
+      const styles = getLabelContainerStyles(activeLayout, lblFormat.fontFamily);
+      const activeElements = activeLayout.elements.filter(el => el.enabled);
+      const splitMetrics = getSplitThermalLabelMetrics(activeLayout, styles, activeElements);
+      const wMm = `${styles.widthMm}mm`;
+      const hMm = `${styles.heightMm}mm`;
+      clone.style.position = 'static';
+      clone.style.transform = 'none';
+      clone.style.width = wMm;
+      clone.style.height = hMm;
+      clone.style.maxWidth = wMm;
+      clone.style.maxHeight = hMm;
+      clone.style.padding = `${splitMetrics.effectivePaddingMm}mm`;
+      clone.style.overflow = 'hidden';
+
+      const pageStyle = `
+        @page {
+          size: ${wMm} ${hMm};
+          margin: 0 !important;
         }
-        stylesHtml += `<style>${rules}</style>`;
-      } catch (e) {
-        // Safe to ignore CORS issues
-      }
+        #test-label-print-modal {
+          position: static !important;
+          transform: none !important;
+          width: ${wMm} !important;
+          height: ${hMm} !important;
+          max-width: ${wMm} !important;
+          max-height: ${hMm} !important;
+          padding: ${splitMetrics.effectivePaddingMm}mm !important;
+          margin: 0 auto !important;
+          display: flex !important;
+          flex-direction: ${splitMetrics.hasQrSide ? 'row' : 'column'} !important;
+          justify-content: ${splitMetrics.hasQrSide && (activeElements.filter(el => el.id !== 'qr_code').length > 0) ? 'space-between' : 'center'} !important;
+          align-items: center !important;
+          gap: ${splitMetrics.hasQrSide && (activeElements.filter(el => el.id !== 'qr_code').length > 0) ? `${splitMetrics.colGapMm}mm` : '0'} !important;
+          text-align: ${styles.textAlign} !important;
+          font-family: ${styles.fontFamilyCss} !important;
+          box-sizing: border-box !important;
+          overflow: hidden !important;
+          background: white !important;
+          color: black !important;
+          page-break-inside: avoid !important;
+          break-inside: avoid !important;
+        }
+        #test-label-print-modal svg {
+          max-width: 100% !important;
+          display: block !important;
+        }
+        #test-label-print-modal * {
+          box-sizing: border-box !important;
+        }
+      `;
+      printPureContent(clone.outerHTML, pageStyle);
+      return;
     }
 
-    const contentHtml = element.outerHTML;
+    const receiptW = testPrintSize === '58mm' ? '58mm' : '80mm';
+    const pageSizeSpec = testPrintSize === '58mm' ? '58mm auto' : '80mm auto';
+    clone.style.width = receiptW;
+    clone.style.maxWidth = receiptW;
+    clone.style.padding = testPrintSize === '58mm' ? '4px' : '8px';
 
-    printWindow.document.write(`
-      <!DOCTYPE html>
-      <html dir="rtl" lang="ar">
-        <head>
-          <meta charset="utf-8">
-          <title>${title}</title>
-          <script src="https://cdn.tailwindcss.com"></script>
-          ${stylesHtml}
-          <style>
-            @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&family=Inter:wght@400;500;600;700&display=swap');
-            body {
-              font-family: 'Cairo', 'Inter', sans-serif !important;
-              direction: rtl;
-              text-align: right;
-              background-color: white;
-              color: black;
-              margin: 0;
-              padding: 20px;
-              visibility: visible !important;
-            }
-            body * {
-              visibility: visible !important;
-            }
-            .no-print {
-              display: none !important;
-            }
-            @media print {
-              body {
-                padding: 0;
-                margin: 0;
-                visibility: visible !important;
-              }
-              body * {
-                visibility: visible !important;
-              }
-              .no-print {
-                display: none !important;
-              }
-            }
-          </style>
-        </head>
-        <body>
-          <div class="max-w-xl mx-auto">
-            ${contentHtml}
-          </div>
-          <script>
-            window.addEventListener('load', () => {
-              setTimeout(() => {
-                window.print();
-                setTimeout(() => {
-                  window.close();
-                }, 500);
-              }, 800);
-            });
-          </script>
-        </body>
-      </html>
-    `);
-    printWindow.document.close();
+    const pageStyle = `
+      @page {
+        size: ${pageSizeSpec};
+        margin: 0 !important;
+      }
+      #print-root {
+        width: 100% !important;
+        display: flex !important;
+        justify-content: center !important;
+        background: white !important;
+      }
+    `;
+    printPureContent(clone.outerHTML, pageStyle);
   };
 
   // 1. Export VCF (vCard) for Mobile Contacts
@@ -1227,7 +1200,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
           status: DeviceStatus.RECEIVED,
           createdAt: Date.now(),
           updatedAt: Date.now(),
-          expectedDeliveryDate: new Date().toISOString().split('T')[0],
+          expectedDeliveryDate: formatCountryDateYmd(),
           statusHistory: [
             {
               status: DeviceStatus.RECEIVED,
@@ -1311,7 +1284,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
           status: DeviceStatus.RECEIVED,
           createdAt: Date.now(),
           updatedAt: Date.now(),
-          expectedDeliveryDate: new Date().toISOString().split('T')[0],
+          expectedDeliveryDate: formatCountryDateYmd(),
           statusHistory: [
             {
               status: DeviceStatus.RECEIVED,
@@ -1485,7 +1458,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
           }
         }
 
-        let expectedDeliveryDate = new Date(createdAt + 3 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+        let expectedDeliveryDate = formatCountryDateYmd(createdAt + 3 * 24 * 60 * 60 * 1000);
         if (row['موعد التسليم المتوقع'] || row['تاريخ التسليم المتوقع']) {
           expectedDeliveryDate = String(row['موعد التسليم المتوقع'] || row['تاريخ التسليم المتوقع']);
         }
@@ -1591,13 +1564,17 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
       const SETTINGS_KEYS = [
         'centerName', 'engineerName', 'centerMobile', 'centerEmail', 'currencyName',
         'countryName', 'countryDialCode', 'centerLogo', 'barcodePrefix', 'barcodeStartNum',
-        'appLoginUsername', 'appLoginPassword', 'isAppLoginEnabled',
+        'barcodeDigits', 'barcodeSuffix', 'appLoginUsername', 'appLoginPassword', 'isAppLoginEnabled',
         'rcptCenterNameText', 'rcptTermsText', 'rcptZoom', 'rcptBarcodeHeight', 'rcptBarcodeWidth',
-        'rcptShowQR', 'rcptSize', 'lblAlign', 'lblVerticalAlign', 'lblShowCenterName',
-        'lblShowBarcode', 'lblShowCustomerName', 'lblShowDeviceModel', 'lblShowDate',
-        'lblShowMobile', 'lblFontSizeCenterName', 'lblFontSizeMobile', 'lblFontSizeBarcodeText',
-        'lblBarcodeHeight', 'lblBarcodeWidth', 'lblBarcodeFormat', 'lblFontSizeCustomerName', 'lblFontSizeDeviceModel', 'lblFontSizeDate',
-        'lblPaperSize', 'lblLineSpacing'
+        'rcptShowQR', 'rcptSize', 'rcptFontFamily', 'rcptFontSize', 'rcptAlign', 'rcptVerticalAlign',
+        'rcptLineHeight', 'rcptFontWeight', 'receipt_layout_config',
+        'lblAlign', 'lblVerticalAlign', 'lblShowCenterName', 'lblShowBarcode', 'lblShowQR',
+        'lblShowCustomerName', 'lblShowDeviceModel', 'lblShowDate', 'lblShowMobile',
+        'lblFontSizeCenterName', 'lblFontSizeMobile', 'lblFontSizeBarcodeText', 'lblFontSizeCustomText',
+        'lblBarcodeHeight', 'lblBarcodeWidth', 'lblBarcodeFormat', 'lblFontSizeCustomerName',
+        'lblFontSizeDeviceModel', 'lblFontSizeDate', 'lblPaperSize', 'lblLineSpacing',
+        'lblZoom', 'lblCustomText', 'lblFontFamily', 'lblFontSize', 'lblLineHeight', 'lblFontWeight',
+        'label_layout_config', 'allow_select_printer_on_print', 'websiteDomain'
       ];
 
       const settingsObj: Record<string, string> = {};
@@ -1674,6 +1651,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
       if (data.settings.currencyName) { setCurrencyName(data.settings.currencyName); }
       if (data.settings.countryName) { setCountryName(data.settings.countryName); }
       if (data.settings.countryDialCode) { setCountryDialCode(data.settings.countryDialCode); }
+      if (data.settings.websiteDomain) { setWebsiteDomain(data.settings.websiteDomain); }
 
       // Restore templates
       if (Array.isArray(data.templates)) {
@@ -1938,7 +1916,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
               status: DeviceStatus.DELIVERED,
               createdAt: Date.now(),
               updatedAt: Date.now(),
-              expectedDeliveryDate: new Date(Date.now()).toISOString().split('T')[0],
+              expectedDeliveryDate: formatCountryDateYmd(),
               statusHistory: [
                 {
                   status: DeviceStatus.DELIVERED,
@@ -2123,7 +2101,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
             ipAddress: '192.168.1.140',
             port: 9100,
             protocol: 'tspl',
-            paperSize: 'label_2x1',
+            paperSize: 'label_38x25',
             isDefaultInvoices: false,
             isDefaultLabels: false,
             status: 'online',
@@ -2215,7 +2193,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
             name: 'XP-365B (طابعة ملصقات بلوتوث)',
             type: 'bluetooth',
             protocol: 'tspl',
-            paperSize: 'label_2x1',
+            paperSize: 'label_38x25',
             isDefaultInvoices: false,
             isDefaultLabels: false,
             status: 'online',
@@ -2286,7 +2264,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
             name: 'Xprinter XP-365B (USB)',
             type: 'usb',
             protocol: 'tspl',
-            paperSize: 'label_30x20',
+            paperSize: 'label_38x25',
             isDefaultInvoices: false,
             isDefaultLabels: true,
             status: 'online',
@@ -2424,6 +2402,10 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
       }
     }
 
+    const normalizedWebsiteDomain = normalizeDomainUrl(websiteDomain);
+    setWebsiteDomain(normalizedWebsiteDomain);
+    localStorage.setItem('websiteDomain', normalizedWebsiteDomain);
+
     localStorage.setItem('centerName', centerName);
     localStorage.setItem('engineerName', engineerName);
     localStorage.setItem('centerMobile', centerMobile);
@@ -2456,37 +2438,16 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
     // Sync other states to match the unified inputs
     setRcptCenterNameText(centerName);
 
-    // Save custom receipt states
+    // Save custom receipt identity & terms without clobbering ReceiptDesigner / LabelDesigner layout keys
     localStorage.setItem('rcptCenterNameText', centerName);
     localStorage.setItem('rcptTermsText', rcptTermsText);
-    localStorage.setItem('rcptZoom', rcptZoom);
-    localStorage.setItem('rcptBarcodeHeight', rcptBarcodeHeight);
-    localStorage.setItem('rcptBarcodeWidth', rcptBarcodeWidth);
-    localStorage.setItem('rcptShowQR', String(rcptShowQR));
-    localStorage.setItem('rcptSize', rcptSize);
-
-    // Save custom label alignment states
-    localStorage.setItem('lblAlign', lblAlign);
-    localStorage.setItem('lblVerticalAlign', lblVerticalAlign);
-
-    // Save custom label checkboxes and sizes
-    localStorage.setItem('lblShowCenterName', String(lblShowCenterName));
-    localStorage.setItem('lblShowBarcode', String(lblShowBarcode));
-    localStorage.setItem('lblShowQR', String(lblShowQR));
-    localStorage.setItem('lblShowCustomerName', String(lblShowCustomerName));
-    localStorage.setItem('lblShowDeviceModel', String(lblShowDeviceModel));
-    localStorage.setItem('lblShowDate', String(lblShowDate));
-    localStorage.setItem('lblShowMobile', String(lblShowMobile));
-    localStorage.setItem('lblFontSizeCenterName', String(lblFontSizeCenterName));
-    localStorage.setItem('lblFontSizeMobile', String(lblFontSizeMobile));
-    localStorage.setItem('lblFontSizeBarcodeText', String(lblFontSizeBarcodeText));
-    localStorage.setItem('lblBarcodeHeight', String(lblBarcodeHeight));
-    localStorage.setItem('lblBarcodeWidth', String(lblBarcodeWidth));
-    localStorage.setItem('lblBarcodeFormat', lblBarcodeFormat);
-    localStorage.setItem('lblFontSizeCustomerName', String(lblFontSizeCustomerName));
-    localStorage.setItem('lblFontSizeDeviceModel', String(lblFontSizeDeviceModel));
-    localStorage.setItem('lblFontSizeDate', String(lblFontSizeDate));
-    localStorage.setItem('lblLineSpacing', String(lblLineSpacing));
+    if (!localStorage.getItem('rcptSize')) {
+      localStorage.setItem('rcptSize', rcptSize);
+    }
+    localStorage.setItem('lblPaperSize', FIXED_LABEL_PAPER_SIZE);
+    if (!localStorage.getItem('lblBarcodeFormat')) {
+      localStorage.setItem('lblBarcodeFormat', lblBarcodeFormat);
+    }
 
     setShowSaveToast(true);
     setTimeout(() => {
@@ -2570,7 +2531,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
             <Settings className="w-6 h-6 animate-spin-slow" />
           </div>
           <div>
-            <h2 className="font-sans font-extrabold text-xl text-gray-800">إعدادات النظام والتحكم بالبيانات</h2>
+            <h2 className="font-sans font-extrabold text-xl text-gray-800">الاعدادات</h2>
           </div>
         </div>
       </div>
@@ -2649,7 +2610,11 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
 
           <div className="pt-4 mt-4 border-t border-gray-100">
             <button
-              onClick={() => {
+              onClick={async () => {
+                await logoutUser();
+                localStorage.removeItem('isAppAuthenticated');
+                localStorage.removeItem('appCurrentUser');
+                localStorage.removeItem('db_app_settings_backup');
                 sessionStorage.removeItem('isAppAuthenticated');
                 sessionStorage.removeItem('appCurrentUser');
                 sessionStorage.removeItem('settingsUnlocked');
@@ -2670,55 +2635,63 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
           
           {/* Helper Tokens Card */}
           <div className="space-y-4">
-            <div className="bg-gradient-to-br from-teal-800 to-teal-950 rounded-3xl p-6 text-white  space-y-4">
+            <div className="bg-gradient-to-br from-teal-800 to-teal-950 rounded-3xl p-6 text-white space-y-4">
               <h4 className="font-sans font-extrabold text-sm flex items-center gap-2">
                 <span>⚠️ المتغيرات المدعومة في القوالب</span>
               </h4>
               <p className="text-teal-100 text-xs font-sans leading-relaxed">
-                يمكنك استخدام المتغيرات التالية داخل الرسائل، وسيتم تعويضها تلقائياً ببيانات الطلب والعميل الفعلية عند الإرسال:
+                يمكنك استخدام المتغيرات التالية داخل الرسائل (أو الضغط عليها أثناء تعديل القالب لإدراجها فوراً):
               </p>
               
-              <div className="space-y-2 font-mono text-xs text-teal-200">
-                <div className="bg-white/5 p-2 rounded-lg border border-white/5 flex justify-between">
-                  <span>{`{customerName}`}</span>
-                  <span className="font-sans text-[10px] text-teal-100/70">اسم العميل</span>
-                </div>
-                <div className="bg-white/5 p-2 rounded-lg border border-white/5 flex justify-between">
-                  <span>{`{orderId}`}</span>
-                  <span className="font-sans text-[10px] text-teal-100/70">رقم طلب الصيانة</span>
-                </div>
-                <div className="bg-white/5 p-2 rounded-lg border border-white/5 flex justify-between">
-                  <span>{`{device}`}</span>
-                  <span className="font-sans text-[10px] text-teal-100/70">نوع وموديل الجهاز</span>
-                </div>
-                <div className="bg-white/5 p-2 rounded-lg border border-white/5 flex justify-between">
-                  <span>{`{fault}`}</span>
-                  <span className="font-sans text-[10px] text-teal-100/70">وصف العطل</span>
-                </div>
-                <div className="bg-white/5 p-2 rounded-lg border border-white/5 flex justify-between">
-                  <span>{`{cost}`}</span>
-                  <span className="font-sans text-[10px] text-teal-100/70">التكلفة (المقدرة/الفعلية)</span>
-                </div>
-                <div className="bg-white/5 p-2 rounded-lg border border-white/5 flex justify-between">
-                  <span>{`{expectedDate}`}</span>
-                  <span className="font-sans text-[10px] text-teal-100/70">تاريخ التسليم المتوقع</span>
-                </div>
-                <div className="bg-white/5 p-2 rounded-lg border border-white/5 flex justify-between">
-                  <span>{`{trackingUrl}`}</span>
-                  <span className="font-sans text-[10px] text-teal-100/70">رابط تتبع العميل المباشر</span>
-                </div>
-                <div className="bg-white/5 p-2 rounded-lg border border-white/5 flex justify-between">
-                  <span>{`{recipient}`}</span>
-                  <span className="font-sans text-[10px] text-teal-100/70">اسم المستلم الفعلي</span>
-                </div>
-                <div className="bg-white/5 p-2 rounded-lg border border-white/5 flex justify-between">
-                  <span>{`{centerName}`}</span>
-                  <span className="font-sans text-[10px] text-teal-100/70">اسم مركز الصيانة</span>
-                </div>
+              <div className="space-y-1.5 font-mono text-xs text-teal-200 max-h-[520px] overflow-y-auto pr-1">
+                {[
+                  { token: '{customerName}', desc: 'اسم العميل' },
+                  { token: '{orderId}', desc: 'رقم الطلب' },
+                  { token: '{device}', desc: 'نوع وموديل الجهاز' },
+                  { token: '{fault}', desc: 'وصف العطل والتشخيص' },
+                  { token: '{status}', desc: 'حالة الصيانة الحالية' },
+                  { token: '{statusNote}', desc: 'ملاحظة التحديث' },
+                  { token: '{estimatedCost}', desc: 'التكلفة الأساسية / المتوقعة' },
+                  { token: '{extraCost}', desc: 'الكلف الإضافية' },
+                  { token: '{extraCostReason}', desc: 'سبب الكلفة الإضافية' },
+                  { token: '{totalCost}', desc: 'التكلفة الإجمالية الكلية' },
+                  { token: '{cost}', desc: 'التكلفة النهائية' },
+                  { token: '{advancePayment}', desc: 'الدفعة المقدمة (العربون)' },
+                  { token: '{remainingCost}', desc: 'المبلغ المتبقي' },
+                  { token: '{currency}', desc: 'العملة' },
+                  { token: '{waitingParts}', desc: 'تفاصيل انتظار القطع' },
+                  { token: '{waitingPartsDate}', desc: 'تاريخ وصول القطع المتوقع' },
+                  { token: '{receivedDate}', desc: 'تاريخ الاستلام' },
+                  { token: '{expectedDate}', desc: 'تاريخ التسليم المتوقع' },
+                  { token: '{technician}', desc: 'الفني المسؤول' },
+                  { token: '{recipient}', desc: 'اسم المستلم الفعلي' },
+                  { token: '{relation}', desc: 'صلة القرابة' },
+                  { token: '{trackingUrl}', desc: 'رابط تتبع العميل المباشر' },
+                  { token: '{centerName}', desc: 'اسم مركز الصيانة' },
+                  { token: '{centerMobile}', desc: 'رقم موبايل المركز' },
+                ].map((item) => (
+                  <button
+                    key={item.token}
+                    type="button"
+                    onClick={() => {
+                      if (!editingTemplateId) return;
+                      if (activeTemplateField === 'sms') {
+                        setSmsContent((prev) => `${prev}${prev && !prev.endsWith(' ') ? ' ' : ''}${item.token}`);
+                      } else {
+                        setWhatsappContent((prev) => `${prev}${prev && !prev.endsWith(' ') ? ' ' : ''}${item.token}`);
+                      }
+                    }}
+                    title={editingTemplateId ? `اضغط لإدراج ${item.token}` : item.desc}
+                    className={`w-full text-right bg-white/5 hover:bg-white/15 p-2 rounded-lg border border-white/5 flex justify-between items-center transition-colors ${editingTemplateId ? 'cursor-pointer' : 'cursor-default'}`}
+                  >
+                    <span dir="ltr">{item.token}</span>
+                    <span className="font-sans text-[10px] text-teal-100/80">{item.desc}</span>
+                  </button>
+                ))}
               </div>
 
               <div className="bg-white/10 p-3 rounded-xl border border-white/10 text-[10px] text-teal-100 leading-relaxed font-sans text-right" dir="rtl">
-                💡 <strong>نصيحة:</strong> استخدم النجوم <strong>*مثال*</strong> لتغميق النص في الواتساب وجعله يبدو أكثر جاذبية للعميل.
+                💡 <strong>ملاحظة:</strong> الكلف الإضافية وتفاصيل انتظار القطع والمتغيرات الجديدة المضافة أثناء تحديث الحالة يتم تضمينها تلقائياً في الرسالة حتى لو لم تُكتب يدوياً في القالب.
               </div>
             </div>
           </div>
@@ -2785,6 +2758,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
                         <span className="text-[10px] font-sans font-bold text-emerald-700 block">تعديل صيغة الواتس اب:</span>
                         <textarea
                           value={whatsappContent}
+                          onFocus={() => setActiveTemplateField('whatsapp')}
                           onChange={(e) => setWhatsappContent(e.target.value)}
                           className="w-full h-32 bg-gray-50 border border-gray-200 rounded-xl py-2 px-3 text-xs focus:outline-none focus:ring-2 focus:ring-teal-500 focus:bg-white text-right leading-relaxed font-sans"
                           placeholder="اكتب صيغة رسالة الواتس اب هنا..."
@@ -2796,6 +2770,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
                         <span className="text-[10px] font-sans font-bold text-blue-700 block">تعديل صيغة الرسالة النصية (SMS):</span>
                         <textarea
                           value={smsContent}
+                          onFocus={() => setActiveTemplateField('sms')}
                           onChange={(e) => setSmsContent(e.target.value)}
                           className="w-full h-32 bg-gray-50 border border-gray-200 rounded-xl py-2 px-3 text-xs focus:outline-none focus:ring-2 focus:ring-teal-500 focus:bg-white text-right leading-relaxed font-sans"
                           placeholder="اكتب صيغة الرسالة النصية هنا..."
@@ -2858,199 +2833,10 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
           </div>
 
           {printerSubTab === 'receipt' && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 animate-in fade-in duration-200">
-            {/* Settings Form */}
-            <div className="lg:col-span-7 bg-white rounded-3xl border border-gray-100 p-6 md:p-8  space-y-6">
-              <div>
-                <h3 className="font-sans font-bold text-gray-800 text-lg flex items-center gap-2 text-right justify-start" dir="rtl">
-                  <FileText className="w-5 h-5 text-teal-600" />
-                  <span>تخصيص وتصميم إيصال الاستلام (Receipt)</span>
-                </h3>
-                <p className="text-gray-400 text-xs mt-1 text-right">
-                  اضبط المقاسات والخطوط والبنود المطبوعة على إيصال استلام العميل الافتراضي.
-                </p>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-                {/* Receipt Zoom Level */}
-                <div className="space-y-1.5 text-right">
-                  <label className="block text-gray-700 font-sans font-bold text-xs">
-                    حجم الطباعة الكلي للوصل (نسبة التكبير Zoom)
-                  </label>
-                  <select
-                    value={rcptZoom}
-                    onChange={(e) => setRcptZoom(e.target.value)}
-                    className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-2xl font-sans text-xs focus:bg-white focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 outline-none transition-all font-semibold text-right"
-                  >
-                    <option value="80">80% (صغير جداً - اقتصادي للورق)</option>
-                    <option value="90">90% (صغير)</option>
-                    <option value="100">100% (الحجم القياسي الافتراضي)</option>
-                    <option value="110">110% (كبير ومقروء بوضوح)</option>
-                    <option value="120">120% (كبير جداً - خطوط عريضة)</option>
-                  </select>
-                </div>
-
-                {/* Receipt Size Selection */}
-                <div className="space-y-1.5 text-right">
-                  <label className="block text-gray-700 font-sans font-bold text-xs">
-                    عرض ومقاس إيصال الاستلام (Receipt Size)
-                  </label>
-                  <select
-                    value={rcptSize}
-                    onChange={(e) => setRcptSize(e.target.value)}
-                    className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-2xl font-sans text-xs focus:bg-white focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 outline-none transition-all font-semibold text-right"
-                  >
-                    <option value="80mm">حراري 80mm (قياسي لورق الفواتير)</option>
-                    <option value="58mm">حراري 58mm (للأجهزة المحمولة والمصغرة)</option>
-                    <option value="A5">ورق A5 (نصف صفحة مكتبية)</option>
-                    <option value="A4">ورق A4 (صفحة كاملة رسمية)</option>
-                  </select>
-                </div>
-              </div>
-
-              {/* Terms & Conditions Textarea */}
-              <div className="space-y-1.5 text-right">
-                <label className="block text-gray-700 font-sans font-bold text-xs">
-                  نص شروط وأحكام الصيانة المطبوعة في تذييل الوصل
-                </label>
-                <textarea
-                  value={rcptTermsText}
-                  onChange={(e) => setRcptTermsText(e.target.value)}
-                  rows={4}
-                  placeholder="اكتب شروط وأحكام الصيانة هنا، وافصل بين البنود بالنزول لسطر جديد..."
-                  className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-2xl font-sans text-xs focus:bg-white focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 outline-none transition-all font-semibold leading-relaxed"
-                />
-              </div>
-
-              <div className="pt-4 border-t border-gray-50 flex items-center justify-between gap-4">
-                <div className="text-right">
-                  {showSaveToast && (
-                    <span className="text-emerald-600 font-bold text-xs animate-pulse">
-                      ✨ تم حفظ جميع التعديلات بنجاح وتحديث المتصفح!
-                    </span>
-                  )}
-                </div>
-                <button
-                  onClick={handleSaveCenterInfo}
-                  className="px-6 py-3 bg-teal-600 hover:bg-teal-700 text-white font-sans font-bold text-xs rounded-2xl  -600/10 hover: transition-all flex items-center gap-2"
-                >
-                  <Save className="w-4 h-4" />
-                  <span>حفظ تصميم إيصال الاستلام</span>
-                </button>
-              </div>
+            <div className="space-y-6 animate-in fade-in duration-200">
+              <ReceiptDesigner />
             </div>
-
-            {/* Dynamic Interactive Preview Column */}
-            <div className="lg:col-span-5 flex flex-col items-center justify-start">
-              <div className="w-full max-w-sm sticky top-4">
-                <div className="text-center mb-2.5">
-                  <span className="text-[10px] font-sans font-bold text-gray-400 tracking-wider uppercase">معاينة تفاعلية فورية (إيصال حراري)</span>
-                </div>
-                
-                {/* Thermal Paper Container */}
-                <div 
-                  className="bg-[#FAF9F6] text-gray-800 p-6 border border-gray-200 rounded-t-sm relative overflow-hidden transition-all duration-300" 
-                  style={{ 
-                    transform: `scale(${parseFloat(rcptZoom) / 100})`, 
-                    transformOrigin: 'top center',
-                    fontFamily: ARABIC_FONTS.find(f => f.id === rcptFormat.fontFamily)?.css || 'inherit',
-                    fontSize: `${rcptFormat.fontSize}pt`,
-                    textAlign: rcptFormat.textAlign,
-                    lineHeight: rcptFormat.lineHeight,
-                    fontWeight: rcptFormat.fontWeight === '900' ? 900 : rcptFormat.fontWeight === 'bold' ? 700 : 400
-                  }}
-                >
-                  
-                  {/* Decorative Header */}
-                  <div className="border-b-2 border-dashed border-gray-300 pb-3 text-center flex flex-col items-center justify-center">
-                    {centerLogo && (
-                      <img
-                        src={centerLogo}
-                        alt="Logo"
-                        className="w-10 h-10 rounded-lg object-cover mb-1 border border-gray-250"
-                        referrerPolicy="no-referrer"
-                      />
-                    )}
-                    <h4 className="font-extrabold text-sm tracking-tight text-gray-900">{centerName || 'مركز الصيانة الذكي'}</h4>
-                    <p className="text-[10px] text-gray-500 mt-1">هاتف: {centerMobile || '05xxxxxxxx'}</p>
-                  </div>
-
-                  {/* Receipt Body */}
-                  <div className="py-4 space-y-3 text-[11px] border-b border-dashed border-gray-300">
-                    <div className="flex justify-between">
-                      <span className="font-mono font-bold text-teal-800">#{currentLiveBarcode}</span>
-                      <span className="font-bold text-gray-500">رقم الفاتورة:</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="font-mono">2026/07/09 11:30</span>
-                      <span className="font-bold text-gray-500">التاريخ والوقت:</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span>أحمد عبد الله</span>
-                      <span className="font-bold text-gray-500">اسم العميل:</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span>آيفون 14 برو ماكس - فضي</span>
-                      <span className="font-bold text-gray-500">الجهاز:</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span>شاشة مكسورة + بطارية ضعيفة</span>
-                      <span className="font-bold text-gray-500">العطل الموصوف:</span>
-                    </div>
-                  </div>
-
-                  {/* Barcode Preview - Real Unencrypted Barcode & Clear Text */}
-                  <div className="py-4 flex flex-col items-center justify-center border-b border-dashed border-gray-300">
-                    <div className="w-full max-w-[200px] flex flex-col items-center justify-center bg-white p-2 rounded-xl border border-gray-200">
-                      <BarcodeGenerator 
-                        value={currentLiveBarcode} 
-                        width={1.2} 
-                        height={35} 
-                        showText={true} 
-                        format="CODE128" 
-                        fontSize={10} 
-                      />
-                    </div>
-                    <span className="text-[9px] text-gray-400 mt-1 font-sans">باركود غير مشفر ومقروء بوضوح للطلب</span>
-                  </div>
-
-                  {/* QR Code Preview */}
-                  {rcptShowQR && (
-                    <div className="py-3 flex flex-col items-center justify-center border-b border-dashed border-gray-300">
-                      <div className="w-16 h-16 bg-white border border-gray-200 p-1 rounded flex flex-col items-center justify-center gap-1">
-                        <div className="grid grid-cols-4 gap-1 w-full h-full opacity-70">
-                          {Array.from({ length: 16 }).map((_, i) => (
-                            <div key={i} className={`rounded-sm ${i % 3 === 0 || i % 5 === 2 ? 'bg-black' : 'bg-transparent'}`} />
-                          ))}
-                        </div>
-                      </div>
-                      <span className="text-[8px] text-gray-400 mt-1">امسح الكود لتتبع حالة جهازك مباشرة</span>
-                    </div>
-                  )}
-
-                  {/* Terms Preview */}
-                  <div className="pt-3 text-[9px] text-gray-500 text-center leading-normal space-y-1 font-medium">
-                    <p className="font-bold text-gray-700">شروط وأحكام الصيانة:</p>
-                    {rcptTermsText ? (
-                      rcptTermsText.split('\n').map((line, idx) => (
-                        <p key={idx}>{line}</p>
-                      ))
-                    ) : (
-                      <p>لا توجد شروط مدخلة حالياً.</p>
-                    )}
-                  </div>
-
-                  {/* Faux Tear Strip Bottom Edge */}
-                  <div className="absolute bottom-0 left-0 right-0 h-2 bg-gradient-to-t from-gray-200/50 to-transparent flex overflow-hidden">
-                    {Array.from({ length: 40 }).map((_, i) => (
-                      <div key={i} className="w-4 h-4 bg-white rotate-45 transform origin-top-left -translate-y-2 shrink-0 border border-gray-100" />
-                    ))}
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
+          )}
 
         {printerSubTab === 'label' && (
           <div className="space-y-6 animate-in fade-in duration-200">
@@ -3355,8 +3141,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
                 
                 {/* Backup & Restore */}
                 <div className="space-y-3 pb-4 border-b border-gray-100">
-                  <div className="bg-teal-50 border border-teal-100 p-4 rounded-2xl flex flex-col items-center gap-3">
-                    <p className="text-[11px] text-teal-800 text-center font-medium">استيراد وتصدير الأسماء وجهات الاتصال بشكل مستقل (يدعم ملفات VCF/Excel)</p>
+                  <div className="bg-teal-50 border border-teal-100 p-3 rounded-2xl flex flex-col items-center">
                     <button
                       onClick={() => setShowNamesBackupModal(true)}
                       className="w-full py-2.5 bg-teal-600 hover:bg-teal-700 text-white text-xs font-sans font-bold rounded-xl transition-all flex items-center justify-center gap-1.5 shadow-lg shadow-teal-500/20"
@@ -3366,8 +3151,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
                     </button>
                   </div>
 
-                  <div className="bg-emerald-50 border border-emerald-100 p-4 rounded-2xl flex flex-col items-center gap-3">
-                    <p className="text-[11px] text-emerald-800 text-center font-medium">استيراد وتصدير سجلات الزبائن (طلبات الصيانة) بصيغة Excel</p>
+                  <div className="bg-emerald-50 border border-emerald-100 p-3 rounded-2xl flex flex-col items-center">
                     <button
                       onClick={() => setShowOrdersBackupModal(true)}
                       className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-sans font-bold rounded-xl transition-all flex items-center justify-center gap-1.5 shadow-lg shadow-emerald-500/20"
@@ -3377,8 +3161,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
                     </button>
                   </div>
 
-                  <div className="bg-amber-50 border border-amber-100 p-4 rounded-2xl flex flex-col items-center gap-3">
-                    <p className="text-[11px] text-amber-800 text-center font-medium">استيراد وتصدير سجلات الرسائل والإشعارات السابقة بصيغة Excel</p>
+                  <div className="bg-amber-50 border border-amber-100 p-3 rounded-2xl flex flex-col items-center">
                     <button
                       onClick={() => setShowLogsBackupModal(true)}
                       className="w-full py-2.5 bg-amber-600 hover:bg-amber-700 text-white text-xs font-sans font-bold rounded-xl transition-all flex items-center justify-center gap-1.5 shadow-lg shadow-amber-500/20"
@@ -3388,8 +3171,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
                     </button>
                   </div>
 
-                  <div className="bg-blue-50 border border-blue-100 p-4 rounded-2xl flex flex-col items-center gap-3">
-                    <p className="text-[11px] text-blue-800 text-center font-medium">استيراد وتصدير إعدادات النظام وقوالب الرسائل (Excel / JSON)</p>
+                  <div className="bg-blue-50 border border-blue-100 p-3 rounded-2xl flex flex-col items-center">
                     <button
                       onClick={() => setShowSettingsBackupModal(true)}
                       className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-sans font-bold rounded-xl transition-all flex items-center justify-center gap-1.5 shadow-lg shadow-blue-500/20"
@@ -3399,8 +3181,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
                     </button>
                   </div>
 
-                  <div className="bg-indigo-50 border border-indigo-100 p-4 rounded-2xl flex flex-col items-center gap-3 mt-6">
-                    <p className="text-[11px] text-indigo-800 text-center font-medium">النسخ الاحتياطي واستعادة قاعدة البيانات بالكامل (إعدادات، صيانة، أرشيف)</p>
+                  <div className="bg-indigo-50 border border-indigo-100 p-3 rounded-2xl flex flex-col items-center">
                     <button
                       onClick={() => setShowBackupModal(true)}
                       className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-sans font-bold rounded-xl transition-all flex items-center justify-center gap-1.5 shadow-lg shadow-indigo-500/20"
@@ -3463,60 +3244,41 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
         <div className="space-y-6 animate-in fade-in duration-300">
           
           {/* Header Banner */}
-          <div className="bg-gradient-to-r from-teal-800 to-teal-950 rounded-3xl p-6 md:p-8 text-white  relative overflow-hidden">
+          <div className="bg-gradient-to-r from-teal-800 to-teal-950 rounded-3xl p-5 md:p-6 text-white relative overflow-hidden">
             <div className="absolute top-0 left-0 w-64 h-64 bg-teal-700/20 rounded-full blur-3xl -translate-x-1/2 -translate-y-1/2" />
             <div className="absolute bottom-0 right-0 w-96 h-96 bg-emerald-600/10 rounded-full blur-3xl translate-x-1/3 translate-y-1/3" />
             
-            <div className="relative z-10 flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
-              <div className="space-y-2">
-                <span className="bg-teal-500/30 text-teal-200 border border-teal-500/30 text-[10px] font-sans font-bold px-2.5 py-1 rounded-full uppercase tracking-wider">
-                  هوية المركز والاتصال
-                </span>
-                <h3 className="font-sans font-extrabold text-2xl">إعدادات هوية مركز الصيانة والمهندس</h3>
-                <p className="text-teal-100/80 text-xs md:text-sm font-sans max-w-2xl leading-relaxed">
-                  هنا يمكنك تخصيص بيانات مركز الصيانة الخاص بك كاسم المركز، والبريد الإلكتروني، ورقم موبايل التواصل الافتراضي، والمهندس المسؤول عن الصيانة. ستنعكس هذه التفاصيل مباشرة على ترويسة وتفاصيل فواتير وإيصالات استلام الصيانة المطبوعة للعملاء.
-                </p>
+            <div className="relative z-10 flex items-center justify-start gap-3">
+              <div className="w-10 h-10 rounded-2xl bg-white/10 backdrop-blur-md border border-white/10 flex items-center justify-center shrink-0">
+                <Store className="w-6 h-6 text-emerald-400" />
               </div>
-
-              <div className="bg-white/10 backdrop-blur-md p-4 rounded-2xl border border-white/10 shrink-0 flex items-center gap-3">
-                <Store className="w-8 h-8 text-emerald-400" />
-                <div className="font-sans">
-                  <div className="text-[10px] text-teal-200 font-semibold">تخصيص الهوية</div>
-                  <div className="text-xs font-bold text-white">تخصيص المطبوعات والفواتير</div>
-                </div>
-              </div>
+              <h3 className="font-sans font-extrabold text-xl md:text-2xl text-white">
+                هوية المركز
+              </h3>
             </div>
           </div>
 
           {/* Form Card */}
-          <div className="bg-white rounded-3xl border border-gray-100 p-6 md:p-8  space-y-6 shadow-[0_20px_60px_-15px_rgba(0,0,0,0.3)]">
-            <h4 className="font-sans font-extrabold text-gray-800 text-sm pb-3 border-b border-gray-100 flex items-center gap-2">
-              <Sliders className="w-5 h-5 text-teal-600" />
-              <span>البيانات الأساسية لمركز الصيانة</span>
-            </h4>
-
+          <div className="bg-white rounded-3xl border border-gray-100 p-6 md:p-8 space-y-6 shadow-[0_20px_60px_-15px_rgba(0,0,0,0.3)]">
             {/* Store Logo Management Section */}
             <div className="p-5 bg-teal-50/30 rounded-2xl border border-teal-100/50 space-y-4">
-              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-right">
-                <div>
-                  <h5 className="font-sans font-bold text-gray-800 text-xs flex items-center gap-2 justify-end">
-                    <Image className="w-4 h-4 text-teal-600" />
-                    <span>شعار المتجر أو مركز الصيانة (اللوغو)</span>
-                  </h5>
-                  <p className="text-[10px] text-gray-400 mt-0.5">شعار المتجر يظهر في ترويسة الموقع وأيضاً على إيصالات الفواتير والمطبوعات المطبوعة للعملاء.</p>
-                </div>
+              <div className="text-right">
+                <h5 className="font-sans font-bold text-gray-800 text-xs flex items-center gap-2 justify-start">
+                  <Image className="w-4 h-4 text-teal-600" />
+                  <span>شعار المركز</span>
+                </h5>
               </div>
 
-              <div className="flex flex-col sm:flex-row items-center gap-6">
+              <div className="flex flex-col items-center justify-center gap-4 py-2 text-center">
                 {/* Logo Preview box */}
-                <div className="relative w-24 h-24 rounded-2xl bg-gray-50 border-2 border-dashed border-gray-200 flex items-center justify-center overflow-hidden group shrink-0">
+                <div className="relative w-28 h-28 rounded-3xl bg-gray-50 border-2 border-dashed border-teal-300 flex items-center justify-center overflow-hidden group shrink-0 shadow-xs">
                   {centerLogo ? (
                     <>
                       <img src={centerLogo} alt="Logo Preview" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
                       <button
                         type="button"
                         onClick={() => setCenterLogo('')}
-                        className="absolute inset-0 bg-black/55 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white"
+                        className="absolute inset-0 bg-black/55 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white cursor-pointer"
                         title="حذف الشعار الحالي"
                       >
                         <Trash2 className="w-5 h-5 text-rose-200 hover:text-rose-400" />
@@ -3524,40 +3286,37 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
                     </>
                   ) : (
                     <div className="text-center p-3 text-gray-300">
-                      <Image className="w-7 h-7 mx-auto mb-1 opacity-70" />
-                      <span className="text-[9px] font-bold block">لا يوجد شعار</span>
+                      <Image className="w-8 h-8 mx-auto mb-1 opacity-70 text-teal-600" />
+                      <span className="text-[10px] font-bold block text-gray-400">لا يوجد شعار</span>
                     </div>
                   )}
                 </div>
 
                 {/* Upload & Camera Buttons */}
-                <div className="space-y-2.5 w-full sm:w-auto">
-                  <div className="flex flex-wrap gap-2.5">
-                    {/* Choose File Button */}
-                    <button
-                      type="button"
-                      onClick={() => fileInputRef.current?.click()}
-                      className="px-4 py-2.5 bg-white hover:bg-gray-50 border border-gray-200 text-gray-700 text-xs font-sans font-bold rounded-xl transition-all flex items-center gap-1.5  cursor-pointer"
-                    >
-                      <Upload className="w-4 h-4 text-teal-600" />
-                      <span>اختيار ملف صورة الشعار</span>
-                    </button>
+                <div className="flex flex-wrap items-center justify-center gap-2.5">
+                  {/* Choose File Button */}
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="px-4 py-2.5 bg-white hover:bg-gray-50 border border-gray-200 text-gray-700 text-xs font-sans font-bold rounded-xl transition-all flex items-center gap-1.5 cursor-pointer shadow-xs active:scale-95"
+                  >
+                    <Upload className="w-4 h-4 text-teal-600" />
+                    <span>اختيار ملف صورة الشعار</span>
+                  </button>
 
-                    {/* Camera Capture Button */}
-                    <button
-                      type="button"
-                      onClick={showCamera ? stopCamera : startCamera}
-                      className={`px-4 py-2.5 text-xs font-sans font-bold rounded-xl transition-all flex items-center gap-1.5  cursor-pointer ${
-                        showCamera 
-                          ? 'bg-rose-50 hover:bg-rose-100 border border-rose-100 text-rose-600'
-                          : 'bg-white hover:bg-gray-50 border border-gray-200 text-gray-700'
-                      }`}
-                    >
-                      <Camera className="w-4 h-4 text-teal-600" />
-                      <span>{showCamera ? 'إيقاف الكاميرا' : 'التقاط صورة فورا بالكاميرا'}</span>
-                    </button>
-                  </div>
-                  <p className="text-[10px] text-gray-400 leading-normal">يدعم صيغ JPG, PNG. يتم ضغط الصورة تلقائياً لسرعة تحميل الفاتورة وتوفير مساحة التخزين.</p>
+                  {/* Camera Capture Button */}
+                  <button
+                    type="button"
+                    onClick={showCamera ? stopCamera : startCamera}
+                    className={`px-4 py-2.5 text-xs font-sans font-bold rounded-xl transition-all flex items-center gap-1.5 cursor-pointer shadow-xs active:scale-95 ${
+                      showCamera 
+                        ? 'bg-rose-50 hover:bg-rose-100 border border-rose-100 text-rose-600'
+                        : 'bg-white hover:bg-gray-50 border border-gray-200 text-gray-700'
+                    }`}
+                  >
+                    <Camera className="w-4 h-4 text-teal-600" />
+                    <span>{showCamera ? 'إيقاف الكاميرا' : 'التقاط صورة فورا بالكاميرا'}</span>
+                  </button>
                 </div>
               </div>
 
@@ -3627,7 +3386,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
               {/* Center Name */}
               <div className="space-y-2 text-right">
                 <label className="block text-gray-700 font-sans font-bold text-xs">
-                  اسم مركز الصيانة الموحد (يظهر على الفاتورة، الوصل، والملصق)
+                  اسم المركز
                 </label>
                 <input
                   type="text"
@@ -3641,7 +3400,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
               {/* Engineer Name */}
               <div className="space-y-2 text-right">
                 <label className="block text-gray-700 font-sans font-bold text-xs">
-                  اسم المهندس المسؤول / الفني الافتراضي
+                  اسم المهندس
                 </label>
                 <input
                   type="text"
@@ -3655,7 +3414,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
               {/* Center Mobile */}
               <div className="space-y-2 text-right">
                 <label className="block text-gray-700 font-sans font-bold text-xs">
-                  رقم موبايل مركز الصيانة الموحد (يظهر على الوصل والملصق)
+                  رقم الموبايل
                 </label>
                 <input
                   type="text"
@@ -3682,43 +3441,51 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
                 />
               </div>
 
-              {/* Currency Name */}
+              {/* 1. Country Dropdown */}
               <div className="space-y-2 text-right">
-                <label className="block text-gray-700 font-sans font-bold text-xs flex items-center gap-1.5 justify-end">
-                  <Coins className="w-3.5 h-3.5 text-teal-600" />
-                  <span>العملة الافتراضية للنظام:</span>
+                <label className="block text-gray-700 font-sans font-bold text-xs flex items-center gap-1.5 justify-start">
+                  <Globe className="w-3.5 h-3.5 text-teal-600" />
+                  <span>البلد</span>
                 </label>
-                <div className="flex flex-col gap-2">
-                  <input
-                    type="text"
-                    value={currencyName}
-                    onChange={(e) => setCurrencyName(e.target.value)}
-                    placeholder="مثال: دينار، ريال، درهم، دولار..."
-                    className="w-full px-4 py-3 bg-gray-50 border border-gray-100 rounded-2xl font-sans text-xs focus:bg-white focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 outline-none transition-all font-semibold text-right"
-                  />
+                <div className="relative">
+                  <select
+                    value={countryName}
+                    onChange={(e) => handleCountrySelectChange(e.target.value)}
+                    className="w-full px-4 py-3 bg-gray-50 border border-gray-100 rounded-2xl font-sans text-xs focus:bg-white focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 outline-none transition-all font-semibold text-right cursor-pointer"
+                  >
+                    <option value="">-- اختر البلد لتحديث العملة والرمز تلقائياً --</option>
+                    {COUNTRIES_LIST.map((c) => (
+                      <option key={c.name} value={c.name}>
+                        {c.name} ({c.currency} | +{c.dialCode})
+                      </option>
+                    ))}
+                    {countryName && !COUNTRIES_LIST.some((c) => c.name === countryName) && (
+                      <option value={countryName}>{countryName} (مخصص)</option>
+                    )}
+                  </select>
                 </div>
               </div>
 
-              {/* Country Name */}
+              {/* 2. Currency Name */}
               <div className="space-y-2 text-right">
-                <label className="block text-gray-700 font-sans font-bold text-xs flex items-center gap-1.5 justify-end">
-                  <Globe className="w-3.5 h-3.5 text-teal-600" />
-                  <span>اسم البلد (يظهر في ترويسة الإيصال)</span>
+                <label className="block text-gray-700 font-sans font-bold text-xs flex items-center gap-1.5 justify-start">
+                  <Coins className="w-3.5 h-3.5 text-teal-600" />
+                  <span>العملة</span>
                 </label>
                 <input
                   type="text"
-                  value={countryName}
-                  onChange={(e) => setCountryName(e.target.value)}
-                  placeholder="مثال: الأردن"
+                  value={currencyName}
+                  onChange={(e) => setCurrencyName(e.target.value)}
+                  placeholder="مثال: دينار، ريال، درهم، دولار..."
                   className="w-full px-4 py-3 bg-gray-50 border border-gray-100 rounded-2xl font-sans text-xs focus:bg-white focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 outline-none transition-all font-semibold text-right"
                 />
               </div>
 
-              {/* Country Dial Code */}
+              {/* 3. Country Dial Code */}
               <div className="space-y-2 text-right">
-                <label className="block text-gray-700 font-sans font-bold text-xs flex items-center gap-1.5 justify-end">
+                <label className="block text-gray-700 font-sans font-bold text-xs flex items-center gap-1.5 justify-start">
                   <Phone className="w-3.5 h-3.5 text-teal-600" />
-                  <span>الرمز الدولي للبلد (بدون علامة + أو أصفار)</span>
+                  <span>الرمز الدولي</span>
                 </label>
                 <input
                   type="text"
@@ -3729,13 +3496,84 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
                   className="w-full px-4 py-3 bg-gray-50 border border-gray-100 rounded-2xl font-sans text-xs text-right focus:bg-white focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 outline-none transition-all font-semibold"
                 />
               </div>
+
+              {/* Active Country Timezone Preview */}
+              <div className="md:col-span-2 bg-gray-50 border border-gray-100 rounded-2xl px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-right">
+                <div className="text-[11px] font-sans font-bold text-gray-700 flex items-center gap-1.5">
+                  <Clock className="w-3.5 h-3.5 text-teal-600" />
+                  <span>التوقيت المحلي المستخدم لرقم الطلب ({countryName || 'الأردن'}):</span>
+                  <span dir="ltr" className="font-mono text-teal-700">
+                    {resolveCountryTimeZone({ countryName, countryDialCode })}
+                  </span>
+                </div>
+                <div className="text-[11px] font-mono font-bold text-teal-800 bg-white px-2.5 py-1 rounded-xl border border-teal-100" dir="ltr">
+                  {formatCountryDateTime24h(new Date(), { countryName, countryDialCode })} (24h) · {currentLiveBarcode}
+                </div>
+              </div>
+
+              {/* 4. Built-in Website Domain */}
+              <div className="md:col-span-2 bg-teal-50/50 border border-teal-100 rounded-2xl p-4 space-y-3 text-right">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <label className="text-gray-800 font-sans font-extrabold text-xs flex items-center gap-1.5 justify-start">
+                    <Globe className="w-4 h-4 text-teal-600" />
+                    <span>نطاق الموقع المدمج (Built-in Domain)</span>
+                  </label>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setWebsiteDomain(BUILT_IN_APP_DOMAIN)}
+                      className="px-2.5 py-1 bg-white hover:bg-teal-50 text-teal-700 border border-teal-200 rounded-lg text-[10px] font-bold transition-colors cursor-pointer"
+                    >
+                      النطاق السحابي المدمج
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setWebsiteDomain(FIREBASE_HOSTING_DOMAIN)}
+                      className="px-2.5 py-1 bg-white hover:bg-teal-50 text-gray-700 border border-gray-200 rounded-lg text-[10px] font-bold transition-colors cursor-pointer"
+                    >
+                      نطاق Firebase
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const normalized = normalizeDomainUrl(websiteDomain);
+                        try {
+                          await navigator.clipboard.writeText(normalized);
+                          setDomainCopied(true);
+                          setTimeout(() => setDomainCopied(false), 2000);
+                        } catch (_) {}
+                      }}
+                      className="px-2.5 py-1 bg-teal-600 hover:bg-teal-700 text-white rounded-lg text-[10px] font-bold transition-colors flex items-center gap-1 cursor-pointer"
+                    >
+                      {domainCopied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                      <span>{domainCopied ? 'تم النسخ' : 'نسخ الرابط'}</span>
+                    </button>
+                  </div>
+                </div>
+
+                <input
+                  type="url"
+                  value={websiteDomain}
+                  onChange={(e) => setWebsiteDomain(e.target.value)}
+                  placeholder={BUILT_IN_APP_DOMAIN}
+                  dir="ltr"
+                  className="w-full px-4 py-2.5 bg-white border border-teal-200/80 rounded-xl font-mono text-xs text-left focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 outline-none transition-all font-semibold text-gray-800"
+                />
+
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-[10px] text-teal-800/90 font-sans">
+                  <span>تستخدم روابط تتبع العملاء ورموز الـ QR هذا النطاق تلقائياً عند الطباعة والإرسال.</span>
+                  <span className="font-mono text-gray-500 truncate max-w-full" dir="ltr">
+                    مثال: {buildTrackingUrl(currentLiveBarcode, websiteDomain)}
+                  </span>
+                </div>
+              </div>
             </div>
 
-            {/* Custom Invoice Footer / Terms section */}
+            {/* 4. Custom Invoice Footer / Terms (Notes) section */}
             <div className="pt-6 border-t border-gray-100 space-y-4">
-              <h5 className="font-sans font-extrabold text-gray-800 text-xs flex items-center gap-2 justify-end">
+              <h5 className="font-sans font-extrabold text-gray-800 text-xs flex items-center gap-2 justify-start">
                 <FileText className="w-4 h-4 text-teal-600" />
-                <span>نص وملاحظات أسفل الفاتورة (الضمان والشروط والأحكام)</span>
+                <span>ملاحظات</span>
               </h5>
               <p className="text-[10px] text-gray-400 text-right">
                 اكتب نصاً مخصصاً ليظهر في أسفل الفاتورة وإيصالات استلام الصيانة المطبوعة لعملائك (مثلاً: ملاحظات الضمان، شروط الاستلام، والتعليمات الهامة للمحل).
@@ -3747,54 +3585,16 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
                   onChange={(e) => setRcptTermsText(e.target.value)}
                   rows={4}
                   placeholder="اكتب شروط وأحكام الصيانة وملاحظات الضمان هنا..."
-                  className="w-full px-4 py-3 bg-gray-50 border border-gray-100 rounded-2xl font-sans text-xs focus:bg-white focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 outline-none transition-all font-semibold leading-relaxed"
+                  className="w-full px-4 py-3 bg-gray-50 border border-gray-100 rounded-2xl font-sans text-xs focus:bg-white focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 outline-none transition-all font-semibold leading-relaxed text-right"
                 />
               </div>
             </div>
 
-            {/* User Login & Firebase Auth Status Section */}
-            <div className="pt-6 border-t border-gray-100 space-y-4">
-              <h5 className="font-sans font-extrabold text-gray-800 text-xs flex items-center gap-2 justify-end">
-                <ShieldCheck className="w-4 h-4 text-emerald-600" />
-                <span>حساب Firebase والمصادقة السحابية وعزل البيانات</span>
-              </h5>
-              <p className="text-[10px] text-gray-400 text-right">
-                يعتمد النظام حصرياً على مصادقة Google Firebase Authentication المباشرة. يتم عزل وتشفير كافة طلبات الصيانة والبيانات بشكل كامل تحت مسار معرف المستخدم (UID) الخاص بحسابك.
-              </p>
-
-              <div className="p-4 bg-emerald-50/40 rounded-2xl border border-emerald-100 space-y-3 text-right">
-                <div className="flex items-center justify-between flex-row-reverse">
-                  <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-100/80 text-emerald-800 rounded-full text-[11px] font-bold">
-                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                    نظام العزل السحابي نشط
-                  </span>
-                  <span className="text-xs font-bold text-gray-700">نوع المصادقة: سحابية متقدمة (Firebase Auth)</span>
-                </div>
-
-                <div className="bg-white rounded-xl p-3 border border-emerald-100/80 space-y-2 text-xs">
-                  <div className="flex justify-between items-center flex-row-reverse text-gray-700">
-                    <span className="font-bold">المستخدم المسجل حالياً:</span>
-                    <span className="font-mono text-emerald-700 font-semibold">{getCurrentUserId() || 'مجهول'}</span>
-                  </div>
-                  <div className="flex justify-between items-center flex-row-reverse text-gray-600 text-[11px]">
-                    <span>مسار البيانات السحابية الحصري:</span>
-                    <span className="font-mono bg-gray-100 px-2 py-0.5 rounded text-gray-700" dir="ltr">
-                      users/{'{'}UID{'}'}/orders
-                    </span>
-                  </div>
-                </div>
-
-                <p className="text-[10px] text-gray-500 leading-relaxed font-sans">
-                  🛡️ تم إلغاء تسجيل الدخول المحلي التقليدي القديم نهائياً. كل جهاز أو حساب مسجل يرى ويتحكم فقط في طلباته الخاصة ولا يمكن لأي حساب آخر الوصول إليها.
-                </p>
-              </div>
-            </div>
-
-            {/* Save Button */}
-            <div className="pt-4 border-t border-gray-50 flex justify-end">
+            {/* Save Button (Aligned to the Right) */}
+            <div className="pt-4 border-t border-gray-50 flex justify-start">
               <button
                 onClick={handleSaveCenterInfo}
-                className="px-6 py-3 bg-teal-600 hover:bg-teal-700 text-white font-sans font-bold text-xs rounded-2xl  -600/10 hover: transition-all flex items-center gap-2"
+                className="px-6 py-3 bg-teal-600 hover:bg-teal-700 text-white font-sans font-bold text-xs rounded-2xl transition-all flex items-center gap-2 cursor-pointer shadow-md"
               >
                 <Save className="w-4 h-4" />
                 <span>حفظ بيانات وهوية المركز</span>
@@ -3826,58 +3626,6 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
       {/* Real-world Thermal Printer Test Receipt Modal */}
       {showTestPrintModal && (
         <div className="fixed inset-0 bg-transparent z-50 flex items-start justify-center p-2 pt-1 sm:pt-2 overflow-y-auto font-sans no-print">
-          {/* Print isolation styles */}
-          <style dangerouslySetInnerHTML={{ __html: `
-            @media print {
-              body * {
-                visibility: hidden !important;
-              }
-              #test-receipt-print-modal, #test-receipt-print-modal * {
-                visibility: visible !important;
-              }
-              html, body, #root {
-                margin: 0 !important;
-                padding: 0 !important;
-                height: auto !important;
-                overflow: visible !important;
-                background: white !important;
-                color: black !important;
-                direction: rtl !important;
-              }
-              /* Reset any fixed overlays or animated containers */
-              .fixed, [class*="fixed"], [class*="animate-in"] {
-                position: static !important;
-                transform: none !important;
-                animation: none !important;
-                background: none !important;
-                backdrop-filter: none !important;
-                box-shadow: none !important;
-                border: none !important;
-                padding: 0 !important;
-                margin: 0 !important;
-                width: auto !important;
-                height: auto !important;
-                overflow: visible !important;
-              }
-              #test-receipt-print-modal {
-                position: absolute !important;
-                left: 0 !important;
-                top: 0 !important;
-                width: ${testPrintSize === '80mm' ? '80mm' : '58mm'} !important;
-                background: white !important;
-                border: none !important;
-                box-shadow: none !important;
-                padding: 8px !important;
-                margin: 0 !important;
-                display: block !important;
-                visibility: visible !important;
-              }
-              .no-print {
-                display: none !important;
-              }
-            }
-          `}} />
-
           <div className="bg-white rounded-3xl max-w-md w-full overflow-hidden shadow-2xl border border-gray-200 p-6 space-y-6 text-right animate-in slide-in-from-top-2 duration-150 mb-4">
             {/* Modal Header */}
             <div className="border-b border-gray-100 pb-3.5 flex justify-between items-center">
@@ -3927,37 +3675,37 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
               <span className="text-[10px] text-gray-400 font-bold">معاينة الإيصال على الشاشة:</span>
               <div 
                 id="test-receipt-print-modal"
-                className={`bg-gray-50 p-4 rounded-2xl border border-gray-200/60 mx-auto text-black font-mono text-[11px] leading-relaxed select-none ${
-                  testPrintSize === '80mm' ? 'w-[76mm] max-w-full' : 'w-[54mm] max-w-full'
+                className={`bg-gray-50 p-3 sm:p-4 rounded-2xl border border-gray-200/60 mx-auto text-black font-mono text-[11px] leading-relaxed select-none w-full break-words [overflow-wrap:anywhere] ${
+                  testPrintSize === '80mm' ? 'max-w-[76mm]' : 'max-w-[54mm]'
                 }`}
                 style={{ direction: 'rtl' }}
               >
                 <div className="text-center space-y-1 mb-3">
-                  <div className="font-sans font-bold text-sm">ورشة الإلكترونيات الذكية</div>
-                  <div className="text-[9px] text-gray-500 font-sans">إصلاح الهواتف، الحواسيب، والقطع الدقيقة</div>
-                  <div className="text-[8px] text-gray-400">هاتف: 0500000000 | ص.ب: 12345</div>
+                  <div className="font-sans font-bold text-sm break-words">ورشة الإلكترونيات الذكية</div>
+                  <div className="text-[9px] text-gray-500 font-sans break-words">إصلاح الهواتف، الحواسيب، والقطع الدقيقة</div>
+                  <div className="text-[8px] text-gray-400 break-words">هاتف: 0500000000 | ص.ب: 12345</div>
                 </div>
 
                 <div className="border-t border-dashed border-gray-300 py-2 text-[10px] space-y-1 text-right">
-                  <div><strong>رقم الفحص:</strong> TEST-9999</div>
-                  <div><strong>التاريخ:</strong> {new Date().toLocaleString('ar-SA')}</div>
-                  <div><strong>طريقة الاختبار:</strong> متصفح الويب الآمن</div>
+                  <div className="flex flex-wrap gap-x-1.5"><strong>رقم الفحص:</strong> <span className="tabular-nums">TEST-9999</span></div>
+                  <div className="flex flex-wrap gap-x-1.5"><strong>التاريخ:</strong> <span className="tabular-nums">{new Date().toLocaleString('ar-SA')}</span></div>
+                  <div className="flex flex-wrap gap-x-1.5"><strong>طريقة الاختبار:</strong> <span>متصفح الويب الآمن</span></div>
                 </div>
 
-                <div className="border-t border-b border-dashed border-gray-300 py-2.5 my-2">
-                  <div className="flex justify-between font-bold text-xs text-gray-950">
+                <div className="border-t border-b border-dashed border-gray-300 py-2.5 my-2 space-y-1">
+                  <div className="flex flex-wrap justify-between gap-x-2 font-bold text-xs text-gray-950">
                     <span>البند</span>
                     <span>الحالة</span>
                   </div>
-                  <div className="flex justify-between text-[10px] mt-1.5 text-gray-700">
+                  <div className="flex flex-wrap justify-between gap-x-2 text-[10px] mt-1.5 text-gray-700">
                     <span>فحص محاذاة النص</span>
                     <span>ناجح ✓</span>
                   </div>
-                  <div className="flex justify-between text-[10px] text-gray-700">
+                  <div className="flex flex-wrap justify-between gap-x-2 text-[10px] text-gray-700">
                     <span>فحص الهوامش</span>
                     <span>متطابق ✓</span>
                   </div>
-                  <div className="flex justify-between text-[10px] text-gray-700">
+                  <div className="flex flex-wrap justify-between gap-x-2 text-[10px] text-gray-700">
                     <span>طباعة الفواتير</span>
                     <span>جاهز للعمل</span>
                   </div>
@@ -3969,7 +3717,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
                   <div className="text-[8px] tracking-widest text-gray-500">*TEST-SYSTEM-SUCCESS*</div>
                 </div>
 
-                <div className="text-center text-[9px] text-gray-500 pt-1 font-sans border-t border-dashed border-gray-300">
+                <div className="text-center text-[9px] text-gray-500 pt-1 font-sans border-t border-dashed border-gray-300 break-words">
                   شكراً لاستخدامكم نظام إدارة الصيانة الذكي
                   <br />
                   www.smart-workshop.com
@@ -4023,102 +3771,6 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
       {/* Real-world Thermal Printer Test Label Modal */}
       {showLabelTestModal && (
         <div className="fixed inset-0 bg-transparent z-50 flex items-start justify-center p-2 pt-1 sm:pt-2 overflow-y-auto font-sans no-print">
-            {/* Print isolation styles for Label */}
-            <style dangerouslySetInnerHTML={{ __html: `
-              @media print {
-                body * {
-                  visibility: hidden !important;
-                }
-                #test-label-print-modal, #test-label-print-modal * {
-                  visibility: visible !important;
-                }
-                * {
-                  box-sizing: border-box !important;
-                }
-                @page {
-                  size: ${paperWidthMm} ${paperHeightMm};
-                  margin: 0 !important;
-                }
-                html, body {
-                  margin: 0 !important;
-                  padding: 0 !important;
-                  width: ${paperWidthMm} !important;
-                  height: ${paperHeightMm} !important;
-                  max-width: ${paperWidthMm} !important;
-                  max-height: ${paperHeightMm} !important;
-                  overflow: hidden !important;
-                  background: white !important;
-                  color: black !important;
-                  direction: rtl !important;
-                  font-family: 'Cairo', system-ui, -apple-system, sans-serif !important;
-                  display: flex !important;
-                  justify-content: center !important;
-                  align-items: center !important;
-                }
-                /* Reset any fixed overlays */
-                .fixed, [class*="fixed"], [class*="animate-in"] {
-                  position: static !important;
-                  transform: none !important;
-                  animation: none !important;
-                  background: none !important;
-                  backdrop-filter: none !important;
-                  box-shadow: none !important;
-                  border: none !important;
-                  padding: 0 !important;
-                  margin: 0 !important;
-                  width: auto !important;
-                  height: auto !important;
-                  overflow: visible !important;
-                }
-                #test-label-print-modal {
-                  position: absolute !important;
-                  left: 0 !important;
-                  right: 0 !important;
-                  top: 0 !important;
-                  bottom: 0 !important;
-                  width: ${paperWidthMm} !important;
-                  height: ${paperHeightMm} !important;
-                  max-width: ${paperWidthMm} !important;
-                  max-height: ${paperHeightMm} !important;
-                  background: white !important;
-                  border: none !important;
-                  box-shadow: none !important;
-                  padding: 0.6mm 1mm !important;
-                  margin: 0 auto !important;
-                  display: flex !important;
-                  flex-direction: column !important;
-                  justify-content: space-evenly !important;
-                  align-items: center !important;
-                  text-align: center !important;
-                  visibility: visible !important;
-                  box-sizing: border-box !important;
-                  overflow: hidden !important;
-                }
-                #test-label-print-modal div, #test-label-print-modal span {
-                  max-width: 100% !important;
-                  white-space: nowrap !important;
-                  overflow: hidden !important;
-                  text-overflow: ellipsis !important;
-                  box-sizing: border-box !important;
-                }
-                .label-content-zoom {
-                  width: 100% !important;
-                  height: 100% !important;
-                  display: flex !important;
-                  flex-direction: column !important;
-                  justify-content: space-evenly !important;
-                  align-items: center !important;
-                  box-sizing: border-box !important;
-                  overflow: hidden !important;
-                  transform: scale(1) translate(${((Number(lblAlign) - 50) * 0.2).toFixed(2)}mm, ${((Number(lblVerticalAlign) - 50) * 0.15).toFixed(2)}mm) !important;
-                  transform-origin: center center !important;
-                }
-                .no-print {
-                  display: none !important;
-                }
-              }
-            `}} />
-
             <div className="bg-white rounded-3xl max-w-md w-full overflow-hidden shadow-2xl border border-gray-200 p-6 space-y-5 text-right animate-in slide-in-from-top-2 duration-150 mb-4">
               {/* Modal Header */}
               <div className="border-b border-gray-100 pb-3.5 flex justify-between items-center">
@@ -4137,114 +3789,197 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
                 </button>
               </div>
 
-              {/* Selected layout summary */}
-              <div className="bg-teal-50/50 border border-teal-100/40 rounded-xl p-3 text-right text-xs space-y-1">
-                <div className="text-teal-900 font-bold">معلومات الملصق:</div>
-                <div className="text-gray-600 font-medium grid grid-cols-2 gap-y-1">
-                  <span>📏 الأبعاد: <strong className="text-gray-800">{pWidth}mm × {pHeight}mm</strong></span>
-                  <span>📌 المحاذاة: <strong className="text-gray-800">توسيط متوازن</strong></span>
-                </div>
-              </div>
+              {(() => {
+                const liveLayout = { ...getStoredLabelLayout(), paperSize: FIXED_LABEL_PAPER_SIZE };
+                const previewMetrics = getLabelPreviewMetrics(FIXED_LABEL_PAPER_SIZE, 250, 210, false);
+                const containerStyles = getLabelContainerStyles(liveLayout, lblFormat.fontFamily);
+                const activeElements = liveLayout.elements.filter(el => el.enabled);
+                const splitMetrics = getSplitThermalLabelMetrics(liveLayout, containerStyles, activeElements);
+                const barcodeActiveEl = activeElements.find(el => el.id === 'barcode');
+                const qrActiveEl = activeElements.find(el => el.id === 'qr_code');
+                const infoElements = splitMetrics.hasQrSide
+                  ? activeElements.filter(el => el.id !== 'qr_code')
+                  : activeElements;
+                const sampleDate = new Date().toLocaleDateString('ar-SA');
 
-              {/* Sticker Area on screen */}
-              <div className="space-y-2">
-                <span className="text-[10px] text-gray-400 font-bold block">مظهر الملصق الحراري الفعلي:</span>
-                <div className="p-6 bg-gray-50/70 border border-dashed border-gray-200 rounded-2xl flex items-center justify-center">
-                  
-                  {/* Physical sticker container mimicking real measurements */}
-                  <div 
-                    id="test-label-print-modal"
-                    className="bg-white text-black rounded border border-gray-300 relative overflow-hidden flex flex-col select-none transition-all duration-200"
-                    style={{ 
-                      width: `${screenWidthPx}px`,
-                      height: `${screenHeightPx}px`,
-                      fontFamily: ARABIC_FONTS.find(f => f.id === lblFormat.fontFamily)?.css || "'Cairo', sans-serif",
-                      textAlign: lblFormat.textAlign,
-                      alignItems: lblFormat.textAlign === 'right' ? 'flex-end' : lblFormat.textAlign === 'left' ? 'flex-start' : 'center',
-                      justifyContent: lblFormat.verticalAlign === 'top' ? 'flex-start' : lblFormat.verticalAlign === 'bottom' ? 'flex-end' : 'center',
-                      gap: `${lblFormat.lineHeight * 2}px`,
-                      padding: `${Math.max(2, lblFormat.lineHeight * 2)}px`,
-                      fontWeight: lblFormat.fontWeight === '900' ? 900 : lblFormat.fontWeight === 'bold' ? 700 : 400
-                    }}
-                  >
-                  <div 
-                    className="label-content-zoom animate-fade-in w-full h-full flex flex-col"
-                    style={{
-                      width: '100%',
-                      height: '100%',
-                      display: 'flex',
-                      flexDirection: 'column',
-                      justifyContent: lblFormat.verticalAlign === 'top' ? 'flex-start' : lblFormat.verticalAlign === 'bottom' ? 'flex-end' : 'center',
-                      alignItems: lblFormat.textAlign === 'right' ? 'flex-end' : lblFormat.textAlign === 'left' ? 'flex-start' : 'center',
-                      boxSizing: 'border-box',
-                      gap: `${lblFormat.lineHeight * 2}px`
-                    }}
-                  >
-                    {/* Content of the sticker */}
-                    <div className="w-full flex flex-col items-center" style={{ gap: `${lblLineSpacing * 0.5}px` }}>
-                      {lblShowCenterName && (
-                        <div 
-                          className="font-black text-black block tracking-tight"
-                          style={{ fontSize: `${lblFontSizeCenterName}pt`, lineHeight: `${1 + lblLineSpacing * 0.02}`, textAlign: 'center', width: '100%' }}
-                        >
-                          {centerName || 'مركز الصيانة الذكي'}
-                        </div>
-                      )}
-
-                      {lblShowMobile && (
-                        <div 
-                          className="text-black block font-bold"
-                          style={{ fontSize: `${lblFontSizeMobile}pt`, marginTop: `${lblLineSpacing * 0.25}px`, textAlign: 'center', width: '100%', lineHeight: `${1 + lblLineSpacing * 0.02}` }}
-                        >
-                          {centerMobile || '05xxxxxxxx'}
-                        </div>
-                      )}
-
-                      {/* Customer & Device data */}
-                      {(lblShowCustomerName || lblShowDeviceModel || lblShowDate) && (
-                        <div 
-                          className="border-t border-b border-dashed border-black text-black w-full text-center" 
-                          style={{ 
-                            padding: `${lblLineSpacing * 0.25}px 0`,
-                            margin: `${lblLineSpacing * 0.25}px 0`,
-                            lineHeight: `${1 + lblLineSpacing * 0.03}` 
-                          }}
-                        >
-                          {lblShowCustomerName && <div className="font-bold" style={{ fontSize: `${lblFontSizeCustomerName}pt` }}>العميل: أحمد محمد</div>}
-                          {lblShowDeviceModel && <div className="font-bold" style={{ fontSize: `${lblFontSizeDeviceModel}pt` }}>الجهاز: iPhone 14 Pro Max</div>}
-                          {lblShowDate && <div className="font-mono font-bold" style={{ fontSize: `${lblFontSizeDate}pt` }}>التاريخ: {new Date().toLocaleDateString('ar-SA')}</div>}
-                        </div>
-                      )}
+                return (
+                  <>
+                    {/* Selected layout summary */}
+                    <div className="bg-teal-50/50 border border-teal-100/40 rounded-xl p-3 text-right text-xs space-y-1">
+                      <div className="text-teal-900 font-bold">معلومات الملصق:</div>
+                      <div className="text-gray-600 font-medium grid grid-cols-2 gap-y-1">
+                        <span>📏 الأبعاد: <strong className="text-gray-800 font-mono">{containerStyles.widthMm}mm × {containerStyles.heightMm}mm</strong></span>
+                        <span>🔍 التكبير للعرض: <strong className="text-gray-800 font-mono">×{previewMetrics.scale.toFixed(2)}</strong></span>
+                      </div>
                     </div>
 
-                    {/* Barcode representation */}
-                    {lblShowBarcode && (
-                      <div className="w-full flex flex-col py-0.5 items-center">
-                        <BarcodeGenerator 
-                          value={currentLiveBarcode}
-                          width={1.2}
-                          height={30}
-                          showText={true}
-                          format={lblBarcodeFormat}
-                          fontSize={lblFontSizeBarcodeText}
-                        />
-                      </div>
-                    )}
+                    {/* Sticker Area on screen */}
+                    <div className="space-y-2">
+                      <span className="text-[10px] text-gray-400 font-bold block">مظهر الملصق الحراري الفعلي:</span>
+                      <div className="p-6 bg-gray-50/70 border border-dashed border-gray-200 rounded-2xl flex items-center justify-center">
+                        <div
+                          className="relative mx-auto"
+                          style={{
+                            width: `${previewMetrics.scaledWidthPx}px`,
+                            height: `${previewMetrics.scaledHeightPx}px`,
+                            maxWidth: '100%'
+                          }}
+                        >
+                          <div
+                            id="test-label-print-modal"
+                            dir="rtl"
+                            className="bg-white text-black rounded-sm border border-gray-300 overflow-hidden flex select-none"
+                            style={{
+                              position: 'absolute',
+                              top: 0,
+                              left: 0,
+                              width: `${containerStyles.widthMm}mm`,
+                              height: `${containerStyles.heightMm}mm`,
+                              maxWidth: `${containerStyles.widthMm}mm`,
+                              maxHeight: `${containerStyles.heightMm}mm`,
+                              padding: `${splitMetrics.effectivePaddingMm}mm`,
+                              flexDirection: splitMetrics.hasQrSide ? 'row' : 'column',
+                              alignItems: 'center',
+                              justifyContent: splitMetrics.hasQrSide && infoElements.length > 0 ? 'space-between' : 'center',
+                              gap: splitMetrics.hasQrSide && infoElements.length > 0 ? `${splitMetrics.colGapMm}mm` : '0',
+                              boxSizing: 'border-box',
+                              fontFamily: containerStyles.fontFamilyCss,
+                              textAlign: containerStyles.textAlign,
+                              transform: `scale(${previewMetrics.scale})`,
+                              transformOrigin: 'top left'
+                            }}
+                          >
+                            {(!splitMetrics.hasQrSide || infoElements.length > 0) && (
+                            <div
+                              className={splitMetrics.hasQrSide ? 'flex-1 min-w-0 h-full flex flex-row items-center justify-center overflow-hidden' : 'w-full flex flex-col justify-center'}
+                              style={{
+                                alignItems: splitMetrics.hasQrSide ? 'center' : containerStyles.alignItems,
+                                textAlign: splitMetrics.hasQrSide ? 'center' : containerStyles.textAlign,
+                                gap: splitMetrics.hasQrSide ? `${splitMetrics.verticalColGapMm}mm` : undefined,
+                              }}
+                            >
+                              {infoElements.map((el) => {
+                                const elMetrics = getLabelElementMetrics(el, liveLayout);
+                                const baseFontPt = splitMetrics.compactFontPt ?? Math.min(elMetrics.fontSizePt, splitMetrics.isNarrowWidth ? 8 : 11);
+                                const mTopMm = splitMetrics.isCompactHeight ? 0 : Math.min(elMetrics.marginTopMm, 0.4);
+                                const mBotMm = splitMetrics.isCompactHeight ? 0.2 : Math.min(elMetrics.marginBottomMm, 0.5);
+                                return (
+                                  <div
+                                    key={el.id}
+                                    className={splitMetrics.hasQrSide ? 'max-h-full' : 'w-fit max-w-full'}
+                                    style={splitMetrics.hasQrSide ? {
+                                      writingMode: 'vertical-rl',
+                                      textOrientation: 'mixed',
+                                      margin: 0,
+                                      textAlign: 'center',
+                                      boxSizing: 'border-box',
+                                    } : {
+                                      marginTop: `${mTopMm}mm`,
+                                      marginBottom: `${mBotMm}mm`,
+                                      textAlign: containerStyles.textAlign,
+                                      alignSelf: containerStyles.alignItems,
+                                      boxSizing: 'border-box'
+                                    }}
+                                  >
+                                    {el.id === 'center_name' && (
+                                      <div dir="auto" className={`${splitMetrics.hasQrSide ? 'max-h-full whitespace-nowrap overflow-hidden text-ellipsis' : 'max-w-full truncate'} font-black text-black`} style={{ fontSize: `${splitMetrics.hasQrSide ? splitMetrics.getVerticalCenterNameFontPt(centerName || 'مركز تكنو للصيانة') : splitMetrics.getCenterNameFontPt(centerName || 'مركز تكنو للصيانة', baseFontPt)}pt`, fontWeight: 900, letterSpacing: splitMetrics.hasQrSide ? '0px' : '-0.25px', lineHeight: 1 }}>
+                                        {centerName || 'مركز تكنو للصيانة'}
+                                      </div>
+                                    )}
+                                    {el.id === 'center_mobile' && (
+                                      <div dir="ltr" className={`${splitMetrics.hasQrSide ? 'max-h-full whitespace-nowrap overflow-hidden' : 'max-w-full whitespace-nowrap'} text-black tabular-nums`} style={{ fontSize: `${splitMetrics.hasQrSide ? splitMetrics.getVerticalMobileFontPt(centerMobile || '05xxxxxxxx') : splitMetrics.getCenterMobileFontPt(centerMobile || '05xxxxxxxx', baseFontPt)}pt`, fontWeight: splitMetrics.hasQrSide ? 900 : (el.bold ? 700 : 600), fontFamily: "system-ui, -apple-system, 'Cairo', sans-serif", letterSpacing: splitMetrics.hasQrSide ? '0px' : '-0.1px', lineHeight: splitMetrics.hasQrSide ? 1 : splitMetrics.effectiveLineSpacing }}>
+                                        {centerMobile || '05xxxxxxxx'}
+                                      </div>
+                                    )}
+                                    {el.id === 'customer_name' && (
+                                      <div dir="auto" className={`${splitMetrics.hasQrSide ? 'max-h-full whitespace-nowrap overflow-hidden text-ellipsis' : 'max-w-full truncate'} text-black`} style={{ fontSize: `${splitMetrics.hasQrSide ? splitMetrics.getVerticalInfoFontPt('العميل: أحمد محمد عبد الله') : baseFontPt}pt`, fontWeight: el.bold ? 800 : 600, lineHeight: splitMetrics.hasQrSide ? 1 : splitMetrics.effectiveLineSpacing }}>
+                                        العميل: أحمد محمد عبد الله
+                                      </div>
+                                    )}
+                                    {el.id === 'device_model' && (
+                                      <div dir="auto" className={`${splitMetrics.hasQrSide ? 'max-h-full whitespace-nowrap overflow-hidden text-ellipsis' : 'max-w-full truncate'} text-black`} style={{ fontSize: `${splitMetrics.hasQrSide ? splitMetrics.getVerticalInfoFontPt('الجهاز: iPhone 14 Pro Max') : baseFontPt}pt`, fontWeight: el.bold ? 800 : 600, lineHeight: splitMetrics.hasQrSide ? 1 : splitMetrics.effectiveLineSpacing }}>
+                                        الجهاز: iPhone 14 Pro Max
+                                      </div>
+                                    )}
+                                    {el.id === 'order_date' && (
+                                      <div dir="auto" className={`${splitMetrics.hasQrSide ? 'max-h-full whitespace-nowrap overflow-hidden text-ellipsis' : 'max-w-full truncate'} text-black`} style={{ fontSize: `${splitMetrics.hasQrSide ? splitMetrics.getVerticalInfoFontPt(`التاريخ: ${sampleDate}`) : baseFontPt}pt`, fontWeight: el.bold ? 700 : 400, lineHeight: splitMetrics.hasQrSide ? 1 : splitMetrics.effectiveLineSpacing }}>
+                                        التاريخ: {sampleDate}
+                                      </div>
+                                    )}
+                                    {el.id === 'barcode' && (
+                                      <div dir="ltr" className={`${splitMetrics.hasQrSide ? 'max-h-full whitespace-nowrap overflow-hidden' : 'max-w-full whitespace-nowrap'} font-black text-black tabular-nums`} style={{ fontSize: `${splitMetrics.hasQrSide ? splitMetrics.getVerticalCodeFontPt(currentLiveBarcode) : splitMetrics.getCodeFontPt(currentLiveBarcode, baseFontPt)}pt`, fontFamily: "system-ui, -apple-system, 'Cairo', sans-serif", fontVariantNumeric: 'tabular-nums', letterSpacing: splitMetrics.hasQrSide ? '0px' : '-0.2px', lineHeight: 1 }}>
+                                        {currentLiveBarcode}
+                                      </div>
+                                    )}
+                                    {el.id === 'custom_text' && (
+                                      <div dir="auto" className={`${splitMetrics.hasQrSide ? 'max-h-full whitespace-nowrap overflow-hidden text-ellipsis' : 'max-w-full break-words'} text-black`} style={{ fontSize: `${splitMetrics.hasQrSide ? splitMetrics.getVerticalInfoFontPt(el.customContent || 'يرجى إبراز هذا الملصق عند الاستلام') : baseFontPt}pt`, fontWeight: el.bold ? 700 : 500, lineHeight: splitMetrics.hasQrSide ? 1 : splitMetrics.effectiveLineSpacing, textAlign: splitMetrics.hasQrSide ? 'center' : containerStyles.textAlign }}>
+                                        {el.customContent || 'يرجى إبراز هذا الملصق عند الاستلام'}
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                            )}
 
-                    {/* QR Code representation */}
-                    {lblShowQR && (
-                      <div className="w-full flex flex-col py-0.5 items-center">
-                        <QRCodeGenerator 
-                          value={`${window.location.origin}?track=PREVIEW-ID`} 
-                          size={55}
-                        />
+                            {splitMetrics.hasQrSide && (
+                              <div className="shrink-0 h-full flex flex-col items-center justify-center bg-white gap-0.5">
+                                {barcodeActiveEl && (() => {
+                                  const m = getLabelElementMetrics(barcodeActiveEl, liveLayout);
+                                  return (
+                                    <BarcodeGenerator
+                                      value={currentLiveBarcode}
+                                      qrContent={buildOrderCustomerQrPayload({
+                                        order: {
+                                          id: currentLiveBarcode,
+                                          customerName: 'أحمد محمد عبد الله',
+                                          customerPhone: '0790000000',
+                                          deviceType: 'جوال',
+                                          brandModel: 'iPhone 14 Pro Max',
+                                          faultDescription: 'تغيير شاشة + فحص بطارية',
+                                          estimatedCost: 45,
+                                          status: DeviceStatus.RECEIVED,
+                                          createdAt: Date.now(),
+                                          updatedAt: Date.now(),
+                                          statusHistory: [],
+                                        } as MaintenanceOrder,
+                                        centerName: centerName || 'مركز تكنو للصيانة',
+                                        centerMobile: centerMobile || '05xxxxxxxx',
+                                        currencyName: localStorage.getItem('currencyName') || 'دينار',
+                                        maxLength: 520,
+                                      })}
+                                      width={barcodeActiveEl.width || 1.2}
+                                      height={m.barcodeHeightPx}
+                                      physicalHeightMm={m.barcodeHeightMm}
+                                      targetQrMm={splitMetrics.splitQrSizeMm}
+                                      showText={false}
+                                      format={lblBarcodeFormat}
+                                      maxWidthMm={splitMetrics.effectiveInnerWidthMm}
+                                      marginModules={0}
+                                    />
+                                  );
+                                })()}
+                                {qrActiveEl && (() => {
+                                  const m = getLabelElementMetrics(qrActiveEl, liveLayout);
+                                  return (
+                                    <QRCodeGenerator
+                                      value={buildTrackingUrl(currentLiveBarcode)}
+                                      size={m.qrSizePx}
+                                      compact={true}
+                                      physicalSizeMm={splitMetrics.splitQrSizeMm || Math.max(m.qrSizeMm, 11)}
+                                      marginModules={0}
+                                    />
+                                  );
+                                })()}
+                              </div>
+                            )}
+                          </div>
+                        </div>
                       </div>
-                    )}
-                  </div>
-
-                </div>
-              </div>
-            </div>
+                    </div>
+                  </>
+                );
+              })()}
 
             {/* Action buttons inside modal */}
             <div className="space-y-3">
@@ -4278,7 +4013,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
               </button>
 
                            <div className="bg-blue-50 border border-blue-100 p-3 rounded-2xl text-[10px] text-blue-800 text-right font-medium leading-relaxed">
-                💡 <strong>نصيحة هامة لطابعات الملصقات (Xprinter / Zebra):</strong> عند فتح نافذة الطباعة، يرجى التأكد من اختيار حجم الورق المطابق تماماً لملصقك (مثلاً: 30x20mm أو 50x30mm) وضبط الهوامش على <strong>بلا هوامش (None)</strong> وتفعيل ملائمة الصفحة لضمان خروج الباركود متموضعاً بدقة متناهية!
+                💡 <strong>نصيحة هامة لطابعات الملصقات (Xprinter / Zebra):</strong> عند فتح نافذة الطباعة، يرجى التأكد من اختيار حجم الورق المطابق تماماً لملصقك (<strong>38x25mm</strong>) وضبط الهوامش على <strong>بلا هوامش (None)</strong> وتفعيل ملائمة الصفحة لضمان خروج الباركود متموضعاً بدقة متناهية!
               </div>
             </div>
           </div>

@@ -16,7 +16,8 @@ import {
   Mic, 
   MicOff, 
   Camera, 
-  X 
+  X,
+  Plus
 } from 'lucide-react';
 import { getWhatsAppLink } from '../lib/notifications';
 import { checkMicrophonePermission, requestMicrophonePermission } from '../utils/microphonePermissions';
@@ -29,6 +30,8 @@ interface DashboardViewProps {
   overdueOrders?: MaintenanceOrder[];
   onScanClick?: () => void;
   onViewCustomer?: (name: string, phone?: string) => void;
+  onAddOrderClick?: () => void;
+  canAddOrder?: boolean;
 }
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
@@ -38,14 +41,16 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onSendWhatsAppReminder,
   overdueOrders = [],
   onScanClick,
-  onViewCustomer
+  onViewCustomer,
+  onAddOrderClick,
+  canAddOrder = true
 }) => {
   const currencyName = localStorage.getItem('currencyName') || 'دينار';
   const centerName = localStorage.getItem('centerName') || 'TECHNO';
   
   // Exclude contact dummy orders from the dashboard stats, calendar and lists
   const orders = React.useMemo(() => {
-    return rawOrders.filter(o => !isContactOrder(o));
+    return (rawOrders || []).filter(o => o && !isContactOrder(o));
   }, [rawOrders]);
   
   // Compute counts
@@ -53,7 +58,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const underMaintenance = orders.filter(
     o => o.status === DeviceStatus.RECEIVED || 
          o.status === DeviceStatus.DIAGNOSING || 
-         o.status === DeviceStatus.REPAIRING
+         o.status === DeviceStatus.REPAIRING ||
+         o.status === DeviceStatus.PENDING
   ).length;
   const readyForDelivery = orders.filter(o => o.status === DeviceStatus.READY).length;
   const delivered = orders.filter(o => o.status === DeviceStatus.DELIVERED).length;
@@ -95,28 +101,36 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     }
   };
 
+  const getLocalDateStr = (d: Date) => {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  };
+
   // Determine delivery reminders
   // Filter devices that are not yet delivered/unrepairable and whose expected delivery date is near
   // Near = expected delivery date is today or in the past (overdue), or tomorrow
   const getDeliveryReminders = () => {
-    const todayStr = new Date().toISOString().split('T')[0];
-    const tomorrowStr = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const tomorrowDate = new Date();
+    tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+    const tomorrowStr = getLocalDateStr(tomorrowDate);
     
-    return orders.filter(order => {
-      if (order.status === DeviceStatus.DELIVERED || order.status === DeviceStatus.UNREPAIRABLE) {
+    return (orders || []).filter(order => {
+      if (!order || order.status === DeviceStatus.DELIVERED || order.status === DeviceStatus.UNREPAIRABLE) {
         return false;
       }
       const expDate = order.expectedDeliveryDate;
+      if (!expDate) return false;
       return expDate <= tomorrowStr; // Today, tomorrow, or overdue
-    }).sort((a, b) => a.expectedDeliveryDate.localeCompare(b.expectedDeliveryDate));
+    }).sort((a, b) => (a.expectedDeliveryDate || '').localeCompare(b.expectedDeliveryDate || ''));
   };
 
   const reminders = getDeliveryReminders();
 
   // Helper to render date alert level
   const getDateBadge = (dateStr: string) => {
-    const todayStr = new Date().toISOString().split('T')[0];
-    const tomorrowStr = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const todayStr = getLocalDateStr(new Date());
 
     if (dateStr < todayStr) {
       return (
@@ -145,6 +159,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const [searchTerm, setSearchTerm] = React.useState('');
   const [isListening, setIsListening] = React.useState(false);
   const recognitionRef = React.useRef<any>(null);
+
+  React.useEffect(() => {
+    return () => {
+      if (recognitionRef.current) {
+        try { recognitionRef.current.stop(); } catch (_) {}
+      }
+    };
+  }, []);
 
   const handleVoiceSearch = async () => {
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
@@ -196,7 +218,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       };
 
       recognition.onerror = async (event: any) => {
-        console.error("Speech recognition error:", event.error);
+        if (event.error === 'no-speech' || event.error === 'aborted') {
+          setIsListening(false);
+          return;
+        }
+        console.warn("Speech recognition notice:", event.error);
         if (event.error === 'not-allowed') {
           const reqRes = await requestMicrophonePermission();
           if (reqRes.granted) {
@@ -215,7 +241,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       recognitionRef.current = recognition;
       recognition.start();
     } catch (e) {
-      console.error("Failed to start speech recognition:", e);
+      console.warn("Failed to start speech recognition:", e);
       setIsListening(false);
     }
   };
@@ -249,20 +275,22 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     <div className="space-y-8" dir="rtl">
       {/* 🔍 Top Search Bar in Dashboard (لوحة التحكم) */}
       <div className="bg-white rounded-3xl border border-gray-100 p-6 shadow-xs">
-        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 mb-4">
-          <div className="flex items-center gap-2.5">
-            <div className="p-2.5 bg-teal-50 rounded-2xl text-teal-600 border border-teal-100/60">
-              <Search className="w-5 h-5" />
-            </div>
-            <div>
-              <h3 className="font-sans font-extrabold text-gray-900 text-base">البحث والاستعلام السريع عن الأجهزة والعملاء</h3>
-            </div>
-          </div>
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-2.5 mb-4">
+          <button
+            type="button"
+            onClick={onAddOrderClick}
+            disabled={!canAddOrder}
+            className="w-full flex-1 bg-teal-600 hover:bg-teal-700 disabled:bg-gray-300 disabled:cursor-not-allowed text-white font-sans font-bold px-6 py-3.5 rounded-full transition-all text-base flex items-center justify-center gap-2 cursor-pointer shadow-xs active:scale-98"
+            title={!canAddOrder ? "عذراً، ليس لديك صلاحية لإضافة طلب صيانة جديد" : "إضافة طلب صيانة جديد"}
+          >
+            <Plus className="w-5 h-5" />
+            <span>{!canAddOrder ? "إضافة طلب (غير مصرح)" : "إضافة طلب صيانة جديد"}</span>
+          </button>
           {searchTerm && (
             <button
               type="button"
               onClick={() => setSearchTerm('')}
-              className="text-xs text-gray-400 hover:text-gray-600 font-sans font-bold flex items-center gap-1 cursor-pointer bg-gray-50 hover:bg-gray-100 px-3 py-1.5 rounded-xl transition-colors"
+              className="text-xs text-gray-400 hover:text-gray-600 font-sans font-bold flex items-center justify-center gap-1 cursor-pointer bg-gray-50 hover:bg-gray-100 px-3 py-2 rounded-xl transition-colors shrink-0"
             >
               <X className="w-3.5 h-3.5" />
               <span>مسح البحث</span>
@@ -488,7 +516,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 max-h-[320px] overflow-y-auto pr-1">
             {overdueOrders.map((order) => {
-              const daysInMaintenance = Math.floor((Date.now() - order.createdAt) / (1000 * 60 * 60 * 24));
+              const daysInMaintenance = Math.max(0, Math.floor((Date.now() - (order.createdAt || Date.now())) / (1000 * 60 * 60 * 24)));
               return (
                 <div 
                   key={order.id}
@@ -536,7 +564,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                     </button>
                     <a
                       href={`tel:${order.customerPhone}`}
-                      className="px-2.5 py-2 bg-purple-50 hover:bg-purple-100 text-purple-700 border border-purple-150 rounded-xl transition-all flex items-center justify-center cursor-pointer"
+                      className="px-2.5 py-2 bg-purple-50 hover:bg-purple-100 text-purple-700 border border-purple-200 rounded-xl transition-all flex items-center justify-center cursor-pointer"
                       title="اتصال هاتفي مباشر"
                     >
                       <PhoneCall className="w-3.5 h-3.5" />
@@ -584,7 +612,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                       >
                         {order.customerName}
                       </button>
-                      {getDateBadge(order.expectedDeliveryDate)}
+                      {order.expectedDeliveryDate ? getDateBadge(order.expectedDeliveryDate) : null}
                     </div>
                     
                     <div className="text-xs text-gray-500 font-sans flex items-center gap-1">
@@ -592,7 +620,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                         {order.deviceType} {order.brandModel}
                       </span>
                       <span>•</span>
-                      <span>تاريخ التسليم المتوقع: <strong>{new Date(order.expectedDeliveryDate).toLocaleDateString('ar-SA')}</strong></span>
+                      <span>تاريخ التسليم المتوقع: <strong>{order.expectedDeliveryDate || 'غير محدد'}</strong></span>
                     </div>
 
                     <div className="text-xs text-gray-400 font-sans flex items-center gap-1.5 pt-1">
@@ -609,7 +637,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   <div className="w-full sm:w-auto shrink-0 flex gap-2">
                     <button
                       onClick={() => onSendWhatsAppReminder(order)}
-                      className="w-full sm:w-auto px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-sans font-bold text-xs rounded-xl transition-colors flex items-center justify-center gap-1.5  -600/15"
+                      className="w-full sm:w-auto px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-sans font-bold text-xs rounded-xl transition-colors flex items-center justify-center gap-1.5 shadow-lg shadow-emerald-600/15"
                     >
                       <MessageSquare className="w-3.5 h-3.5" />
                       إرسال تذكير بالواتس اب

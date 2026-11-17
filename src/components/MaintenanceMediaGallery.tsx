@@ -104,7 +104,7 @@ export const MaintenanceMediaGallery: React.FC<MaintenanceMediaGalleryProps> = (
       {/* Photos Grid or Empty state */}
       {photos.length === 0 ? (
         <div className="bg-gray-50/70 border border-dashed border-gray-200 rounded-2xl p-6 text-center text-gray-400 space-y-2.5">
-          <div className="w-10 h-10 bg-white rounded-full flex items-center justify-center mx-auto text-gray-300 border border-gray-150">
+          <div className="w-10 h-10 bg-white rounded-full flex items-center justify-center mx-auto text-gray-300 border border-gray-200">
             <Camera className="w-5 h-5" />
           </div>
           <div className="text-xs font-bold text-gray-600">لم يتم توثيق أي صور بالكاميرا لهذا الجهاز حتى الآن</div>
@@ -203,7 +203,7 @@ export const MaintenanceMediaGallery: React.FC<MaintenanceMediaGalleryProps> = (
             {/* Details & Actions */}
             <div className="p-4 space-y-3">
               {selectedPhoto.note && (
-                <div className="bg-gray-50 p-3 rounded-2xl border border-gray-150 text-xs text-gray-800 leading-relaxed">
+                <div className="bg-gray-50 p-3 rounded-2xl border border-gray-200 text-xs text-gray-800 leading-relaxed">
                   <span className="font-bold text-gray-500 block text-[10px] mb-0.5">ملاحظة التوثيق:</span>
                   {selectedPhoto.note}
                 </div>

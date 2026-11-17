@@ -1,127 +1,80 @@
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useEffect } from 'react';
 import { Printer, X } from 'lucide-react';
-import JsBarcode from 'jsbarcode';
+import { printPureContent } from '../lib/printUtils';
+import { renderPrintableBarcodeSvg } from '../utils/barcode';
+import { FIXED_LABEL_PAPER_SIZE, getLabelPreviewMetrics } from '../utils/labelDesigner';
+import { BarcodeGenerator } from './BarcodeGenerator';
 
 interface LabelPrintViewProps {
   orderId: string;
+  qrContent?: string;
   onClose: () => void;
 }
 
-export const LabelPrintView: React.FC<LabelPrintViewProps> = ({ orderId, onClose }) => {
-  const [barcodeBase64, setBarcodeBase64] = useState('');
+export const LabelPrintView: React.FC<LabelPrintViewProps> = ({ orderId, qrContent, onClose }) => {
+  const previewMetrics = getLabelPreviewMetrics(FIXED_LABEL_PAPER_SIZE, 250, 180, false);
+  const preferredFormat = localStorage.getItem('lblBarcodeFormat') || 'AUTO';
 
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: 'instant' });
   }, []);
 
-  useEffect(() => {
-    try {
-      const canvas = document.createElement('canvas');
-      JsBarcode(canvas, orderId, {
-        width: 1.3,
-        height: 28,
-        displayValue: false,
-        margin: 1,
-        background: '#ffffff',
-        lineColor: '#000000',
-      });
-      setBarcodeBase64(canvas.toDataURL('image/png'));
-    } catch (e) {
-      console.error(e);
-    }
-  }, [orderId]);
-
   const handlePrint = () => {
-    const iframe = document.createElement('iframe');
-    iframe.style.display = 'none';
-    document.body.appendChild(iframe);
-    
-    const printWindow = iframe.contentWindow;
-    if (!printWindow) return;
+    const barcodeSvgHtml = renderPrintableBarcodeSvg({
+      code: orderId,
+      qrContent,
+      preferredFormat,
+      baseWidth: 1.4,
+      heightMm: 10,
+      maxWidthMm: 34,
+      targetQrMm: 14,
+      quietZonePx: 10,
+    });
 
-    printWindow.document.write(`
-      <html dir="rtl">
-        <head>
-          <title>طباعة ملصق الجهاز</title>
-          <style>
-            @page {
-              margin: 0;
-              size: 50mm 30mm;
-            }
-            * {
-              box-sizing: border-box;
-            }
-            body {
-              margin: 0;
-              padding: 0;
-              width: 50mm;
-              height: 30mm;
-              max-width: 50mm;
-              max-height: 30mm;
-              overflow: hidden;
-              box-sizing: border-box;
-              display: flex;
-              align-items: center;
-              justify-content: center;
-              background: white;
-              font-family: 'Courier New', Courier, monospace;
-              -webkit-print-color-adjust: exact !important;
-              print-color-adjust: exact !important;
-            }
-            .label-container {
-              width: 50mm;
-              height: 30mm;
-              max-width: 50mm;
-              max-height: 30mm;
-              overflow: hidden;
-              padding: 1.5mm 2mm;
-              text-align: center;
-              display: flex;
-              flex-direction: column;
-              align-items: center;
-              justify-content: space-evenly;
-            }
-            .barcode-img {
-              max-height: 12mm;
-              width: auto;
-              max-width: 90%;
-              image-rendering: pixelated;
-              display: block;
-              margin: 0 auto;
-            }
-            .serial-number {
-              font-size: 8.5pt;
-              font-weight: 900;
-              margin-top: 1mm;
-              letter-spacing: 0.5px;
-              direction: ltr !important;
-              font-family: 'Courier New', Courier, monospace !important;
-              max-width: 95%;
-              overflow: hidden;
-              text-overflow: ellipsis;
-              white-space: nowrap;
-            }
-          </style>
-        </head>
-        <body>
-          <div class="label-container">
-            ${barcodeBase64 ? '<img src="' + barcodeBase64 + '" class="barcode-img" />' : ''}
-            <div class="serial-number">
-              ${orderId}
-            </div>
-          </div>
-          <script>
-            window.onload = () => {
-              setTimeout(() => {
-                window.print();
-                setTimeout(() => { window.parent.document.body.removeChild(window.frameElement); }, 500);
-              }, 100);
-            };
-          </script>
-        </body>
-      </html>
-    `);
-    printWindow.document.close();
+    const labelHtml = `
+      <div class="label-container" dir="rtl">
+        ${barcodeSvgHtml}
+        <div class="serial-number">${orderId}</div>
+      </div>
+    `;
+
+    const pageStyle = `
+      @page {
+        margin: 0 !important;
+        size: 38mm 25mm;
+      }
+      .label-container {
+        width: 38mm !important;
+        height: 25mm !important;
+        max-width: 38mm !important;
+        max-height: 25mm !important;
+        overflow: hidden !important;
+        padding: 1.2mm 1.5mm !important;
+        margin: 0 auto !important;
+        text-align: center !important;
+        display: flex !important;
+        flex-direction: column !important;
+        align-items: center !important;
+        justify-content: space-evenly !important;
+        background: white !important;
+        color: black !important;
+        box-sizing: border-box !important;
+      }
+      .serial-number {
+        font-size: 8.5pt !important;
+        font-weight: 900 !important;
+        margin-top: 0.6mm !important;
+        letter-spacing: 0.2px !important;
+        direction: ltr !important;
+        font-family: 'Courier New', Courier, monospace !important;
+        max-width: 96% !important;
+        overflow: hidden !important;
+        text-overflow: clip !important;
+        white-space: nowrap !important;
+      }
+    `;
+
+    printPureContent(labelHtml, pageStyle);
   };
 
   return (
@@ -131,7 +84,7 @@ export const LabelPrintView: React.FC<LabelPrintViewProps> = ({ orderId, onClose
         <div className="bg-teal-600 p-4 flex items-center justify-between">
           <div className="flex items-center gap-2 text-white">
             <Printer className="w-5 h-5" />
-            <h2 className="font-sans font-bold text-sm">طباعة ملصق مبسط للسيريال</h2>
+            <h2 className="font-sans font-bold text-sm">طباعة ملصق QR للسيريال</h2>
           </div>
           <button onClick={onClose} className="text-white hover:bg-white/20 p-1.5 rounded-xl transition-colors">
             <X className="w-4 h-4" />
@@ -140,21 +93,50 @@ export const LabelPrintView: React.FC<LabelPrintViewProps> = ({ orderId, onClose
 
         {/* Preview Area */}
         <div className="p-8 flex flex-col items-center justify-center bg-gray-50 border-b border-gray-100 min-h-[220px]">
-          {/* Virtual Label Boundary (50x30 ratio roughly) */}
-          <div 
-            className="bg-white border-2 border-dashed border-gray-300  flex flex-col items-center justify-center rounded overflow-hidden"
-            style={{ width: '250px', height: '150px' }}
+          <div
+            className="relative mx-auto"
+            style={{
+              width: `${previewMetrics.scaledWidthPx}px`,
+              height: `${previewMetrics.scaledHeightPx}px`,
+              maxWidth: '100%'
+            }}
           >
-            <div className="flex flex-col items-center justify-center w-full">
-              {barcodeBase64 && (
-                <img src={barcodeBase64} alt="Barcode" className="w-auto max-h-[60px]" style={{ imageRendering: 'pixelated' }} />
-              )}
-              <div className="serial-number" style={{ fontSize: '32px', fontWeight: '900', marginTop: '10px', fontFamily: 'monospace', letterSpacing: '2px' }}>
-                {orderId}
-              </div>
+            <div
+              dir="rtl"
+              className="bg-white border-2 border-dashed border-gray-300 flex flex-col items-center justify-evenly rounded overflow-hidden"
+              style={{
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                width: '38mm',
+                height: '25mm',
+                maxWidth: '38mm',
+                maxHeight: '25mm',
+                padding: '1.2mm 1.5mm',
+                boxSizing: 'border-box',
+                textAlign: 'center',
+                transform: `scale(${previewMetrics.scale})`,
+                transformOrigin: 'top left'
+              }}
+            >
+              <BarcodeGenerator
+                value={orderId}
+                qrContent={qrContent}
+                width={1.4}
+                physicalHeightMm={10}
+                maxWidthMm={34}
+                targetQrMm={14}
+                svgMargin={10}
+                showText={true}
+                showModeBadge={true}
+                fontSize={8.5}
+                textLetterSpacing="0.2px"
+                textMarginTopMm={0.6}
+                format={preferredFormat}
+              />
             </div>
           </div>
-          <p className="text-[10px] text-gray-400 mt-4 font-sans text-center">معاينة للملصق (خط كبير وواضح - مقاس 50x30 مم)</p>
+          <p className="text-[10px] text-gray-400 mt-4 font-sans text-center">معاينة مطابقة للطباعة - مقاس 38×25 مم (×{previewMetrics.scale.toFixed(2)})</p>
         </div>
 
         {/* Actions */}
@@ -167,7 +149,7 @@ export const LabelPrintView: React.FC<LabelPrintViewProps> = ({ orderId, onClose
           </button>
           <button
             onClick={handlePrint}
-            className="flex-1 py-3 bg-teal-600 hover:bg-teal-700 text-white font-sans font-bold rounded-xl text-xs transition-colors  -600/20 flex items-center justify-center gap-2"
+            className="flex-1 py-3 bg-teal-600 hover:bg-teal-700 text-white font-sans font-bold rounded-xl text-xs transition-colors shadow-lg shadow-teal-600/20 flex items-center justify-center gap-2"
           >
             <Printer className="w-4 h-4" />
             <span>طباعة الملصق الآن</span>

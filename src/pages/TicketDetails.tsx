@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router';
 import { db, Ticket, Customer } from '../db';
-import { QRCodeSVG } from 'qrcode.react';
+import { QRCodeGenerator } from '../components/QRCodeGenerator';
 import { Phone, MessageCircle, UserPlus, Printer, ArrowRight } from 'lucide-react';
 
 export function TicketDetails() {
@@ -75,48 +75,54 @@ END:VCARD`;
       </div>
 
       {/* Main Card */}
-      <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden" id="print-area">
-        <div className="p-6 text-center border-b border-gray-100 bg-gray-50">
-          <h1 className="text-2xl font-bold text-gray-800 mb-2">RepairShop Pro</h1>
+      <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden max-w-lg mx-auto w-full" id="print-area">
+        <div className="p-4 sm:p-6 text-center border-b border-gray-100 bg-gray-50">
+          <h1 className="text-xl sm:text-2xl font-bold text-gray-800 mb-1.5 break-words">RepairShop Pro</h1>
           <p className="text-gray-500 text-sm mb-4">إيصال استلام جهاز</p>
           
-          <div className="flex justify-center mb-4">
-            <div className="p-4 bg-white rounded-lg border-2 border-gray-800 inline-block">
-              <QRCodeSVG value={ticket.id} size={150} level="H" />
+          <div className="flex justify-center mb-3">
+            <div className="p-2 bg-white rounded-xl border-2 border-gray-800 inline-flex max-w-full">
+              <QRCodeGenerator
+                value={ticket.id}
+                mode="alphanumeric"
+                size={140}
+                errorCorrectionLevel="M"
+                showModeBadge={true}
+              />
             </div>
           </div>
-          <div className="text-xl font-mono font-bold tracking-widest text-gray-800">{ticket.id}</div>
+          <div className="text-lg sm:text-xl font-mono tabular-nums font-bold tracking-widest text-gray-800 break-all" dir="ltr">{ticket.id}</div>
         </div>
 
-        <div className="p-6 space-y-4">
-          <div>
-            <h3 className="text-xs text-gray-400 uppercase tracking-wider mb-1">العميل</h3>
-            <p className="font-bold text-gray-800">{customer.name}</p>
-            <p className="text-gray-600 font-mono" dir="ltr">{customer.phone}</p>
+        <div className="p-4 sm:p-6 space-y-4">
+          <div className="min-w-0">
+            <h3 className="text-xs text-gray-400 tracking-wider mb-1">العميل</h3>
+            <p className="font-bold text-gray-800 break-words [overflow-wrap:anywhere]">{customer.name}</p>
+            <p className="text-gray-600 font-mono tabular-nums break-all" dir="ltr">{customer.phone}</p>
           </div>
 
-          <div className="border-t border-gray-100 pt-4">
-            <h3 className="text-xs text-gray-400 uppercase tracking-wider mb-1">الجهاز</h3>
-            <p className="font-bold text-gray-800">{ticket.deviceType} - {ticket.brand} {ticket.model}</p>
-            <p className="text-gray-600 mt-1">{ticket.problem}</p>
+          <div className="border-t border-gray-100 pt-4 min-w-0">
+            <h3 className="text-xs text-gray-400 tracking-wider mb-1">الجهاز</h3>
+            <p className="font-bold text-gray-800 break-words [overflow-wrap:anywhere]">{ticket.deviceType} - {ticket.brand} {ticket.model}</p>
+            <p className="text-gray-600 mt-1 break-words [overflow-wrap:anywhere]">{ticket.problem}</p>
           </div>
 
-          <div className="border-t border-gray-100 pt-4 grid grid-cols-2 gap-4">
-            <div>
-              <h3 className="text-xs text-gray-400 uppercase tracking-wider mb-1">التكلفة</h3>
-              <p className="font-bold text-gray-800">{ticket.totalCost} $</p>
+          <div className="border-t border-gray-100 pt-4 grid grid-cols-1 min-[360px]:grid-cols-2 gap-3 sm:gap-4">
+            <div className="min-w-0">
+              <h3 className="text-xs text-gray-400 tracking-wider mb-1">التكلفة</h3>
+              <p className="font-bold text-gray-800 tabular-nums">{ticket.totalCost} $</p>
             </div>
-            <div>
-              <h3 className="text-xs text-gray-400 uppercase tracking-wider mb-1">المدفوع</h3>
-              <p className="font-bold text-green-600">{ticket.paidAmount} $</p>
+            <div className="min-w-0">
+              <h3 className="text-xs text-gray-400 tracking-wider mb-1">المدفوع</h3>
+              <p className="font-bold text-green-600 tabular-nums">{ticket.paidAmount} $</p>
             </div>
-            <div>
-              <h3 className="text-xs text-gray-400 uppercase tracking-wider mb-1">المتبقي</h3>
-              <p className="font-bold text-red-600">{ticket.remainingAmount} $</p>
+            <div className="min-w-0">
+              <h3 className="text-xs text-gray-400 tracking-wider mb-1">المتبقي</h3>
+              <p className="font-bold text-red-600 tabular-nums">{ticket.remainingAmount} $</p>
             </div>
-            <div>
-              <h3 className="text-xs text-gray-400 uppercase tracking-wider mb-1">موعد التسليم</h3>
-              <p className="font-bold text-gray-800">{new Date(ticket.expectedDeliveryDate).toLocaleDateString('ar')}</p>
+            <div className="min-w-0">
+              <h3 className="text-xs text-gray-400 tracking-wider mb-1">موعد التسليم</h3>
+              <p className="font-bold text-gray-800 tabular-nums">{new Date(ticket.expectedDeliveryDate).toLocaleDateString('ar')}</p>
             </div>
           </div>
         </div>

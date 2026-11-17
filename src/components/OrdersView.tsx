@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { MaintenanceOrder, DeviceStatus, NotificationTemplate, AppUser, isContactOrder, MaintenancePhoto } from '../types';
+import { MaintenanceOrder, DeviceStatus, NotificationTemplate, AppUser, isContactOrder, MaintenancePhoto, CustomerProfile, CustomNotificationVariable, StatusHistorySnapshot } from '../types';
 import { QRCodeGenerator } from './QRCodeGenerator';
 import { BarcodeGenerator } from './BarcodeGenerator';
 import JsBarcode from 'jsbarcode';
@@ -7,6 +7,7 @@ import { LabelPrintView } from './LabelPrintView';
 import { PreNotificationModal } from './PreNotificationModal';
 import { CameraCaptureModal } from './CameraCaptureModal';
 import { MaintenanceMediaGallery } from './MaintenanceMediaGallery';
+import { StatusSnapshotBadges } from './StatusSnapshotBadges';
 import { 
   Search, 
   Filter, 
@@ -42,18 +43,57 @@ import {
   Sliders,
   GripVertical,
   ArrowUp,
-  ArrowDown
+  ArrowDown,
+  Package,
+  Tag,
+  PlusCircle
 } from 'lucide-react';
-import { DEFAULT_BARCODE_PREFIX, sanitizeBarcodePrefix, formatDateTimeForBarcode, generateBarcodeId, parseBarcodeId } from '../utils/barcode';
+import {
+  DEFAULT_BARCODE_PREFIX,
+  sanitizeBarcodePrefix,
+  formatDateTimeForBarcode,
+  formatCountryDateYmd,
+  formatCountryDateTime24h,
+  generateBarcodeId,
+  parseBarcodeId,
+  resolveBarcodeEncoding,
+  extractScannedBarcodeId,
+  renderPrintableBarcodeSvg
+} from '../utils/barcode';
+import { renderAlphanumericQrSvg } from '../utils/qrAlphanumeric';
+import { buildOrderCustomerQrPayload, normalizeCustomerNameKey, phonesMatch } from '../utils/customerBarcode';
 import { PrintFormatToolbar } from './PrintFormatToolbar';
 import { PrintFormatConfig, getStoredReceiptFormat, getStoredLabelFormat, ARABIC_FONTS, RECEIPT_FONT_SIZES, LABEL_FONT_SIZES } from '../utils/printFormatting';
-import { getStoredLabelLayout, LabelLayoutConfig, LabelElementConfig, reorderElements, saveStoredLabelLayout } from '../utils/labelDesigner';
+import {
+  getStoredLabelLayout,
+  LabelLayoutConfig,
+  LabelElementConfig,
+  reorderElements,
+  saveStoredLabelLayout,
+  getLabelPreviewMetrics,
+  getLabelContainerStyles,
+  getLabelElementMetrics,
+  getSplitThermalLabelMetrics,
+  FIXED_LABEL_PAPER_SIZE
+} from '../utils/labelDesigner';
 import { LabelDesigner } from './LabelDesigner';
-import { formatNotification, getWhatsAppLink, openWhatsAppDirectly, getWhatsAppWebLink, getWhatsAppNativeLink } from '../lib/notifications';
+import {
+  getStoredReceiptLayout,
+  ReceiptLayoutConfig,
+  ReceiptElementConfig,
+  getReceiptPaperMetrics,
+  getResponsiveReceiptFontSize,
+  getReceiptAlignmentClass
+} from '../utils/receiptDesigner';
+import { ReceiptDesigner } from './ReceiptDesigner';
+import { formatNotification, getWhatsAppLink, openWhatsAppDirectly, getWhatsAppWebLink, getWhatsAppNativeLink, buildStatusHistorySnapshot, getOrderFinancials, getStatusArabicLabel, sanitizeCustomVariables } from '../lib/notifications';
+import { printPureContent, printHtmlViaIframe } from '../lib/printUtils';
 import { checkMicrophonePermission, requestMicrophonePermission } from '../utils/microphonePermissions';
+import { buildTrackingUrl } from '../utils/appDomain';
 
 interface OrdersViewProps {
   orders: MaintenanceOrder[];
+  customers?: CustomerProfile[];
   viewType?: 'active' | 'completed' | 'all';
   templates: NotificationTemplate[];
   appUrl: string;
@@ -61,7 +101,7 @@ interface OrdersViewProps {
   onDeleteOrder: (orderId: string) => void;
   onClearAllOrders: () => void;
   onTriggerDelivery: (order: MaintenanceOrder) => void;
-  onLogNotification: (orderId: string, customerName: string, customerPhone: string, type: 'sms' | 'whatsapp', content: string, triggerEvent: string) => void;
+  onLogNotification: (orderId: string, customerName: string, customerPhone: string, type: 'sms' | 'whatsapp', content: string, triggerEvent: string, variablesSnapshot?: StatusHistorySnapshot) => void;
   onScanClick: () => void;
   initialSearchTerm?: string;
   onClearInitialSearch?: () => void;
@@ -69,10 +109,15 @@ interface OrdersViewProps {
   onClearInitialStatusFilter?: () => void;
   currentUser?: AppUser | null;
   onViewCustomer?: (name: string, phone?: string) => void;
+  initialOpenAddModal?: boolean;
+  onClearInitialOpenAddModal?: () => void;
+  initialPrefillCustomer?: { name: string; phone: string } | null;
+  onClearInitialPrefillCustomer?: () => void;
 }
 
 export const OrdersView: React.FC<OrdersViewProps> = ({
   orders,
+  customers = [],
   viewType = 'all',
   templates,
   appUrl,
@@ -87,13 +132,39 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
   initialStatusFilter,
   onClearInitialStatusFilter,
   currentUser,
-  onViewCustomer
+  onViewCustomer,
+  initialOpenAddModal,
+  onClearInitialOpenAddModal,
+  initialPrefillCustomer,
+  onClearInitialPrefillCustomer
 }) => {
-  const canAdd = currentUser ? currentUser.permissions.add_orders : true;
-  const canEdit = currentUser ? currentUser.permissions.edit_orders : true;
+  const canAdd = currentUser?.permissions ? currentUser.permissions.add_orders : true;
+  const canEdit = currentUser?.permissions ? currentUser.permissions.edit_orders : true;
   const canDelete = true;
 
+  const formatSafeDate = (d?: string | number) => {
+    if (!d) return 'غير محدد';
+    try {
+      if (typeof d === 'string') {
+        const ymdMatch = d.trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (ymdMatch) {
+          const dtLocal = new Date(Number(ymdMatch[1]), Number(ymdMatch[2]) - 1, Number(ymdMatch[3]), 12, 0, 0);
+          return dtLocal.toLocaleDateString('ar-SA');
+        }
+      }
+      const dt = new Date(d);
+      if (isNaN(dt.getTime())) return typeof d === 'string' ? d : 'غير محدد';
+      return dt.toLocaleDateString('ar-SA');
+    } catch (_) {
+      return typeof d === 'string' ? d : 'غير محدد';
+    }
+  };
+
   const currencyName = localStorage.getItem('currencyName') || 'دينار';
+  const getActiveCountrySettings = () => ({
+    countryName: localStorage.getItem('countryName') || 'الأردن',
+    countryDialCode: localStorage.getItem('countryDialCode') || '962',
+  });
   const countryName = localStorage.getItem('countryName') || 'الأردن';
   const countryDialCode = localStorage.getItem('countryDialCode') || '962';
 
@@ -103,33 +174,82 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
   const rcptZoom = localStorage.getItem('rcptZoom') || '100';
   const rcptShowQR = localStorage.getItem('rcptShowQR') !== 'false';
   const rcptSize = localStorage.getItem('rcptSize') || '80mm';
+
+  const getOrderQrContent = (order: MaintenanceOrder, maxLength: number = 520): string => {
+    const matchedCustomer =
+      customers.find(
+        (c) =>
+          (order.customerId && c.id === order.customerId) ||
+          (order.customerBarcode &&
+            c.customerBarcode.toUpperCase() === order.customerBarcode.toUpperCase()) ||
+          (order.customerPhone && phonesMatch(c.phone, order.customerPhone)) ||
+          (order.customerName &&
+            normalizeCustomerNameKey(c.name) === normalizeCustomerNameKey(order.customerName))
+      ) || null;
+    const customerOrders = orders.filter((o) => {
+      if (!o || isContactOrder(o)) return false;
+      if (matchedCustomer) {
+        if (o.customerId && o.customerId === matchedCustomer.id) return true;
+        if (
+          o.customerBarcode &&
+          o.customerBarcode.toUpperCase() === matchedCustomer.customerBarcode.toUpperCase()
+        ) {
+          return true;
+        }
+        if (matchedCustomer.phone && phonesMatch(o.customerPhone, matchedCustomer.phone)) {
+          return true;
+        }
+      }
+      if (order.customerPhone && phonesMatch(o.customerPhone, order.customerPhone)) return true;
+      return (
+        Boolean(order.customerName) &&
+        normalizeCustomerNameKey(o.customerName) === normalizeCustomerNameKey(order.customerName)
+      );
+    });
+    return buildOrderCustomerQrPayload({
+      order,
+      customer: matchedCustomer,
+      customerOrders,
+      currencyName,
+      centerName: localStorage.getItem('centerName') || 'مركز الصيانة الذكي',
+      centerMobile: localStorage.getItem('centerMobile') || '',
+      appUrl,
+      maxLength: Math.max(520, maxLength),
+    });
+  };
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [deviceFilter, setDeviceFilter] = useState<string>('all');
 
-  // Automatically detect barcode scans (exact order ID match)
+  // Automatically detect barcode scans (exact order ID, serial, or customer barcode)
   useEffect(() => {
-    const cleanTerm = searchTerm.trim().toLowerCase();
-    if (!cleanTerm || cleanTerm.length < 5) return;
-    
-    const exactOrder = orders.find(o => o.id.toLowerCase() === cleanTerm && !isContactOrder(o));
-    
+    const cleanTerm = (extractScannedBarcodeId(searchTerm) || searchTerm.trim()).toLowerCase();
+    if (!cleanTerm || cleanTerm.length < 4) return;
+
+    const exactOrder = orders.find(
+      (o) =>
+        !isContactOrder(o) &&
+        (o.id.toLowerCase() === cleanTerm ||
+          (o.deviceBarcode && o.deviceBarcode.toLowerCase() === cleanTerm) ||
+          (o.serialNumber && o.serialNumber.toLowerCase() === cleanTerm))
+    );
+
     if (exactOrder) {
       setSelectedOrder(exactOrder);
-      if (exactOrder.customerPhone) {
-        setSearchTerm(exactOrder.customerPhone);
-      }
     }
   }, [searchTerm, orders]);
 
-  
   useEffect(() => {
     if (initialSearchTerm) {
       setSearchTerm(initialSearchTerm);
-      // Try to find if there is an exact or partial match to select automatically
-      const cleanTerm = initialSearchTerm.trim().toLowerCase();
+      const cleanTerm = (extractScannedBarcodeId(initialSearchTerm) || initialSearchTerm.trim()).toLowerCase();
       const exactMatch = orders.find(
-        o => (o.id.toLowerCase() === cleanTerm || o.customerPhone === cleanTerm) && !isContactOrder(o)
+        (o) =>
+          !isContactOrder(o) &&
+          (o.id.toLowerCase() === cleanTerm ||
+            o.customerPhone === cleanTerm ||
+            (o.customerBarcode && o.customerBarcode.toLowerCase() === cleanTerm) ||
+            (o.serialNumber && o.serialNumber.toLowerCase() === cleanTerm))
       );
       if (exactMatch) {
         setSelectedOrder(exactMatch);
@@ -148,6 +268,20 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
       }
     }
   }, [initialStatusFilter, onClearInitialStatusFilter]);
+
+  useEffect(() => {
+    if (initialOpenAddModal) {
+      if (canAdd) {
+        handleOpenAddModal(initialPrefillCustomer || undefined);
+      }
+      if (onClearInitialOpenAddModal) {
+        onClearInitialOpenAddModal();
+      }
+      if (onClearInitialPrefillCustomer) {
+        onClearInitialPrefillCustomer();
+      }
+    }
+  }, [initialOpenAddModal]);
   
   // Modals / Selection states
   const [selectedOrder, setSelectedOrder] = useState<MaintenanceOrder | null>(null);
@@ -167,14 +301,17 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
 
   useEffect(() => {
     if (autoPrintOrder) {
-      setShowCustomerTicket(autoPrintOrder);
-      setTimeout(() => {
-        handlePrintElement('customer-receipt-print-modal', '⚠️ يرجى اختيار طابعة الإيصالات (Receipt Printer) ⚠️');
-        setTimeout(() => {
-          handlePrintLabelThermal(autoPrintOrder);
-          setAutoPrintOrder(null);
-        }, 1500);
-      }, 500);
+      const orderToPrint = autoPrintOrder;
+      setShowCustomerTicket(orderToPrint);
+      const timer = setTimeout(() => {
+        handlePrintElement('customer-receipt-print-modal', 'طباعة إيصال الاستلام', () => {
+          setTimeout(() => {
+            handlePrintLabelThermal(orderToPrint);
+            setAutoPrintOrder(null);
+          }, 200);
+        });
+      }, 350);
+      return () => clearTimeout(timer);
     }
   }, [autoPrintOrder]);
 
@@ -216,40 +353,39 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
     return localStorage.getItem('lblShowMobile') !== 'false';
   });
   const [lblBarcodeFormat, setLblBarcodeFormat] = useState<string>(() => {
-    return localStorage.getItem('lblBarcodeFormat') || 'CODE128';
+    return localStorage.getItem('lblBarcodeFormat') || 'AUTO';
   });
 
+  const clampPt = (val: string | null, fallback: number) => {
+    const n = val ? Number(val) : fallback;
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(10, Math.min(99, n));
+  };
+
   const [lblFontSizeCenterName, setLblFontSizeCenterName] = useState<number>(() => {
-    const saved = localStorage.getItem('lblFontSizeCenterName');
-    return saved ? Number(saved) : 13;
+    return clampPt(localStorage.getItem('lblFontSizeCenterName'), 13);
   });
   const [lblFontSizeMobile, setLblFontSizeMobile] = useState<number>(() => {
-    const saved = localStorage.getItem('lblFontSizeMobile');
-    return saved ? Number(saved) : 8.5;
+    return clampPt(localStorage.getItem('lblFontSizeMobile'), 10);
   });
   const [lblFontSizeCustomerName, setLblFontSizeCustomerName] = useState<number>(() => {
-    const saved = localStorage.getItem('lblFontSizeCustomerName');
-    return saved ? Number(saved) : 8;
+    return clampPt(localStorage.getItem('lblFontSizeCustomerName'), 10);
   });
   const [lblFontSizeDeviceModel, setLblFontSizeDeviceModel] = useState<number>(() => {
-    const saved = localStorage.getItem('lblFontSizeDeviceModel');
-    return saved ? Number(saved) : 8;
+    return clampPt(localStorage.getItem('lblFontSizeDeviceModel'), 10);
   });
   const [lblFontSizeDate, setLblFontSizeDate] = useState<number>(() => {
-    const saved = localStorage.getItem('lblFontSizeDate');
-    return saved ? Number(saved) : 8;
+    return clampPt(localStorage.getItem('lblFontSizeDate'), 10);
   });
   const [lblFontSizeBarcodeText, setLblFontSizeBarcodeText] = useState<number>(() => {
-    const saved = localStorage.getItem('lblFontSizeBarcodeText');
-    return saved ? Number(saved) : 10;
+    return clampPt(localStorage.getItem('lblFontSizeBarcodeText'), 10);
   });
   const [showLabelFontSizesControls, setShowLabelFontSizesControls] = useState<boolean>(false);
-  const [lblPaperSize, setLblPaperSize] = useState<string>(() => {
-    return localStorage.getItem('lblPaperSize') || '50x30';
-  });
+  const [lblPaperSize, setLblPaperSize] = useState<string>(() => FIXED_LABEL_PAPER_SIZE);
   const [lblLineSpacing, setLblLineSpacing] = useState<number>(() => {
     const saved = localStorage.getItem('lblLineSpacing');
-    return saved ? Number(saved) : 0;
+    const parsed = saved ? Number(saved) : 1.15;
+    return parsed > 0 ? parsed : 1.15;
   });
 
   // Printing format configurations (Fonts, Alignment, Spacing, Size, Weight)
@@ -282,10 +418,13 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
   const [labelModalLayout, setLabelModalLayout] = useState<LabelLayoutConfig>(() => getStoredLabelLayout());
   const [draggedModalId, setDraggedModalId] = useState<string | null>(null);
   const [dragOverModalId, setDragOverModalId] = useState<string | null>(null);
+  const [showFullReceiptDesignerInModal, setShowFullReceiptDesignerInModal] = useState<boolean>(false);
+  const [receiptModalLayout, setReceiptModalLayout] = useState<ReceiptLayoutConfig>(() => getStoredReceiptLayout());
 
   useEffect(() => {
     const handleStorageChange = () => {
       setLabelModalLayout(getStoredLabelLayout());
+      setReceiptModalLayout(getStoredReceiptLayout());
       setRcptFormat(getStoredReceiptFormat());
       setLblFormat(getStoredLabelFormat());
       setLblShowCenterName(localStorage.getItem('lblShowCenterName') !== 'false');
@@ -295,24 +434,23 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
       setLblShowDeviceModel(localStorage.getItem('lblShowDeviceModel') !== 'false');
       setLblShowDate(localStorage.getItem('lblShowDate') !== 'false');
       setLblShowMobile(localStorage.getItem('lblShowMobile') !== 'false');
-      setLblBarcodeFormat(localStorage.getItem('lblBarcodeFormat') || 'CODE128');
+      setLblBarcodeFormat(localStorage.getItem('lblBarcodeFormat') || 'AUTO');
       
       const fsCenter = localStorage.getItem('lblFontSizeCenterName');
-      if (fsCenter) setLblFontSizeCenterName(Number(fsCenter));
+      if (fsCenter) setLblFontSizeCenterName(clampPt(fsCenter, 13));
       const fsMob = localStorage.getItem('lblFontSizeMobile');
-      if (fsMob) setLblFontSizeMobile(Number(fsMob));
+      if (fsMob) setLblFontSizeMobile(clampPt(fsMob, 10));
       const fsCust = localStorage.getItem('lblFontSizeCustomerName');
-      if (fsCust) setLblFontSizeCustomerName(Number(fsCust));
+      if (fsCust) setLblFontSizeCustomerName(clampPt(fsCust, 10));
       const fsDevice = localStorage.getItem('lblFontSizeDeviceModel');
-      if (fsDevice) setLblFontSizeDeviceModel(Number(fsDevice));
+      if (fsDevice) setLblFontSizeDeviceModel(clampPt(fsDevice, 10));
       const fsDate = localStorage.getItem('lblFontSizeDate');
-      if (fsDate) setLblFontSizeDate(Number(fsDate));
+      if (fsDate) setLblFontSizeDate(clampPt(fsDate, 10));
       const fsBarcode = localStorage.getItem('lblFontSizeBarcodeText');
-      if (fsBarcode) setLblFontSizeBarcodeText(Number(fsBarcode));
-      const paperSize = localStorage.getItem('lblPaperSize');
-      if (paperSize) setLblPaperSize(paperSize);
+      if (fsBarcode) setLblFontSizeBarcodeText(clampPt(fsBarcode, 10));
+      setLblPaperSize(FIXED_LABEL_PAPER_SIZE);
       const lineSpacing = localStorage.getItem('lblLineSpacing');
-      if (lineSpacing) setLblLineSpacing(Number(lineSpacing));
+      if (lineSpacing && Number(lineSpacing) > 0) setLblLineSpacing(Number(lineSpacing));
 
       const savedPrinters = localStorage.getItem('maintenance_printers');
       if (savedPrinters) {
@@ -387,7 +525,15 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
 
   const makePrinterDefault = (printerId: string, forType: 'isDefaultInvoices' | 'isDefaultLabels') => {
     const saved = localStorage.getItem('maintenance_printers');
-    const printersList = saved ? JSON.parse(saved) : [];
+    let printersList: any[] = [];
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) printersList = parsed;
+      } catch (e) {
+        console.warn("Invalid saved printers JSON, resetting to default:", e);
+      }
+    }
     const updated = (printersList.length ? printersList : [{
       id: 'p-default',
       name: 'طابعة النظام الافتراضية (عبر المتصفح)',
@@ -454,458 +600,298 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
   const handlePrintElement = (elementId: string, title: string = 'طباعة', onComplete?: () => void) => {
     const element = document.getElementById(elementId);
     if (!element) {
-      alert("عنصر الطباعة غير موجود");
+      console.warn("عنصر الطباعة غير موجود:", elementId);
       if (onComplete) onComplete();
       return;
     }
-
-    const printWindow = window.open('', '_blank', 'width=800,height=800');
-    if (!printWindow) {
-      // Fallback to standard window.print if blocked
-      try {
-        window.print();
-      } catch (e) {
-        alert("يرجى تفعيل السماح للنوافذ المنبثقة (Popups) أو فتح التطبيق في متصفح خارجي/نافذة جديدة للطباعة.");
-      }
-      if (onComplete) onComplete();
-      return;
-    }
-
-    if (onComplete) {
-      const timer = setInterval(() => {
-        if (printWindow.closed) {
-          clearInterval(timer);
-          onComplete();
-        }
-      }, 500);
-    }
-
-    // Capture stylesheet references to keep layout and Tailwind CSS styling
-    let stylesHtml = Array.from(document.querySelectorAll('style, link[rel="stylesheet"]'))
-      .map(node => node.outerHTML)
-      .join('\n');
-
-    const contentHtml = element.outerHTML;
 
     // Load receipt paper size custom settings
-    const rcptSize = localStorage.getItem('rcptSize') || '80mm';
+    const activeRcptSize = getStoredReceiptLayout().paperSize || localStorage.getItem('rcptSize') || '80mm';
     let pageSizeSpec = 'auto';
     let receiptWidth = '100%';
-    let receiptPadding = '20px';
+    let receiptPadding = '12px';
 
-    if (rcptSize === '80mm') {
+    if (activeRcptSize === '80mm') {
       pageSizeSpec = '80mm auto';
       receiptWidth = '80mm';
-      receiptPadding = '10px';
-    } else if (rcptSize === '58mm') {
+      receiptPadding = '8px';
+    } else if (activeRcptSize === '58mm') {
       pageSizeSpec = '58mm auto';
       receiptWidth = '58mm';
-      receiptPadding = '5px';
-    } else if (rcptSize === 'A5') {
+      receiptPadding = '4px';
+    } else if (activeRcptSize === 'A5') {
       pageSizeSpec = 'A5 portrait';
       receiptWidth = '148mm';
-      receiptPadding = '20px';
-    } else if (rcptSize === 'A4') {
+      receiptPadding = '16px';
+    } else if (activeRcptSize === 'A4') {
       pageSizeSpec = 'A4 portrait';
       receiptWidth = '210mm';
-      receiptPadding = '25px';
+      receiptPadding = '20px';
     }
 
-    printWindow.document.write(`
-      <!DOCTYPE html>
-      <html dir="rtl" lang="ar">
-        <head>
-          <meta charset="utf-8">
-          <title>${title}</title>
-          ${stylesHtml}
-          <style>
-            @import url('https://fonts.googleapis.com/css2?family=Almarai:wght@400;700;800&family=Amiri:wght@400;700&family=Cairo:wght@400;600;700;800;900&family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&family=Tajawal:wght@400;500;700;800;900&display=swap');
-            
-            @page {
-              size: ${elementId === 'customer-receipt-print-modal' ? pageSizeSpec : 'auto'};
-              margin: 0;
-            }
+    // Clone element to sanitize for clean print document
+    const clone = element.cloneNode(true) as HTMLElement;
 
-            body {
-              font-family: ${rcptFormat.fontFamily}, 'Cairo', 'Inter', sans-serif !important;
-              direction: rtl;
-              text-align: ${rcptFormat.textAlign} !important;
-              background-color: white;
-              color: black;
-              margin: 0;
-              padding: ${elementId === 'customer-receipt-print-modal' ? '0' : '20px'};
-              visibility: visible !important;
-              font-size: ${rcptFormat.fontSize}px !important;
-              line-height: ${rcptFormat.lineHeight} !important;
-              font-weight: ${rcptFormat.fontWeight === '900' ? 900 : rcptFormat.fontWeight === 'bold' ? 700 : 400} !important;
-            }
-            body * {
-              visibility: visible !important;
-            }
-            .no-print {
-              display: none !important;
-            }
+    // Remove any interactive UI elements, designers, and non-printable elements
+    clone.querySelectorAll('.no-print, button, input, textarea, select').forEach(el => el.remove());
 
-            #customer-receipt-print-modal {
-              width: ${elementId === 'customer-receipt-print-modal' ? receiptWidth : 'auto'} !important;
-              max-width: ${elementId === 'customer-receipt-print-modal' ? receiptWidth : 'none'} !important;
-              padding: ${elementId === 'customer-receipt-print-modal' ? receiptPadding : '1.5rem'} !important;
-              box-shadow: none !important;
-              border: none !important;
-              margin: 0 auto !important;
-              background: white !important;
-              font-family: ${rcptFormat.fontFamily}, 'Cairo', 'Inter', sans-serif !important;
-              text-align: ${rcptFormat.textAlign} !important;
-              line-height: ${rcptFormat.lineHeight} !important;
-              font-size: ${rcptFormat.fontSize}px !important;
-              font-weight: ${rcptFormat.fontWeight === '900' ? 900 : rcptFormat.fontWeight === 'bold' ? 700 : 400} !important;
-            }
+    // Clean up container styles so it behaves as pure printable page
+    clone.style.boxShadow = 'none';
+    clone.style.border = 'none';
+    clone.style.borderRadius = '0';
+    clone.style.width = receiptWidth;
+    clone.style.maxWidth = receiptWidth;
+    clone.style.padding = receiptPadding;
+    clone.style.margin = '0 auto';
+    clone.style.background = 'white';
+    clone.style.color = 'black';
+    clone.style.fontFamily = `${rcptFormat.fontFamily}, 'Cairo', 'Tajawal', sans-serif`;
 
-            ${(elementId === 'customer-receipt-print-modal' && (rcptSize === '80mm' || rcptSize === '58mm')) ? `
-            #customer-receipt-print-modal .grid {
-              display: flex !important;
-              flex-direction: column !important;
-              gap: 10px !important;
-            }
-            #customer-receipt-print-modal .flex-row, #customer-receipt-print-modal .flex {
-              flex-wrap: wrap !important;
-            }
-            ` : ''}
+    const sheetClone = clone.querySelector('#customer-receipt-sheet') as HTMLElement | null;
+    if (sheetClone) {
+      sheetClone.style.maxWidth = '100%';
+      sheetClone.style.width = '100%';
+      sheetClone.style.padding = '0';
+      sheetClone.style.border = 'none';
+      sheetClone.style.borderRadius = '0';
+      sheetClone.style.background = 'white';
+      sheetClone.style.boxShadow = 'none';
+    }
 
-            @media print {
-              .print-instruction { display: none !important; }
-              body {
-                padding: 0;
-                margin: 0;
-                visibility: visible !important;
-                font-family: ${rcptFormat.fontFamily}, 'Cairo', 'Inter', sans-serif !important;
-                text-align: ${rcptFormat.textAlign} !important;
-                font-size: ${rcptFormat.fontSize}px !important;
-                line-height: ${rcptFormat.lineHeight} !important;
-                font-weight: ${rcptFormat.fontWeight === '900' ? 900 : rcptFormat.fontWeight === 'bold' ? 700 : 400} !important;
-              }
-              body * {
-                visibility: visible !important;
-              }
-              .no-print {
-                display: none !important;
-              }
-              #customer-receipt-print-modal {
-                width: ${elementId === 'customer-receipt-print-modal' ? receiptWidth : 'auto'} !important;
-                max-width: ${elementId === 'customer-receipt-print-modal' ? receiptWidth : 'none'} !important;
-                padding: ${elementId === 'customer-receipt-print-modal' ? receiptPadding : '0'} !important;
-                box-shadow: none !important;
-                border: none !important;
-                margin: 0 auto !important;
-                background: white !important;
-                font-family: ${rcptFormat.fontFamily}, 'Cairo', 'Inter', sans-serif !important;
-                text-align: ${rcptFormat.textAlign} !important;
-                line-height: ${rcptFormat.lineHeight} !important;
-                font-size: ${rcptFormat.fontSize}px !important;
-                font-weight: ${rcptFormat.fontWeight === '900' ? 900 : rcptFormat.fontWeight === 'bold' ? 700 : 400} !important;
-              }
-            }
-          </style>
-        </head>
-        <body>
-          <div class="print-instruction" style="background: #ffeb3b; color: #000; text-align: center; padding: 10px; font-weight: bold; margin-bottom: 20px; font-family: sans-serif;">
-            ⚠️ الرجاء التأكد من اختيار طابعة الفواتير/الإيصالات (Receipt Printer) من القائمة ⚠️
-          </div>
-          <div class="${elementId === 'customer-receipt-print-modal' ? '' : 'max-w-xl mx-auto'}">
-            ${contentHtml}
-          </div>
-          <script>
-            function triggerPrint() {
-              setTimeout(() => {
-                window.print();
-              }, 500);
-            }
-            
-            window.onafterprint = () => {
-              setTimeout(() => {
-                window.close();
-              }, 500);
-            };
+    const pageStyle = `
+      @page {
+        size: ${pageSizeSpec};
+        margin: 0 !important;
+      }
+      body {
+        margin: 0 !important;
+        padding: 0 !important;
+        background: white !important;
+        color: black !important;
+        font-family: ${rcptFormat.fontFamily}, 'Cairo', 'Tajawal', sans-serif !important;
+      }
+      #print-root {
+        width: 100% !important;
+        display: flex !important;
+        justify-content: center !important;
+        background: white !important;
+      }
+      .no-print {
+        display: none !important;
+      }
+    `;
 
-            // Wait for all images to load
-            Promise.all(Array.from(document.images).map(img => {
-              if (img.complete) return Promise.resolve();
-              return new Promise(resolve => {
-                img.onload = resolve;
-                img.onerror = resolve;
-              });
-            })).then(() => {
-              if (document.readyState === 'complete') {
-                triggerPrint();
-              } else {
-                window.addEventListener('load', triggerPrint);
-              }
-            });
-          </script>
-        </body>
-      </html>
-    `);
-    printWindow.document.close();
+    printPureContent(clone.outerHTML, pageStyle, onComplete);
   };
 
   const handlePrintLabelThermal = (order: MaintenanceOrder) => {
-    const mainCenterName = localStorage.getItem('centerName') || 'TECHNO';
-    const centerMobile = localStorage.getItem('centerMobile') || '962790000000';
+    const mainCenterName = localStorage.getItem('centerName') || 'مركز تكنو للصيانة';
+    const centerMobile = localStorage.getItem('centerMobile') || '05xxxxxxxx';
 
-    // Custom Label Settings - Dynamic values from states
-    const lblCenterNameText = mainCenterName;
-    const lblMobileText = centerMobile;
     const layoutConfig = getStoredLabelLayout();
-    const paperSize = layoutConfig.paperSize || lblPaperSize || '50x30';
-    const dims = paperSize.split('x');
-    const widthVal = dims[0] ? parseFloat(dims[0]) : 50;
-    const heightVal = dims[1] ? parseFloat(dims[1]) : 30;
-    const widthLabel = `${widthVal}mm`;
-    const heightLabel = `${heightVal}mm`;
+    const effectiveLayout: LabelLayoutConfig = {
+      ...layoutConfig,
+      paperSize: FIXED_LABEL_PAPER_SIZE
+    };
+    const containerStyles = getLabelContainerStyles(effectiveLayout, lblFormat.fontFamily);
+    const widthLabel = `${containerStyles.widthMm}mm`;
+    const heightLabel = `${containerStyles.heightMm}mm`;
 
-    let barcodeBase64 = '';
-    if (lblShowBarcode) {
-      try {
-        const canvas = document.createElement('canvas');
-        try {
-          JsBarcode(canvas, order.id, {
-            format: lblBarcodeFormat || 'CODE128',
-            width: widthVal <= 40 ? 1.1 : 1.3,
-            height: heightVal <= 25 ? 22 : 28,
-            displayValue: false, // Text is printed separately as crisp native HTML font for 100% legibility
-            margin: 0,
-            background: '#ffffff',
-            lineColor: '#000000',
-          });
-        } catch (err) {
-          // Fallback to CODE128 if the format is incompatible
-          JsBarcode(canvas, order.id, {
-            format: 'CODE128',
-            width: widthVal <= 40 ? 1.1 : 1.3,
-            height: heightVal <= 25 ? 22 : 28,
-            displayValue: false,
-            margin: 0,
-            background: '#ffffff',
-            lineColor: '#000000',
-          });
-        }
-        barcodeBase64 = canvas.toDataURL('image/png');
-      } catch (err) {
-        console.error('Barcode generation error', err);
-      }
-    }
-    const printWindow = window.open('', '_blank', 'width=350,height=250');
-    if (!printWindow) {
-      alert("يرجى تفعيل السماح للنوافذ المنبثقة (Popups) أو فتح التطبيق في متصفح خارجي/نافذة جديدة للطباعة.");
-      return;
+    const activeElements = effectiveLayout.elements.filter(el => el.enabled);
+    const barcodeEl = activeElements.find(el => el.id === 'barcode');
+    const qrCodeEl = activeElements.find(el => el.id === 'qr_code');
+    const splitMetrics = getSplitThermalLabelMetrics(effectiveLayout, containerStyles, activeElements);
+    const {
+      hasQrSide,
+      isCompactHeight,
+      isNarrowWidth,
+      effectivePaddingMm,
+      effectiveLineSpacing,
+      effectiveInnerWidthMm,
+      colGapMm,
+      splitQrSizeMm,
+      compactFontPt,
+    } = splitMetrics;
+
+    let barcodeSvgHtml = '';
+    if (barcodeEl) {
+      const barcodeMetrics = getLabelElementMetrics(barcodeEl, effectiveLayout);
+      const currentFormat = localStorage.getItem('lblBarcodeFormat') || lblBarcodeFormat || 'AUTO';
+      barcodeSvgHtml = renderPrintableBarcodeSvg({
+        code: order.id,
+        qrContent: getOrderQrContent(order, 520),
+        preferredFormat: currentFormat,
+        baseWidth: barcodeEl.width || 1.3,
+        heightPx: barcodeMetrics.barcodeHeightPx,
+        heightMm: barcodeMetrics.barcodeHeightMm,
+        maxWidthMm: effectiveInnerWidthMm,
+        targetQrMm: splitQrSizeMm,
+        quietZonePx: 10,
+        marginModules: 0,
+      });
     }
 
     const orderDate = order.createdAt ? new Date(order.createdAt).toLocaleDateString('ar-SA') : new Date().toLocaleDateString('ar-SA');
-    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(`${window.location.origin}?track=${order.id}`)}`;
+    const trackingUrl = buildTrackingUrl(order.id, appUrl);
 
-    const activeElements = layoutConfig.elements.filter(el => el.enabled);
-    const count = activeElements.length;
-    // Auto-scale to ensure everything fits inside the label height and width perfectly
-    const isSmall = heightVal <= 25;
-    const isVerySmall = heightVal <= 20 || widthVal <= 35;
-    
-    // Scale factor based on active elements count to prevent vertical page spills
-    const scale = count > 5 ? 0.8 : (count > 4 ? 0.88 : 1.0);
-
-    const elementsHtml = activeElements.map(el => {
-      const itemStyle = `margin: 0 !important; padding: 0.1mm 0.4mm !important; text-align: center !important; width: 100% !important; max-width: 100% !important; white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important; box-sizing: border-box !important; line-height: 1.1 !important;`;
+    const rightInfoElementsHtml = activeElements.map(el => {
+      const m = getLabelElementMetrics(el, effectiveLayout);
+      const fontPt = compactFontPt ?? Math.min(m.fontSizePt, isNarrowWidth ? 8 : 11);
+      const mTopMm = isCompactHeight ? 0 : Math.min(m.marginTopMm, 0.4);
+      const mBotMm = isCompactHeight ? 0.2 : Math.min(m.marginBottomMm, 0.5);
+      const baseItemStyle = hasQrSide
+        ? `writing-mode: vertical-rl !important; text-orientation: mixed !important; margin: 0 !important; padding: 0 !important; max-height: 100% !important; white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important; box-sizing: border-box !important; text-align: center !important; line-height: 1 !important;`
+        : `margin-top: ${mTopMm}mm !important; margin-bottom: ${mBotMm}mm !important; padding: 0 !important; text-align: ${containerStyles.textAlign} !important; align-self: ${containerStyles.alignItems} !important; max-width: 100% !important; white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important; box-sizing: border-box !important; line-height: ${effectiveLineSpacing} !important;`;
 
       switch (el.id) {
         case 'center_name': {
-          // Large prominent store name that stays within page boundaries
-          const rawFs = Number(localStorage.getItem('lblFontSizeCenterName')) || el.fontSize || 13;
-          const maxAllowed = isVerySmall ? 10 : (isSmall ? 11.5 : (widthVal >= 60 ? 15 : 13.5));
-          const fs = Math.min(rawFs, maxAllowed) * (count > 5 ? 0.9 : 1.0);
-          return `<div class="center-name" style="${itemStyle} font-size: ${fs.toFixed(1)}pt !important; font-weight: 900 !important; letter-spacing: -0.2px !important; text-shadow: 0 0 0.5px rgba(0,0,0,0.2) !important;">${lblCenterNameText}</div>`;
+          const centerFontPt = hasQrSide
+            ? splitMetrics.getVerticalCenterNameFontPt(mainCenterName)
+            : splitMetrics.getCenterNameFontPt(mainCenterName, fontPt);
+          return `<div class="center-name" dir="auto" style="${baseItemStyle} font-size: ${centerFontPt}pt !important; font-weight: 900 !important; letter-spacing: ${hasQrSide ? '0px' : '-0.25px'} !important; line-height: 1 !important;">${mainCenterName}</div>`;
         }
         case 'center_mobile': {
-          const rawFs = Number(localStorage.getItem('lblFontSizeMobile')) || el.fontSize || 7;
-          const fs = Math.min(rawFs, isSmall ? 6.5 : 7.5) * scale;
-          return `<div class="center-mobile" style="${itemStyle} font-size: ${fs.toFixed(1)}pt !important; font-weight: ${el.bold ? 700 : 500} !important;">${lblMobileText}</div>`;
+          const cleanMob = String(centerMobile || '').trim();
+          const mobileFontPt = hasQrSide
+            ? splitMetrics.getVerticalMobileFontPt(cleanMob)
+            : splitMetrics.getCenterMobileFontPt(cleanMob, fontPt);
+          return `<div class="center-mobile" dir="ltr" style="${baseItemStyle} text-overflow: clip !important; font-family: system-ui, -apple-system, 'Cairo', sans-serif !important; font-variant-numeric: tabular-nums !important; font-size: ${mobileFontPt}pt !important; font-weight: ${hasQrSide ? 900 : (el.bold ? 700 : 600)} !important; letter-spacing: ${hasQrSide ? '0px' : '-0.1px'} !important; direction: ltr !important;">${cleanMob}</div>`;
         }
         case 'customer_name': {
-          const rawFs = Number(localStorage.getItem('lblFontSizeCustomerName')) || el.fontSize || 7.5;
-          const fs = Math.min(rawFs, isSmall ? 6.5 : 7.5) * scale;
-          return `<div style="${itemStyle} font-size: ${fs.toFixed(1)}pt !important; font-weight: ${el.bold ? 800 : 600} !important;">العميل: ${order.customerName}</div>`;
+          const txt = `العميل: ${order.customerName}`;
+          const fPt = hasQrSide ? splitMetrics.getVerticalInfoFontPt(txt) : fontPt;
+          return `<div dir="auto" style="${baseItemStyle} font-size: ${fPt}pt !important; font-weight: ${el.bold ? 800 : 600} !important;">${txt}</div>`;
         }
         case 'device_model': {
-          const rawFs = Number(localStorage.getItem('lblFontSizeDeviceModel')) || el.fontSize || 7.5;
-          const fs = Math.min(rawFs, isSmall ? 6.5 : 7.5) * scale;
-          return `<div style="${itemStyle} font-size: ${fs.toFixed(1)}pt !important; font-weight: ${el.bold ? 800 : 600} !important;">الجهاز: ${order.brandModel}</div>`;
+          const txt = `الجهاز: ${order.brandModel}`;
+          const fPt = hasQrSide ? splitMetrics.getVerticalInfoFontPt(txt) : fontPt;
+          return `<div dir="auto" style="${baseItemStyle} font-size: ${fPt}pt !important; font-weight: ${el.bold ? 800 : 600} !important;">${txt}</div>`;
         }
         case 'order_date': {
-          const rawFs = Number(localStorage.getItem('lblFontSizeDate')) || el.fontSize || 6.5;
-          const fs = Math.min(rawFs, isSmall ? 5.5 : 6.5) * scale;
-          return `<div style="${itemStyle} font-size: ${fs.toFixed(1)}pt !important; font-weight: ${el.bold ? 700 : 400} !important;">التاريخ: ${orderDate}</div>`;
+          const txt = `التاريخ: ${orderDate}`;
+          const fPt = hasQrSide ? splitMetrics.getVerticalInfoFontPt(txt) : fontPt;
+          return `<div dir="auto" style="${baseItemStyle} font-size: ${fPt}pt !important; font-weight: ${el.bold ? 700 : 400} !important;">${txt}</div>`;
         }
         case 'barcode': {
-          const bcImgHeight = isVerySmall ? '5.5mm' : (isSmall ? '6.5mm' : (heightVal >= 40 ? '10mm' : '8mm'));
-          const rawFs = Number(localStorage.getItem('lblFontSizeBarcodeText')) || el.fontSize || 8;
-          const bcFont = (Math.min(rawFs, isSmall ? 7 : 8) * scale).toFixed(1);
-          return barcodeBase64 ? `
-            <div class="barcode-print-block" style="${itemStyle} padding: 0 !important; display: flex !important; flex-direction: column !important; align-items: center !important; justify-content: center !important;">
-              <img src="${barcodeBase64}" style="max-height: ${bcImgHeight} !important; height: auto !important; width: auto !important; max-width: 94% !important; margin: 0 auto !important; image-rendering: pixelated !important; display: block !important;" alt="Barcode" />
-              <div class="barcode-number-readable" style="font-size: ${bcFont}pt !important; font-family: 'Courier New', Courier, monospace !important; font-weight: 800 !important; letter-spacing: 0.5px !important; direction: ltr !important; margin-top: 0.2mm !important; line-height: 1 !important; white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important;">
-                ${order.id}
-              </div>
-            </div>
-          ` : '';
-        }
-        case 'qr_code': {
-          const qrDim = isVerySmall ? '6.5mm' : (isSmall ? '8mm' : '9.5mm');
-          return `
-            <div class="qr-container" style="${itemStyle} padding: 0 !important;">
-              <img src="${qrCodeUrl}" style="max-width: ${qrDim} !important; max-height: ${qrDim} !important; margin: 0 auto !important; display: block !important;" alt="QR" />
-            </div>
-          `;
+          const codeFontPt = hasQrSide
+            ? splitMetrics.getVerticalCodeFontPt(order.id)
+            : splitMetrics.getCodeFontPt(order.id, fontPt);
+          return `<div class="barcode-number-readable" dir="ltr" style="${baseItemStyle} text-overflow: clip !important; font-size: ${codeFontPt}pt !important; font-family: system-ui, -apple-system, 'Cairo', sans-serif !important; font-variant-numeric: tabular-nums !important; font-weight: 900 !important; letter-spacing: ${hasQrSide ? '0px' : '-0.2px'} !important; direction: ltr !important; line-height: 1 !important;">${order.id}</div>`;
         }
         case 'custom_text': {
-          const fs = Math.min(el.fontSize || 6.5, isSmall ? 5.5 : 6.5) * scale;
-          return `<div class="custom-text" style="${itemStyle} font-size: ${fs.toFixed(1)}pt !important; font-weight: ${el.bold ? 700 : 500} !important;">${el.customContent || 'يرجى إبراز هذا الملصق عند الاستلام'}</div>`;
+          const txt = el.customContent || 'يرجى إبراز هذا الملصق عند الاستلام';
+          const fPt = hasQrSide ? splitMetrics.getVerticalInfoFontPt(txt) : fontPt;
+          if (hasQrSide) {
+            return `<div class="custom-text" dir="auto" style="${baseItemStyle} font-size: ${fPt}pt !important; font-weight: ${el.bold ? 700 : 500} !important;">${txt}</div>`;
+          }
+          return `<div class="custom-text" style="margin-top: ${mTopMm}mm !important; margin-bottom: ${mBotMm}mm !important; padding: 0 !important; text-align: ${containerStyles.textAlign} !important; align-self: ${containerStyles.alignItems} !important; max-width: 100% !important; white-space: normal !important; word-break: break-word !important; box-sizing: border-box !important; line-height: ${effectiveLineSpacing} !important; font-size: ${fontPt}pt !important; font-weight: ${el.bold ? 700 : 500} !important;">${txt}</div>`;
         }
         default:
           return '';
       }
-    }).join('\n');
+    }).filter(Boolean).join('\n');
 
-    printWindow.document.write(`
-      <!DOCTYPE html>
-      <html dir="rtl" lang="ar">
-        <head>
-          <meta charset="utf-8">
-          <title>⚠️ طابعة ملصقات الباركود - ${lblCenterNameText}</title>
-          <style>
-            @import url('https://fonts.googleapis.com/css2?family=Almarai:wght@400;700;800&family=Amiri:wght@400;700&family=Cairo:wght@400;600;700;800;900&family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&family=Tajawal:wght@400;500;700;800;900&display=swap');
-            @page {
-              size: ${widthLabel} ${heightLabel};
-              margin: 0 !important;
-            }
-            * {
-              box-sizing: border-box !important;
-            }
-            html, body {
-              margin: 0 !important;
-              padding: 0 !important;
-              width: ${widthLabel} !important;
-              height: ${heightLabel} !important;
-              max-width: ${widthLabel} !important;
-              max-height: ${heightLabel} !important;
-              overflow: hidden !important;
-              box-sizing: border-box !important;
-              background-color: white !important;
-              color: black !important;
-              font-family: ${lblFormat.fontFamily}, 'Cairo', system-ui, -apple-system, sans-serif !important;
-              text-align: center !important;
-              -webkit-print-color-adjust: exact !important;
-              print-color-adjust: exact !important;
-              display: block !important;
-            }
-            .label-wrapper-outer {
-              width: ${widthLabel} !important;
-              height: ${heightLabel} !important;
-              max-width: ${widthLabel} !important;
-              max-height: ${heightLabel} !important;
-              display: flex !important;
-              flex-direction: column !important;
-              box-sizing: border-box !important;
-              font-family: ${lblFormat.fontFamily}, 'Cairo', system-ui, -apple-system, sans-serif !important;
-              text-align: center !important;
-              align-items: center !important;
-              justify-content: space-between !important;
-              padding: 0.4mm 0.8mm !important;
-              margin: 0 auto !important;
-              overflow: hidden !important;
-            }
-            .label-wrapper-outer div, .label-wrapper-outer span {
-              max-width: 100% !important;
-              white-space: nowrap !important;
-              overflow: hidden !important;
-              text-overflow: ellipsis !important;
-              box-sizing: border-box !important;
-            }
-            @media print {
-              .print-instruction { display: none !important; }
-              @page {
-                size: ${widthLabel} ${heightLabel};
-                margin: 0 !important;
-              }
-              html, body {
-                width: ${widthLabel} !important;
-                height: ${heightLabel} !important;
-                max-width: ${widthLabel} !important;
-                max-height: ${heightLabel} !important;
-                margin: 0 !important;
-                padding: 0 !important;
-                overflow: hidden !important;
-                background-color: white !important;
-                color: black !important;
-                display: block !important;
-              }
-              .label-wrapper-outer {
-                width: ${widthLabel} !important;
-                height: ${heightLabel} !important;
-                max-width: ${widthLabel} !important;
-                max-height: ${heightLabel} !important;
-                overflow: hidden !important;
-                display: flex !important;
-                flex-direction: column !important;
-                box-sizing: border-box !important;
-                text-align: center !important;
-                align-items: center !important;
-                justify-content: space-between !important;
-                margin: 0 auto !important;
-                padding: 0.3mm 0.6mm !important;
-              }
-            }
-          </style>
-        </head>
-        <body>
-          <div class="print-instruction" style="background: #ffeb3b; color: #000; text-align: center; padding: 6px; font-weight: bold; margin-bottom: 10px; font-family: sans-serif; position: absolute; top: 0; left: 0; right: 0; z-index: 9999; font-size: 11px;">
-            ⚠️ الرجاء التأكد من اختيار طابعة الملصقات (Label Printer) وضبط الهوامش على (بلا هوامش - None) ⚠️
-          </div>
-          <div class="label-wrapper-outer">
-            ${elementsHtml}
-          </div>
+    const leftQrBlocks: string[] = [];
+    if (barcodeSvgHtml) {
+      leftQrBlocks.push(`<div class="barcode-qr-wrap" style="display: flex !important; align-items: center !important; justify-content: center !important; background: #ffffff !important;">${barcodeSvgHtml}</div>`);
+    }
+    if (qrCodeEl) {
+      const m = getLabelElementMetrics(qrCodeEl, effectiveLayout);
+      const inlineQrSvg = renderAlphanumericQrSvg({
+        value: trackingUrl,
+        mode: 'auto',
+        physicalSizeMm: splitQrSizeMm || Math.max(m.qrSizeMm, 11),
+        marginModules: 0,
+        errorCorrectionLevel: 'M',
+      });
+      leftQrBlocks.push(`<div class="qr-container" style="display: flex !important; align-items: center !important; justify-content: center !important; background: #ffffff !important;">${inlineQrSvg}</div>`);
+    }
+    const leftQrHtml = leftQrBlocks.join('\n');
 
-          <script>
-            function triggerPrint() {
-              setTimeout(() => {
-                window.print();
-              }, 500);
-            }
+    const hasInfoHtml = Boolean(rightInfoElementsHtml.trim());
+    const labelHtml = hasQrSide
+      ? (hasInfoHtml
+        ? `
+      <div class="pure-thermal-label-outer" dir="rtl">
+        <div class="thermal-info-col">
+          ${rightInfoElementsHtml}
+        </div>
+        <div class="thermal-qr-col">
+          ${leftQrHtml}
+        </div>
+      </div>
+    `
+        : `
+      <div class="pure-thermal-label-outer pure-thermal-label-qr-only" dir="rtl">
+        <div class="thermal-qr-col">
+          ${leftQrHtml}
+        </div>
+      </div>
+    `)
+      : `
+      <div class="pure-thermal-label-outer" dir="rtl">
+        ${rightInfoElementsHtml}
+      </div>
+    `;
 
-            window.onafterprint = () => {
-              setTimeout(() => {
-                window.close();
-              }, 500);
-            };
+    const pageStyle = `
+      @page {
+        size: ${widthLabel} ${heightLabel};
+        margin: 0 !important;
+      }
+      .pure-thermal-label-outer {
+        width: ${widthLabel} !important;
+        height: ${heightLabel} !important;
+        max-width: ${widthLabel} !important;
+        max-height: ${heightLabel} !important;
+        overflow: hidden !important;
+        display: flex !important;
+        flex-direction: ${hasQrSide ? 'row' : 'column'} !important;
+        align-items: center !important;
+        justify-content: ${hasQrSide && hasInfoHtml ? 'space-between' : 'center'} !important;
+        gap: ${hasQrSide && hasInfoHtml ? `${colGapMm}mm` : '0'} !important;
+        padding: ${effectivePaddingMm}mm !important;
+        box-sizing: border-box !important;
+        text-align: ${containerStyles.textAlign} !important;
+        margin: 0 auto !important;
+        background: white !important;
+        color: black !important;
+        font-family: ${containerStyles.fontFamilyCss} !important;
+        page-break-inside: avoid !important;
+        break-inside: avoid !important;
+      }
+      .thermal-info-col {
+        flex: 1 1 0% !important;
+        min-width: 0 !important;
+        height: 100% !important;
+        display: flex !important;
+        flex-direction: ${hasQrSide ? 'row' : 'column'} !important;
+        justify-content: center !important;
+        align-items: ${hasQrSide ? 'center' : containerStyles.alignItems} !important;
+        gap: ${hasQrSide ? `${splitMetrics.verticalColGapMm}mm` : '0'} !important;
+        text-align: ${hasQrSide ? 'center' : containerStyles.textAlign} !important;
+        overflow: hidden !important;
+      }
+      .thermal-qr-col {
+        flex: 0 0 auto !important;
+        height: 100% !important;
+        display: flex !important;
+        flex-direction: column !important;
+        align-items: center !important;
+        justify-content: center !important;
+        gap: 0.25mm !important;
+        background: #ffffff !important;
+      }
+      .pure-thermal-label-outer svg {
+        max-width: 100% !important;
+        display: block !important;
+      }
+      .pure-thermal-label-outer * {
+        box-sizing: border-box !important;
+      }
+    `;
 
-            // Wait for all images to load
-            Promise.all(Array.from(document.images).map(img => {
-              if (img.complete) return Promise.resolve();
-              return new Promise(resolve => {
-                img.onload = resolve;
-                img.onerror = resolve;
-              });
-            })).then(() => {
-              if (document.fonts && document.fonts.ready) {
-                document.fonts.ready.then(triggerPrint).catch(triggerPrint);
-              } else if (document.readyState === 'complete') {
-                triggerPrint();
-              } else {
-                window.addEventListener('load', triggerPrint);
-              }
-            });
-          </script>
-        </body>
-      </html>
-    `);
-    printWindow.document.close();
+    printPureContent(labelHtml, pageStyle);
   };
   
   // Form fields for adding/editing
@@ -917,6 +903,14 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
   const [formSerialNumber, setFormSerialNumber] = useState('');
   const [formFaultDescription, setFormFaultDescription] = useState('');
   const [formEstimatedCost, setFormEstimatedCost] = useState<number | ''>('');
+  const [formExtraCost, setFormExtraCost] = useState<number | ''>('');
+  const [formExtraCostReason, setFormExtraCostReason] = useState('');
+  const [formAdvancePayment, setFormAdvancePayment] = useState<number | ''>('');
+  const [formWaitingPartsDetails, setFormWaitingPartsDetails] = useState('');
+  const [formWaitingPartsExpectedDate, setFormWaitingPartsExpectedDate] = useState('');
+  const [formCustomVariables, setFormCustomVariables] = useState<CustomNotificationVariable[]>([]);
+  const [newFormVarLabel, setNewFormVarLabel] = useState('');
+  const [newFormVarValue, setNewFormVarValue] = useState('');
   const [formCurrency, setFormCurrency] = useState('');
   const [formExpectedDeliveryDate, setFormExpectedDeliveryDate] = useState('');
   const [formNotes, setFormNotes] = useState('');
@@ -927,38 +921,86 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
   );
   const [formBarcodeId, setFormBarcodeId] = useState<string>('');
   const [formPhotos, setFormPhotos] = useState<MaintenancePhoto[]>([]);
+  const [formCustomerId, setFormCustomerId] = useState<string>('');
+  const [formCustomerBarcode, setFormCustomerBarcode] = useState<string>('');
 
-  // Unique customers derived from all orders to act as autocomplete database
+  // Unified customer autocomplete database combining persistent CustomerProfiles & order history
   const uniqueCustomers = useMemo(() => {
-    const map = new Map<string, string>(); // phone -> name
-    orders.forEach(o => {
+    const list: { id?: string; customerBarcode?: string; name: string; phone: string }[] = [];
+    const seenKeys = new Set<string>();
+
+    customers.forEach((c) => {
+      const key = c.phone?.trim() || c.name?.trim();
+      if (key) seenKeys.add(key);
+      list.push({
+        id: c.id,
+        customerBarcode: c.customerBarcode,
+        name: c.name,
+        phone: c.phone,
+      });
+    });
+
+    orders.forEach((o) => {
       const p = (o.customerPhone || '').trim();
       const n = (o.customerName || '').trim();
-      if (p && n && p.length > 3) {
-        const existing = map.get(p);
-        if (!existing || n.length > existing.length) {
-          map.set(p, n);
-        }
+      const key = p || n;
+      if (!key) return;
+      const alreadyExists = list.some(
+        (item) =>
+          (p && phonesMatch(item.phone, p)) ||
+          (!p && normalizeCustomerNameKey(item.name) === normalizeCustomerNameKey(n))
+      );
+      if (!alreadyExists && !seenKeys.has(key)) {
+        seenKeys.add(key);
+        list.push({
+          id: o.customerId,
+          customerBarcode: o.customerBarcode,
+          name: n,
+          phone: p,
+        });
       }
     });
-    return Array.from(map.entries()).map(([phone, name]) => ({ phone, name }));
-  }, [orders]);
 
-  const [customerSuggestions, setCustomerSuggestions] = useState<{ name: string; phone: string }[]>([]);
+    return list;
+  }, [customers, orders]);
+
+  const matchedCustomerInForm = useMemo(() => {
+    if (formCustomerId) {
+      const byId = uniqueCustomers.find((c) => c.id === formCustomerId);
+      if (byId) return byId;
+    }
+    if (formCustomerPhone.trim()) {
+      const byPhone = uniqueCustomers.find((c) => phonesMatch(c.phone, formCustomerPhone));
+      if (byPhone) return byPhone;
+    }
+    if (formCustomerName.trim()) {
+      const nKey = normalizeCustomerNameKey(formCustomerName);
+      const byName = uniqueCustomers.find((c) => normalizeCustomerNameKey(c.name) === nKey);
+      if (byName) return byName;
+    }
+    return null;
+  }, [uniqueCustomers, formCustomerId, formCustomerPhone, formCustomerName]);
+
+  const [customerSuggestions, setCustomerSuggestions] = useState<{ id?: string; customerBarcode?: string; name: string; phone: string }[]>([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [activeSuggestionField, setActiveSuggestionField] = useState<'name' | 'phone' | null>(null);
 
   const handleNameChange = (val: string) => {
     setFormCustomerName(val);
+    setFormCustomerId('');
+    setFormCustomerBarcode('');
     setActiveSuggestionField('name');
     if (!val.trim()) {
       setCustomerSuggestions([]);
       setShowSuggestions(false);
       return;
     }
-    const filtered = uniqueCustomers.filter(c => 
-      c.name.toLowerCase().includes(val.toLowerCase()) ||
-      c.phone.includes(val)
+    const q = val.toLowerCase();
+    const filtered = uniqueCustomers.filter(
+      (c) =>
+        c.name.toLowerCase().includes(q) ||
+        c.phone.includes(val) ||
+        (c.customerBarcode && c.customerBarcode.toLowerCase().includes(q))
     );
     setCustomerSuggestions(filtered);
     setShowSuggestions(true);
@@ -966,23 +1008,30 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
 
   const handlePhoneChange = (val: string) => {
     setFormCustomerPhone(val);
+    setFormCustomerId('');
+    setFormCustomerBarcode('');
     setActiveSuggestionField('phone');
     if (!val.trim()) {
       setCustomerSuggestions([]);
       setShowSuggestions(false);
       return;
     }
-    const filtered = uniqueCustomers.filter(c => 
-      c.phone.includes(val) ||
-      c.name.toLowerCase().includes(val.toLowerCase())
+    const q = val.toLowerCase();
+    const filtered = uniqueCustomers.filter(
+      (c) =>
+        c.phone.includes(val) ||
+        c.name.toLowerCase().includes(q) ||
+        (c.customerBarcode && c.customerBarcode.toLowerCase().includes(q))
     );
     setCustomerSuggestions(filtered);
     setShowSuggestions(true);
   };
 
-  const selectSuggestion = (c: { name: string; phone: string }) => {
+  const selectSuggestion = (c: { id?: string; customerBarcode?: string; name: string; phone: string }) => {
     setFormCustomerName(c.name);
     setFormCustomerPhone(c.phone);
+    setFormCustomerId(c.id || '');
+    setFormCustomerBarcode(c.customerBarcode || '');
     setShowSuggestions(false);
     setCustomerSuggestions([]);
   };
@@ -1100,7 +1149,11 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
       };
 
       recognition.onerror = async (event: any) => {
-        console.error("Speech recognition error:", event.error);
+        if (event.error === 'no-speech' || event.error === 'aborted') {
+          setListeningField(null);
+          return;
+        }
+        console.warn("Speech recognition notice:", event.error);
         if (event.error === 'not-allowed') {
           const reqRes = await requestMicrophonePermission();
           if (reqRes.granted) {
@@ -1121,37 +1174,55 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
       recognitionRef.current = recognition;
       recognition.start();
     } catch (error) {
-      console.error("Speech recognition creation failed:", error);
+      console.warn("Speech recognition creation failed:", error);
       setListeningField(null);
     }
   };
 
-  // Auto generate ID: 3-letter prefix + YYMMHHmm
+  // Auto generate ID: ***yymmddhhmm (3-char prefix + country local 24h timestamp)
   const generateNewId = (prefixToUse?: string) => {
     const rawPrefix = prefixToUse || formBarcodePrefix || localStorage.getItem('barcodePrefix') || 'TEC';
     const cleanPrefix = sanitizeBarcodePrefix(rawPrefix);
     const existingOrderIds = orders.map(o => o.id);
-    return generateBarcodeId(cleanPrefix, existingOrderIds);
+    return generateBarcodeId(cleanPrefix, existingOrderIds, new Date(), getActiveCountrySettings());
   };
 
-  const handleOpenAddModal = () => {
+  const handleOpenAddModal = (prefill?: { name: string; phone: string }) => {
     setIsEditing(false);
     const currentPrefix = sanitizeBarcodePrefix(localStorage.getItem('barcodePrefix') || 'TEC');
     setFormBarcodePrefix(currentPrefix);
-    const newId = generateBarcodeId(currentPrefix, orders.map(o => o.id));
+    const activeTz = getActiveCountrySettings();
+    const newId = generateBarcodeId(currentPrefix, orders.map(o => o.id), new Date(), activeTz);
     setFormBarcodeId(newId);
 
-    setFormCustomerName('');
-    setFormCustomerPhone('');
+    setFormCustomerName(prefill?.name || '');
+    setFormCustomerPhone(prefill?.phone || '');
+    const matchedPrefill = prefill
+      ? uniqueCustomers.find(
+          (c) =>
+            (prefill.phone && phonesMatch(c.phone, prefill.phone)) ||
+            (prefill.name && normalizeCustomerNameKey(c.name) === normalizeCustomerNameKey(prefill.name))
+        )
+      : undefined;
+    setFormCustomerId(matchedPrefill?.id || '');
+    setFormCustomerBarcode(matchedPrefill?.customerBarcode || '');
     setFormDeviceType('جوال');
     setFormBrandModel('');
     setFormSerialNumber('');
     setFormFaultDescription('');
     setFormEstimatedCost('');
-    setFormCurrency(currencyName);
+    setFormExtraCost('');
+    setFormExtraCostReason('');
+    setFormAdvancePayment('');
+    setFormWaitingPartsDetails('');
+    setFormWaitingPartsExpectedDate('');
+    setFormCustomVariables([]);
+    setNewFormVarLabel('');
+    setNewFormVarValue('');
+    setFormCurrency(localStorage.getItem('currencyName') || currencyName);
     
-    // Set default expected date to 3 days from now
-    const threeDaysOut = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    // Set default expected date to 3 days from now in active country timezone
+    const threeDaysOut = formatCountryDateYmd(Date.now() + 3 * 24 * 60 * 60 * 1000, activeTz);
     setFormExpectedDeliveryDate(threeDaysOut);
     
     setFormNotes(''); setFormStatusUpdateText('');
@@ -1165,20 +1236,31 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
     setIsEditing(false); // New order, not editing the old one
     const currentPrefix = sanitizeBarcodePrefix(localStorage.getItem('barcodePrefix') || 'TEC');
     setFormBarcodePrefix(currentPrefix);
-    const newId = generateBarcodeId(currentPrefix, orders.map(o => o.id));
+    const activeTz = getActiveCountrySettings();
+    const newId = generateBarcodeId(currentPrefix, orders.map(o => o.id), new Date(), activeTz);
     setFormBarcodeId(newId);
 
     setFormCustomerName(order.customerName);
     setFormCustomerPhone(order.customerPhone);
+    setFormCustomerId(order.customerId || '');
+    setFormCustomerBarcode(order.customerBarcode || '');
     setFormDeviceType(order.deviceType);
     setFormBrandModel(order.brandModel);
     setFormSerialNumber(order.serialNumber);
     setFormFaultDescription(''); // Let them write new fault
     setFormEstimatedCost('');
-    setFormCurrency(order.currency || currencyName);
+    setFormExtraCost('');
+    setFormExtraCostReason('');
+    setFormAdvancePayment('');
+    setFormWaitingPartsDetails('');
+    setFormWaitingPartsExpectedDate('');
+    setFormCustomVariables([]);
+    setNewFormVarLabel('');
+    setNewFormVarValue('');
+    setFormCurrency(order.currency || localStorage.getItem('currencyName') || currencyName);
     
-    // Set default expected date to 3 days from now
-    const threeDaysOut = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    // Set default expected date to 3 days from now in active country timezone
+    const threeDaysOut = formatCountryDateYmd(Date.now() + 3 * 24 * 60 * 60 * 1000, activeTz);
     setFormExpectedDeliveryDate(threeDaysOut);
     
     setFormNotes(''); setFormStatusUpdateText('');
@@ -1193,11 +1275,21 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
     setFormBarcodePrefix(order.id.slice(0, 3));
     setFormCustomerName(order.customerName);
     setFormCustomerPhone(order.customerPhone);
+    setFormCustomerId(order.customerId || '');
+    setFormCustomerBarcode(order.customerBarcode || '');
     setFormDeviceType(order.deviceType);
     setFormBrandModel(order.brandModel);
     setFormSerialNumber(order.serialNumber);
     setFormFaultDescription(order.faultDescription);
     setFormEstimatedCost(order.estimatedCost === 0 ? '' : order.estimatedCost);
+    setFormExtraCost(order.extraCost ? order.extraCost : '');
+    setFormExtraCostReason(order.extraCostReason || '');
+    setFormAdvancePayment(order.advancePayment ? order.advancePayment : '');
+    setFormWaitingPartsDetails(order.waitingPartsDetails || '');
+    setFormWaitingPartsExpectedDate(order.waitingPartsExpectedDate || '');
+    setFormCustomVariables(order.customVariables ? order.customVariables.map(v => ({ ...v })) : []);
+    setNewFormVarLabel('');
+    setNewFormVarValue('');
     setFormCurrency(order.currency || currencyName);
     setFormExpectedDeliveryDate(order.expectedDeliveryDate);
     setFormNotes(order.notes); setFormStatusUpdateText(order.statusUpdateText || '');
@@ -1210,18 +1302,46 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
     e.preventDefault();
     if (!formCustomerName.trim() || !formCustomerPhone.trim() || !formBrandModel.trim() || !formFaultDescription.trim()) return;
 
+    const resolvedCustId = formCustomerId || matchedCustomerInForm?.id;
+    const resolvedCustBarcode = formCustomerBarcode || matchedCustomerInForm?.customerBarcode;
+
+    const baseCostVal = formEstimatedCost === '' ? 0 : Number(formEstimatedCost) || 0;
+    const extraCostVal = formExtraCost === '' ? 0 : Number(formExtraCost) || 0;
+    const advanceVal = formAdvancePayment === '' ? 0 : Number(formAdvancePayment) || 0;
+    const mergedVars = sanitizeCustomVariables(
+      newFormVarLabel.trim() && newFormVarValue.trim()
+        ? [
+            ...formCustomVariables,
+            {
+              key: `var_${formCustomVariables.length + 1}`,
+              label: newFormVarLabel.trim(),
+              value: newFormVarValue.trim(),
+            },
+          ]
+        : formCustomVariables
+    );
+    const resolvedCurrency = formCurrency || currencyName;
+
     if (isEditing && selectedOrder) {
       // Edit existing
-      const updatedOrder: MaintenanceOrder = {
+      const baseEdited: MaintenanceOrder = {
         ...selectedOrder,
+        ...(resolvedCustId ? { customerId: resolvedCustId } : {}),
+        ...(resolvedCustBarcode ? { customerBarcode: resolvedCustBarcode } : {}),
         customerName: formCustomerName.trim(),
         customerPhone: formCustomerPhone.trim(),
         deviceType: formDeviceType,
         brandModel: formBrandModel.trim(),
         serialNumber: formSerialNumber.trim(),
         faultDescription: formFaultDescription.trim(),
-        estimatedCost: formEstimatedCost === '' ? 0 : formEstimatedCost,
-        currency: formCurrency || currencyName,
+        estimatedCost: baseCostVal,
+        extraCost: extraCostVal,
+        extraCostReason: formExtraCostReason.trim(),
+        advancePayment: advanceVal,
+        waitingPartsDetails: formWaitingPartsDetails.trim(),
+        waitingPartsExpectedDate: formWaitingPartsExpectedDate.trim(),
+        customVariables: mergedVars,
+        currency: resolvedCurrency,
         expectedDeliveryDate: formExpectedDeliveryDate,
         notes: formNotes.trim(),
         statusUpdateText: formStatusUpdateText.trim(),
@@ -1229,31 +1349,50 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
         photos: formPhotos,
         updatedAt: Date.now()
       };
-      
-      // Add a log entry for modification if details changed
-      updatedOrder.statusHistory = updatedOrder.statusHistory || [];
-      updatedOrder.statusHistory.push({
-        status: selectedOrder.status,
-        timestamp: Date.now(),
-        note: 'تم تحديث تفاصيل وبيانات الجهاز والعميل بنجاح.',
-        updatedBy: 'موظف الاستقبال'
+
+      const editSnapshot = buildStatusHistorySnapshot(baseEdited, {
+        statusNote: 'تم تحديث تفاصيل وبيانات الجهاز والأسعار والمتغيرات.',
+        notificationChannel: 'none',
+        currency: resolvedCurrency,
       });
+
+      const updatedOrder: MaintenanceOrder = {
+        ...baseEdited,
+        statusHistory: [
+          ...(selectedOrder.statusHistory || []),
+          {
+            status: selectedOrder.status,
+            timestamp: Date.now(),
+            note: 'تم تحديث تفاصيل وبيانات الجهاز والعميل بنجاح.',
+            updatedBy: currentUser?.displayName || 'موظف الاستقبال',
+            snapshot: editSnapshot,
+          }
+        ]
+      };
 
       onSaveOrder(updatedOrder);
       setSelectedOrder(updatedOrder);
     } else {
-      // Add new
+      // Add new (Reception)
       const newId = formBarcodeId || generateNewId(formBarcodePrefix);
-      const newOrder: MaintenanceOrder = {
+      const baseNewOrder: MaintenanceOrder = {
         id: newId,
+        ...(resolvedCustId ? { customerId: resolvedCustId } : {}),
+        ...(resolvedCustBarcode ? { customerBarcode: resolvedCustBarcode } : {}),
         customerName: formCustomerName.trim(),
         customerPhone: formCustomerPhone.trim(),
         deviceType: formDeviceType,
         brandModel: formBrandModel.trim(),
         serialNumber: formSerialNumber.trim(),
         faultDescription: formFaultDescription.trim(),
-        estimatedCost: formEstimatedCost === '' ? 0 : formEstimatedCost,
-        currency: formCurrency || currencyName,
+        estimatedCost: baseCostVal,
+        extraCost: extraCostVal,
+        extraCostReason: formExtraCostReason.trim(),
+        advancePayment: advanceVal,
+        waitingPartsDetails: formWaitingPartsDetails.trim(),
+        waitingPartsExpectedDate: formWaitingPartsExpectedDate.trim(),
+        customVariables: mergedVars,
+        currency: resolvedCurrency,
         expectedDeliveryDate: formExpectedDeliveryDate,
         status: DeviceStatus.RECEIVED,
         notes: formNotes.trim(),
@@ -1262,12 +1401,24 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
         photos: formPhotos,
         createdAt: Date.now(),
         updatedAt: Date.now(),
+        statusHistory: []
+      };
+
+      const receptionSnapshot = buildStatusHistorySnapshot(baseNewOrder, {
+        statusNote: 'تم استقبال الجهاز في المحل وتسجيل الطلب بنجاح.',
+        notificationChannel: 'none',
+        currency: resolvedCurrency,
+      });
+
+      const newOrder: MaintenanceOrder = {
+        ...baseNewOrder,
         statusHistory: [
           {
             status: DeviceStatus.RECEIVED,
             timestamp: Date.now(),
             note: 'تم استقبال الجهاز في المحل وتسجيل الطلب بنجاح.',
-            updatedBy: 'موظف الاستقبال'
+            updatedBy: currentUser?.displayName || 'موظف الاستقبال',
+            snapshot: receptionSnapshot,
           }
         ]
       };
@@ -1318,7 +1469,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
   const triggerDirectWhatsApp = (tplId: string) => {
     if (!selectedOrder) return;
     const tpl = templates.find(t => t.id === tplId);
-    const targetStatus = (tpl && typeof tpl.statusTrigger === 'string' && tpl.statusTrigger !== 'reminder' && tpl.statusTrigger !== 'overdue_48h')
+    const targetStatus = (tpl && typeof tpl.statusTrigger === 'string' && tpl.statusTrigger !== 'reminder' && (tpl.statusTrigger as string) !== 'overdue_48h')
       ? (tpl.statusTrigger as DeviceStatus)
       : selectedOrder.status;
 
@@ -1332,11 +1483,18 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
   // Filters calculation
   const filteredOrders = orders.filter(order => {
     if (isContactOrder(order)) return false; // Exclude contacts from the maintenance list
-    const matchesSearch = 
-      order.customerName.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      order.customerPhone.includes(searchTerm) ||
-      order.id.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      order.brandModel.toLowerCase().includes(searchTerm.toLowerCase());
+    const q = searchTerm.trim().toLowerCase();
+    const matchesSearch =
+      !q ||
+      (order.customerName || '').toLowerCase().includes(q) ||
+      (order.customerPhone || '').toLowerCase().includes(q) ||
+      phonesMatch(order.customerPhone, searchTerm) ||
+      order.id.toLowerCase().includes(q) ||
+      (order.brandModel || '').toLowerCase().includes(q) ||
+      (order.serialNumber && order.serialNumber.toLowerCase().includes(q)) ||
+      (order.customerBarcode && order.customerBarcode.toLowerCase().includes(q)) ||
+      (order.deviceBarcode && order.deviceBarcode.toLowerCase().includes(q)) ||
+      (order.customerId && order.customerId.toLowerCase().includes(q));
 
     const matchesStatus = statusFilter === 'all' || order.status === statusFilter;
     const matchesDevice = deviceFilter === 'all' || order.deviceType === deviceFilter;
@@ -1510,13 +1668,46 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                     <strong className="text-gray-900 text-left bg-white px-2 py-0.5 rounded border border-gray-200/50 max-w-[180px] break-words">{selectedOrder.faultDescription}</strong>
                   </div>
                   <div className="flex justify-between items-center">
-                    <span>التكلفة المتوقعة:</span>
+                    <span>التكلفة الأساسية:</span>
                     <strong className="text-gray-950 font-bold">{selectedOrder.estimatedCost} {selectedOrder.currency || currencyName}</strong>
                   </div>
-                  {selectedOrder.actualCost !== undefined && (
-                    <div className="flex justify-between border-t border-gray-100 pt-1.5 text-emerald-800 font-bold">
-                      <span>التكلفة النهائية:</span>
-                      <span className="text-emerald-700 font-extrabold">{selectedOrder.actualCost} {selectedOrder.currency || currencyName}</span>
+                  {(selectedOrder.extraCost || 0) > 0 && (
+                    <div className="flex justify-between items-start gap-2 text-amber-900">
+                      <span>الكلف الإضافية:</span>
+                      <strong className="font-bold text-left">
+                        {selectedOrder.extraCost} {selectedOrder.currency || currencyName}
+                        {selectedOrder.extraCostReason ? ` (${selectedOrder.extraCostReason})` : ''}
+                      </strong>
+                    </div>
+                  )}
+                  {(selectedOrder.advancePayment || 0) > 0 && (
+                    <div className="flex justify-between items-center text-teal-800">
+                      <span>العربون المدفوع:</span>
+                      <strong className="font-bold">{selectedOrder.advancePayment} {selectedOrder.currency || currencyName}</strong>
+                    </div>
+                  )}
+                  <div className="flex justify-between border-t border-gray-100 pt-1.5 text-emerald-800 font-bold">
+                    <span>التكلفة الإجمالية:</span>
+                    <span className="text-emerald-700 font-extrabold">
+                      {getOrderFinancials(selectedOrder, currencyName).totalCost} {selectedOrder.currency || currencyName}
+                    </span>
+                  </div>
+                  {selectedOrder.waitingPartsDetails && (
+                    <div className="flex justify-between items-start gap-2 text-sky-900 bg-sky-50 px-2 py-1.5 rounded-lg border border-sky-200">
+                      <span className="shrink-0 font-bold">انتظار القطع:</span>
+                      <strong className="text-left">
+                        {selectedOrder.waitingPartsDetails}
+                        {selectedOrder.waitingPartsExpectedDate ? ` (${selectedOrder.waitingPartsExpectedDate})` : ''}
+                      </strong>
+                    </div>
+                  )}
+                  {selectedOrder.customVariables && selectedOrder.customVariables.length > 0 && (
+                    <div className="flex flex-wrap gap-1 pt-1">
+                      {selectedOrder.customVariables.map((cv, idx) => (
+                        <span key={`${cv.key}-${idx}`} className="text-[10px] bg-violet-50 text-violet-900 border border-violet-200 px-1.5 py-0.5 rounded-md font-bold">
+                          {cv.label}: {cv.value}
+                        </span>
+                      ))}
                     </div>
                   )}
                   <div className="flex justify-between items-center">
@@ -1578,25 +1769,20 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                     <History className="w-3.5 h-3.5 text-teal-600" />
                     سجل تتبع الحالات (Timeline):
                   </h4>
-                  <div className="space-y-3 max-h-48 overflow-y-auto pr-1">
+                  <div className="space-y-3 max-h-60 overflow-y-auto pr-1">
                     {selectedOrder.statusHistory.map((history, idx) => (
                       <div key={idx} className="relative pl-4 border-r-2 border-teal-100 pr-3">
                         <div className="absolute -right-[5px] top-1.5 w-2 h-2 rounded-full bg-teal-500 ring-2 ring-white"></div>
                         <div className="flex justify-between items-start mb-0.5">
                           <span className="text-[10px] font-bold text-teal-800 bg-teal-50 px-1.5 py-0.5 rounded">
-                            {history.status === DeviceStatus.RECEIVED && 'تم الاستلام'}
-                            {history.status === DeviceStatus.DIAGNOSING && 'تحت الفحص'}
-                            {history.status === DeviceStatus.REPAIRING && 'تحت الإصلاح'}
-                            {history.status === DeviceStatus.PENDING && 'قيد الانتظار'}
-                            {history.status === DeviceStatus.READY && 'جاهز للتسليم'}
-                            {history.status === DeviceStatus.DELIVERED && 'تم التسليم'}
-                            {history.status === DeviceStatus.UNREPAIRABLE && 'تعذر الإصلاح'}
+                            {getStatusArabicLabel(history.status)}
                           </span>
                           <span className="text-[9px] text-gray-400 font-mono">
                             {new Date(history.timestamp).toLocaleString('ar-SA')}
                           </span>
                         </div>
                         <p className="text-[10px] text-gray-600 leading-relaxed">{history.note}</p>
+                        <StatusSnapshotBadges snapshot={history.snapshot} compact />
                         <p className="text-[9px] text-gray-400 mt-1">بواسطة: {history.updatedBy}</p>
                       </div>
                     ))}
@@ -1651,7 +1837,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
           </div>
 
           {/* Visual Maintenance & Fault Camera Documentation Section */}
-          <div className="border-t border-gray-150 pt-5 mt-2 bg-gradient-to-b from-gray-50/50 to-white p-4 sm:p-5 rounded-2xl border border-gray-200/80 shadow-2xs">
+          <div className="border-t border-gray-200 pt-5 mt-2 bg-gradient-to-b from-gray-50/50 to-white p-4 sm:p-5 rounded-2xl border border-gray-200/80 shadow-2xs">
             <MaintenanceMediaGallery
               photos={selectedOrder.photos || []}
               orderId={selectedOrder.id}
@@ -1693,25 +1879,11 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 bg-white p-6 rounded-3xl border border-gray-100 ">
         <div>
           <h2 className="font-sans font-extrabold text-xl text-gray-800 flex items-center gap-2">
-            <span>📦 إدارة طلبات صيانة الأجهزة</span>
+            <span>{viewType === 'completed' ? 'الأجهزة المكتملة' : 'الطلبات الحالية'}</span>
             <span className="px-2.5 py-0.5 bg-teal-50 text-teal-700 text-xs rounded-lg font-bold">
               {filteredOrders.length} طلب صيانة
             </span>
           </h2>
-        </div>
-
-        <div className="flex flex-wrap gap-2 w-full sm:w-auto">
-          {viewType !== 'completed' && (
-            <button
-              onClick={handleOpenAddModal}
-              disabled={!canAdd}
-              className="flex-1 sm:flex-initial bg-teal-600 hover:bg-teal-700 disabled:bg-gray-350 disabled:cursor-not-allowed disabled: text-white font-sans font-bold px-5 py-3 rounded-2xl transition-colors text-sm  -600/10 flex items-center justify-center gap-1.5"
-              title={!canAdd ? "عذراً، ليس لديك صلاحية لإضافة طلب صيانة جديد" : "إضافة طلب صيانة جديد"}
-            >
-              <Plus className="w-4.5 h-4.5" />
-              {!canAdd ? "إضافة طلب (غير مصرح)" : "إضافة طلب صيانة جديد"}
-            </button>
-          )}
         </div>
       </div>
 
@@ -1838,7 +2010,9 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                         >
                           {order.customerName}
                         </button>
-                        <div className="text-[10px] text-gray-400 mt-0.5 font-mono">{order.customerPhone}</div>
+                        <div className="text-[10px] text-gray-400 mt-0.5 font-mono flex items-center gap-1.5 flex-wrap">
+                          <span dir="ltr">{order.customerPhone}</span>
+                        </div>
                       </td>
                       <td className="py-4 px-6 font-semibold">
                         <span className="bg-gray-100 text-gray-700 px-2 py-0.5 rounded-md text-[10px] mr-1">
@@ -1847,10 +2021,10 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                         {order.brandModel}
                       </td>
                       <td className="py-4 px-6 font-bold text-gray-800">
-                        {order.actualCost !== undefined ? order.actualCost : order.estimatedCost} {order.currency || currencyName}
+                        {getOrderFinancials(order, currencyName).totalCost} {order.currency || currencyName}
                       </td>
                       <td className="py-4 px-6 text-gray-500">
-                        {new Date(order.expectedDeliveryDate).toLocaleDateString('ar-SA')}
+                        {formatSafeDate(order.expectedDeliveryDate)}
                       </td>
                       <td className="py-4 px-6">{getStatusBadge(order.status)}</td>
                       <td className="py-4 px-6 text-gray-400">{order.technician}</td>
@@ -1880,22 +2054,22 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                     selectedOrder?.id === order.id ? 'bg-teal-50/50 hover:bg-teal-50' : 'bg-white hover:bg-gray-50/50'
                   }`}
                 >
-                  <div className="flex justify-between items-start mb-2.5">
-                    <div>
-                      <span className="font-mono font-extrabold text-teal-700 text-[11px] bg-teal-50 border border-teal-100 px-2 py-0.5 rounded-lg inline-block mb-1.5">
-                        {order.id}
-                      </span>
+                  <div className="flex justify-between items-start gap-2 mb-2.5">
+                    <div className="min-w-0">
                       <button
                         type="button"
                         onClick={(e) => {
                           e.stopPropagation();
                           onViewCustomer?.(order.customerName, order.customerPhone);
                         }}
-                        className="font-bold text-gray-900 hover:text-teal-700 hover:underline text-sm leading-tight cursor-pointer transition-colors text-right block"
+                        className="font-bold text-gray-900 hover:text-teal-700 hover:underline text-sm leading-tight cursor-pointer transition-colors text-right block mb-1.5"
                         title="عرض ملف وسجل العميل وتقارير الصيانة والرسائل"
                       >
                         {order.customerName}
                       </button>
+                      <span className="font-mono font-extrabold text-teal-700 text-[11px] bg-teal-50 border border-teal-100 px-2 py-0.5 rounded-lg inline-block">
+                        {order.id}
+                      </span>
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
                       {getStatusBadge(order.status)}
@@ -1920,7 +2094,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                     </div>
                     <div className="flex items-center gap-1">
                       <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line></svg>
-                      {new Date(order.expectedDeliveryDate).toLocaleDateString('ar-SA')}
+                      {formatSafeDate(order.expectedDeliveryDate)}
                     </div>
                   </div>
                   
@@ -1937,7 +2111,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                     <div className="flex flex-col gap-1 items-end shrink-0 pl-1">
                       <div className="text-[10px] text-gray-400 font-medium">التكلفة</div>
                       <div className="font-bold text-teal-700 text-sm">
-                        {order.actualCost !== undefined ? order.actualCost : order.estimatedCost} <span className="text-[10px] font-normal">{order.currency || currencyName}</span>
+                        {getOrderFinancials(order, currencyName).totalCost} <span className="text-[10px] font-normal">{order.currency || currencyName}</span>
                       </div>
                     </div>
                   </div>
@@ -1958,96 +2132,17 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
       {showSimplePrintLabel && (
         <LabelPrintView
           orderId={showSimplePrintLabel.id}
+          qrContent={getOrderQrContent(showSimplePrintLabel, 520)}
           onClose={() => setShowSimplePrintLabel(null)}
         />
       )}
 
       {/* 1. Print label/thermal barcode popup mockup */}
       {showPrintLabel && (() => {
-        const [pWidth, pHeight] = (labelModalLayout.paperSize || lblPaperSize || '50x30').split('x').map(Number);
-        const wMm = `${pWidth || 50}mm`;
-        const hMm = `${pHeight || 30}mm`;
+        const [pWidth, pHeight] = FIXED_LABEL_PAPER_SIZE.split('x').map(Number);
+        const wMm = `${pWidth || 38}mm`;
         return (
-          <div className="fixed inset-0 bg-transparent z-50 flex items-start justify-center p-2 pt-1 sm:pt-2 overflow-y-auto">
-            <style dangerouslySetInnerHTML={{ __html: `
-              @media print {
-                @page {
-                  size: ${wMm} ${hMm};
-                  margin: 0 !important;
-                }
-                * {
-                  box-sizing: border-box !important;
-                }
-                body * {
-                  visibility: hidden !important;
-                }
-                #thermal-label-print-area, #thermal-label-print-area * {
-                  visibility: visible !important;
-                }
-                html, body, #root {
-                  margin: 0 !important;
-                  padding: 0 !important;
-                  width: ${wMm} !important;
-                  height: ${hMm} !important;
-                  max-width: ${wMm} !important;
-                  max-height: ${hMm} !important;
-                  overflow: hidden !important;
-                  background-color: white !important;
-                  color: black !important;
-                  display: block !important;
-                }
-                /* Reset any fixed overlays or animated containers */
-                .fixed, [class*="fixed"], [class*="animate-in"] {
-                  position: static !important;
-                  transform: none !important;
-                  animation: none !important;
-                  background: none !important;
-                  backdrop-filter: none !important;
-                  box-shadow: none !important;
-                  border: none !important;
-                  padding: 0 !important;
-                  margin: 0 !important;
-                  width: auto !important;
-                  height: auto !important;
-                  overflow: visible !important;
-                }
-                #thermal-label-print-area {
-                  position: absolute !important;
-                  left: 0 !important;
-                  right: 0 !important;
-                  top: 0 !important;
-                  bottom: 0 !important;
-                  width: ${wMm} !important;
-                  height: ${hMm} !important;
-                  max-width: ${wMm} !important;
-                  max-height: ${hMm} !important;
-                  background: white !important;
-                  border: none !important;
-                  box-shadow: none !important;
-                  padding: 0.6mm 1mm !important;
-                  margin: 0 auto !important;
-                  text-align: center !important;
-                  display: flex !important;
-                  flex-direction: column !important;
-                  justify-content: space-evenly !important;
-                  align-items: center !important;
-                  visibility: visible !important;
-                  box-sizing: border-box !important;
-                  overflow: hidden !important;
-                }
-                #thermal-label-print-area div, #thermal-label-print-area span {
-                  max-width: 100% !important;
-                  white-space: nowrap !important;
-                  overflow: hidden !important;
-                  text-overflow: ellipsis !important;
-                  box-sizing: border-box !important;
-                }
-                .no-print {
-                  display: none !important;
-                }
-              }
-            `}} />
-
+          <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-start justify-center p-2 pt-1 sm:pt-2 overflow-y-auto">
           <div className={`bg-white rounded-3xl ${showFullLabelDesignerInModal ? 'max-w-4xl' : 'max-w-md'} w-full overflow-hidden shadow-2xl border border-gray-200 p-6 space-y-5 animate-in slide-in-from-top-2 duration-150 mb-4 text-right transition-all`} dir="rtl">
             <div className="border-b border-gray-100 pb-3 flex justify-between items-center">
               <div>
@@ -2092,7 +2187,12 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                   mockOrder={{
                     id: showPrintLabel.id,
                     customerName: showPrintLabel.customerName,
+                    customerPhone: showPrintLabel.customerPhone,
                     brandModel: showPrintLabel.brandModel,
+                    faultDescription: showPrintLabel.faultDescription,
+                    estimatedCost: showPrintLabel.estimatedCost,
+                    actualCost: showPrintLabel.actualCost,
+                    currency: showPrintLabel.currency,
                     createdAt: showPrintLabel.createdAt
                   }}
                   onLayoutChange={(newCfg) => setLabelModalLayout(newCfg)}
@@ -2102,17 +2202,27 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
               <>
                 {/* Print Preview Workspace */}
                 <div className="p-5 bg-slate-50 border border-gray-200/80 rounded-2xl flex flex-col items-center justify-center space-y-3 relative overflow-hidden bg-[radial-gradient(#e2e8f0_1px,transparent_1px)] [background-size:12px_12px]">
-                  <div className="absolute top-2 right-3 flex items-center gap-1.5 select-none">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                    <span className="text-[9px] text-slate-500 font-extrabold">معاينة حية للملصق الحراري</span>
+                  <div className="w-full flex items-center justify-between text-[10px] text-slate-600 font-bold select-none">
+                    <span>معاينة مطابقة للطباعة</span>
+                    <span className="font-mono text-teal-800">{pWidth || 38}×{pHeight || 25}mm</span>
                   </div>
                   
                   {(() => {
-                    const [pWidth, pHeight] = (labelModalLayout.paperSize || '50x30').split('x').map(Number);
-                    const ratio = (pHeight && pWidth) ? pHeight / pWidth : 30 / 50;
-                    const previewWidth = 240;
-                    const previewHeight = Math.round(previewWidth * ratio);
-                    const activeElements = labelModalLayout.elements.filter(el => el.enabled);
+                    const effectiveLayout: LabelLayoutConfig = {
+                      ...labelModalLayout,
+                      paperSize: FIXED_LABEL_PAPER_SIZE
+                    };
+                    const previewMetrics = getLabelPreviewMetrics(effectiveLayout.paperSize, 250, 200, false);
+                    const containerStyles = getLabelContainerStyles(effectiveLayout, lblFormat.fontFamily);
+                    const activeElements = effectiveLayout.elements.filter(el => el.enabled);
+                    const splitMetrics = getSplitThermalLabelMetrics(effectiveLayout, containerStyles, activeElements);
+                    const barcodeActiveEl = activeElements.find(el => el.id === 'barcode');
+                    const qrActiveEl = activeElements.find(el => el.id === 'qr_code');
+                    const infoElements = splitMetrics.hasQrSide
+                      ? activeElements.filter(el => el.id !== 'qr_code')
+                      : activeElements;
+                    const centerNameText = localStorage.getItem('centerName') || 'مركز تكنو للصيانة';
+                    const centerMobileText = localStorage.getItem('centerMobile') || '05xxxxxxxx';
 
                     const handleDragStart = (id: string, e: React.DragEvent) => {
                       e.dataTransfer.setData('text/plain', id);
@@ -2150,155 +2260,243 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                     return (
                       <>
                         {/* Simulated Cut Line Top */}
-                        <div className="w-[240px] flex items-center justify-between text-slate-400 text-[8px] font-mono border-b border-dashed border-slate-300 pb-1 select-none">
+                        <div className="w-full max-w-[260px] flex items-center justify-between text-slate-400 text-[8px] font-mono border-b border-dashed border-slate-300 pb-1 select-none">
                           <span>✂️ حد قطع الورق العلوي</span>
-                          <span>{pWidth}mm</span>
+                          <span>×{previewMetrics.scale.toFixed(2)}</span>
                         </div>
 
-                        {/* Realistic adhesive sticker wrapper (Preview Only) */}
-                        <div 
-                          className="bg-white border border-gray-300 rounded-md select-none flex flex-col justify-center items-center text-center font-sans overflow-hidden relative transition-all duration-200" 
+                        {/* Scaled Physical Sticker Viewport */}
+                        <div
+                          className="relative mx-auto"
                           style={{
-                            width: `${previewWidth}px`,
-                            minHeight: `${previewHeight}px`,
-                            padding: `${labelModalLayout.padding * 2.5}px`,
-                            boxSizing: 'border-box',
-                            color: 'black',
-                            fontFamily: lblFormat.fontFamily,
-                            textAlign: 'center',
-                            lineHeight: labelModalLayout.lineSpacing,
-                            transformOrigin: 'center center'
+                            width: `${previewMetrics.scaledWidthPx}px`,
+                            height: `${previewMetrics.scaledHeightPx}px`,
+                            maxWidth: '100%'
                           }}
-                          id="thermal-label-print-area"
                         >
-                          {activeElements.map((el) => {
-                            const isBeingDragged = draggedModalId === el.id;
-                            const isOver = dragOverModalId === el.id;
+                          <div
+                            dir="rtl"
+                            className="bg-white border border-gray-300 rounded-sm select-none overflow-hidden shadow-xs"
+                            style={{
+                              position: 'absolute',
+                              top: 0,
+                              left: 0,
+                              width: `${containerStyles.widthMm}mm`,
+                              height: `${containerStyles.heightMm}mm`,
+                              maxWidth: `${containerStyles.widthMm}mm`,
+                              maxHeight: `${containerStyles.heightMm}mm`,
+                              padding: `${splitMetrics.effectivePaddingMm}mm`,
+                              display: 'flex',
+                              flexDirection: splitMetrics.hasQrSide ? 'row' : 'column',
+                              alignItems: 'center',
+                              justifyContent: splitMetrics.hasQrSide && infoElements.length > 0 ? 'space-between' : 'center',
+                              gap: splitMetrics.hasQrSide && infoElements.length > 0 ? `${splitMetrics.colGapMm}mm` : '0',
+                              boxSizing: 'border-box',
+                              color: '#000000',
+                              fontFamily: containerStyles.fontFamilyCss,
+                              textAlign: containerStyles.textAlign,
+                              transform: `scale(${previewMetrics.scale})`,
+                              transformOrigin: 'top left'
+                            }}
+                            id="thermal-label-print-area"
+                          >
+                            {(!splitMetrics.hasQrSide || infoElements.length > 0) && (
+                            <div
+                              className={splitMetrics.hasQrSide ? 'flex-1 min-w-0 h-full flex flex-row items-center justify-center overflow-hidden' : 'w-full flex flex-col justify-center'}
+                              style={{
+                                alignItems: splitMetrics.hasQrSide ? 'center' : containerStyles.alignItems,
+                                textAlign: splitMetrics.hasQrSide ? 'center' : containerStyles.textAlign,
+                                gap: splitMetrics.hasQrSide ? `${splitMetrics.verticalColGapMm}mm` : undefined,
+                              }}
+                            >
+                              {infoElements.map((el) => {
+                                const isBeingDragged = draggedModalId === el.id;
+                                const isOver = dragOverModalId === el.id;
+                                const elMetrics = getLabelElementMetrics(el, effectiveLayout);
+                                const baseFontPt = splitMetrics.compactFontPt ?? Math.min(elMetrics.fontSizePt, splitMetrics.isNarrowWidth ? 8 : 11);
+                                const mTopMm = splitMetrics.isCompactHeight ? 0 : Math.min(elMetrics.marginTopMm, 0.4);
+                                const mBotMm = splitMetrics.isCompactHeight ? 0.2 : Math.min(elMetrics.marginBottomMm, 0.5);
+                                const orderDateStr = showPrintLabel.createdAt ? new Date(showPrintLabel.createdAt).toLocaleDateString('ar-SA') : new Date().toLocaleDateString('ar-SA');
 
-                            return (
-                              <div
-                                key={el.id}
-                                draggable={true}
-                                onDragStart={(e) => handleDragStart(el.id, e)}
-                                onDragOver={(e) => handleDragOver(el.id, e)}
-                                onDrop={(e) => handleDrop(el.id, e)}
-                                className={`w-full text-center transition-all cursor-grab active:cursor-grabbing rounded px-0.5 border border-transparent hover:border-teal-400 hover:bg-teal-50/20 ${
-                                  isBeingDragged ? 'opacity-30' : ''
-                                } ${isOver ? 'border-teal-500 bg-teal-100/40' : ''}`}
-                                style={{
-                                  marginTop: `${(el.marginTop || 0) * labelModalLayout.lineSpacing}px`,
-                                  marginBottom: `${(el.marginBottom || 0) * labelModalLayout.lineSpacing}px`
-                                }}
-                                title="اسحب هذا العنصر بالماوس لتحريكه وتغيير موضعه"
-                              >
-                                {el.id === 'center_name' && (
+                                return (
                                   <div
-                                    className="w-full truncate text-black font-black text-center tracking-tight"
-                                    style={{
-                                      fontSize: `${Math.max(el.fontSize || 13, 12)}pt`,
-                                      fontWeight: 900,
-                                      lineHeight: 1.15
+                                    key={el.id}
+                                    draggable={true}
+                                    onDragStart={(e) => handleDragStart(el.id, e)}
+                                    onDragOver={(e) => handleDragOver(el.id, e)}
+                                    onDragLeave={() => setDragOverModalId(prev => prev === el.id ? null : prev)}
+                                    onDrop={(e) => handleDrop(el.id, e)}
+                                    onDragEnd={() => {
+                                      setDraggedModalId(null);
+                                      setDragOverModalId(null);
                                     }}
-                                  >
-                                    {localStorage.getItem('centerName') || 'TECHNO'}
-                                  </div>
-                                )}
-
-                                {el.id === 'center_mobile' && (
-                                  <div
-                                    className="w-full truncate text-black font-bold text-center"
-                                    style={{
-                                      fontSize: `${el.fontSize}pt`,
-                                      fontWeight: el.bold ? 700 : 500,
-                                      lineHeight: labelModalLayout.lineSpacing
+                                    className={`${splitMetrics.hasQrSide ? 'max-h-full' : 'w-fit max-w-full'} cursor-grab active:cursor-grabbing ${
+                                      isBeingDragged ? 'opacity-30' : ''
+                                    } ${isOver ? 'outline outline-1 outline-teal-500 bg-teal-100/40' : 'hover:outline hover:outline-1 hover:outline-teal-400 hover:bg-teal-50/20'}`}
+                                    style={splitMetrics.hasQrSide ? {
+                                      writingMode: 'vertical-rl',
+                                      textOrientation: 'mixed',
+                                      margin: 0,
+                                      textAlign: 'center',
+                                      boxSizing: 'border-box',
+                                    } : {
+                                      marginTop: `${mTopMm}mm`,
+                                      marginBottom: `${mBotMm}mm`,
+                                      textAlign: containerStyles.textAlign,
+                                      alignSelf: containerStyles.alignItems,
+                                      boxSizing: 'border-box'
                                     }}
+                                    title="اسحب هذا العنصر بالماوس لتحريكه وتغيير موضعه"
                                   >
-                                    {localStorage.getItem('centerMobile') || '05xxxxxxxx'}
-                                  </div>
-                                )}
+                                    {el.id === 'center_name' && (
+                                      <div
+                                        dir="auto"
+                                        className={`${splitMetrics.hasQrSide ? 'max-h-full whitespace-nowrap overflow-hidden text-ellipsis' : 'max-w-full truncate'} text-black font-black`}
+                                        style={{
+                                          fontSize: `${splitMetrics.hasQrSide ? splitMetrics.getVerticalCenterNameFontPt(centerNameText) : splitMetrics.getCenterNameFontPt(centerNameText, baseFontPt)}pt`,
+                                          fontWeight: 900,
+                                          letterSpacing: splitMetrics.hasQrSide ? '0px' : '-0.25px',
+                                          lineHeight: 1
+                                        }}
+                                      >
+                                        {centerNameText}
+                                      </div>
+                                    )}
 
-                                {el.id === 'customer_name' && (
-                                  <div
-                                    className="w-full truncate text-black font-extrabold text-center"
-                                    style={{
-                                      fontSize: `${el.fontSize}pt`,
-                                      fontWeight: el.bold ? 800 : 600,
-                                      lineHeight: labelModalLayout.lineSpacing
-                                    }}
-                                  >
-                                    العميل: {showPrintLabel.customerName}
-                                  </div>
-                                )}
+                                    {el.id === 'center_mobile' && (
+                                      <div
+                                        dir="ltr"
+                                        className={`${splitMetrics.hasQrSide ? 'max-h-full whitespace-nowrap overflow-hidden' : 'max-w-full whitespace-nowrap'} text-black tabular-nums`}
+                                        style={{
+                                          fontSize: `${splitMetrics.hasQrSide ? splitMetrics.getVerticalMobileFontPt(centerMobileText) : splitMetrics.getCenterMobileFontPt(centerMobileText, baseFontPt)}pt`,
+                                          fontWeight: splitMetrics.hasQrSide ? 900 : (el.bold ? 700 : 600),
+                                          fontFamily: "system-ui, -apple-system, 'Cairo', sans-serif",
+                                          letterSpacing: splitMetrics.hasQrSide ? '0px' : '-0.1px',
+                                          lineHeight: splitMetrics.hasQrSide ? 1 : splitMetrics.effectiveLineSpacing
+                                        }}
+                                      >
+                                        {centerMobileText}
+                                      </div>
+                                    )}
 
-                                {el.id === 'device_model' && (
-                                  <div
-                                    className="w-full truncate text-black font-extrabold text-center"
-                                    style={{
-                                      fontSize: `${el.fontSize}pt`,
-                                      fontWeight: el.bold ? 800 : 600,
-                                      lineHeight: labelModalLayout.lineSpacing
-                                    }}
-                                  >
-                                    الجهاز: {showPrintLabel.brandModel}
-                                  </div>
-                                )}
+                                    {el.id === 'customer_name' && (
+                                      <div
+                                        dir="auto"
+                                        className={`${splitMetrics.hasQrSide ? 'max-h-full whitespace-nowrap overflow-hidden text-ellipsis' : 'max-w-full truncate'} text-black`}
+                                        style={{
+                                          fontSize: `${splitMetrics.hasQrSide ? splitMetrics.getVerticalInfoFontPt(`العميل: ${showPrintLabel.customerName}`) : baseFontPt}pt`,
+                                          fontWeight: el.bold ? 800 : 600,
+                                          lineHeight: splitMetrics.hasQrSide ? 1 : splitMetrics.effectiveLineSpacing
+                                        }}
+                                      >
+                                        العميل: {showPrintLabel.customerName}
+                                      </div>
+                                    )}
 
-                                {el.id === 'order_date' && (
-                                  <div
-                                    className="w-full truncate text-gray-500 font-bold text-center"
-                                    style={{
-                                      fontSize: `${el.fontSize}pt`,
-                                      fontWeight: el.bold ? 700 : 400,
-                                      lineHeight: labelModalLayout.lineSpacing
-                                    }}
-                                  >
-                                    التاريخ: {showPrintLabel.createdAt ? new Date(showPrintLabel.createdAt).toLocaleDateString('ar-SA') : new Date().toLocaleDateString('ar-SA')}
-                                  </div>
-                                )}
+                                    {el.id === 'device_model' && (
+                                      <div
+                                        dir="auto"
+                                        className={`${splitMetrics.hasQrSide ? 'max-h-full whitespace-nowrap overflow-hidden text-ellipsis' : 'max-w-full truncate'} text-black`}
+                                        style={{
+                                          fontSize: `${splitMetrics.hasQrSide ? splitMetrics.getVerticalInfoFontPt(`الجهاز: ${showPrintLabel.brandModel}`) : baseFontPt}pt`,
+                                          fontWeight: el.bold ? 800 : 600,
+                                          lineHeight: splitMetrics.hasQrSide ? 1 : splitMetrics.effectiveLineSpacing
+                                        }}
+                                      >
+                                        الجهاز: {showPrintLabel.brandModel}
+                                      </div>
+                                    )}
 
-                                {el.id === 'barcode' && (
-                                  <div className="w-full flex flex-col items-center justify-center overflow-hidden py-0.5">
-                                    <BarcodeGenerator 
+                                    {el.id === 'order_date' && (
+                                      <div
+                                        dir="auto"
+                                        className={`${splitMetrics.hasQrSide ? 'max-h-full whitespace-nowrap overflow-hidden text-ellipsis' : 'max-w-full truncate'} text-black`}
+                                        style={{
+                                          fontSize: `${splitMetrics.hasQrSide ? splitMetrics.getVerticalInfoFontPt(`التاريخ: ${orderDateStr}`) : baseFontPt}pt`,
+                                          fontWeight: el.bold ? 700 : 400,
+                                          lineHeight: splitMetrics.hasQrSide ? 1 : splitMetrics.effectiveLineSpacing
+                                        }}
+                                      >
+                                        التاريخ: {orderDateStr}
+                                      </div>
+                                    )}
+
+                                    {el.id === 'barcode' && (
+                                      <div
+                                        dir="ltr"
+                                        className={`${splitMetrics.hasQrSide ? 'max-h-full whitespace-nowrap overflow-hidden' : 'max-w-full whitespace-nowrap'} font-black text-black tabular-nums`}
+                                        style={{
+                                          fontSize: `${splitMetrics.hasQrSide ? splitMetrics.getVerticalCodeFontPt(showPrintLabel.id) : splitMetrics.getCodeFontPt(showPrintLabel.id, baseFontPt)}pt`,
+                                          fontFamily: "system-ui, -apple-system, 'Cairo', sans-serif",
+                                          fontVariantNumeric: 'tabular-nums',
+                                          letterSpacing: splitMetrics.hasQrSide ? '0px' : '-0.2px',
+                                          lineHeight: 1
+                                        }}
+                                      >
+                                        {showPrintLabel.id}
+                                      </div>
+                                    )}
+
+                                    {el.id === 'custom_text' && (
+                                      <div
+                                        dir="auto"
+                                        className={`${splitMetrics.hasQrSide ? 'max-h-full whitespace-nowrap overflow-hidden text-ellipsis' : 'max-w-full break-words'} text-black`}
+                                        style={{
+                                          fontSize: `${splitMetrics.hasQrSide ? splitMetrics.getVerticalInfoFontPt(el.customContent || localStorage.getItem('lblCustomText') || 'يرجى إبراز هذا الملصق عند الاستلام') : baseFontPt}pt`,
+                                          fontWeight: el.bold ? 700 : 500,
+                                          lineHeight: splitMetrics.hasQrSide ? 1 : splitMetrics.effectiveLineSpacing,
+                                          textAlign: splitMetrics.hasQrSide ? 'center' : containerStyles.textAlign
+                                        }}
+                                      >
+                                        {el.customContent || localStorage.getItem('lblCustomText') || 'يرجى إبراز هذا الملصق عند الاستلام'}
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                            )}
+
+                            {splitMetrics.hasQrSide && (
+                              <div className="shrink-0 h-full flex flex-col items-center justify-center bg-white gap-0.5">
+                                {barcodeActiveEl && (() => {
+                                  const m = getLabelElementMetrics(barcodeActiveEl, effectiveLayout);
+                                  return (
+                                    <BarcodeGenerator
                                       value={showPrintLabel.id}
-                                      width={el.width || 1.2}
-                                      height={el.height ? Math.min(el.height, 35) : 32}
-                                      showText={true}
-                                      format={localStorage.getItem('lblBarcodeFormat') || 'CODE128'}
-                                      fontSize={el.fontSize || 9}
+                                      qrContent={getOrderQrContent(showPrintLabel, 520)}
+                                      width={barcodeActiveEl.width || 1.2}
+                                      height={m.barcodeHeightPx}
+                                      physicalHeightMm={m.barcodeHeightMm}
+                                      targetQrMm={splitMetrics.splitQrSizeMm}
+                                      showText={false}
+                                      format={localStorage.getItem('lblBarcodeFormat') || 'AUTO'}
+                                      maxWidthMm={splitMetrics.effectiveInnerWidthMm}
+                                      marginModules={0}
                                     />
-                                  </div>
-                                )}
-
-                                {el.id === 'qr_code' && (
-                                  <div className="w-full flex flex-col items-center justify-center py-0.5">
-                                    <QRCodeGenerator 
-                                      value={`${window.location.origin}?track=${showPrintLabel.id}`} 
-                                      size={el.height || 45}
+                                  );
+                                })()}
+                                {qrActiveEl && (() => {
+                                  const m = getLabelElementMetrics(qrActiveEl, effectiveLayout);
+                                  return (
+                                    <QRCodeGenerator
+                                      value={buildTrackingUrl(showPrintLabel.id, appUrl)}
+                                      size={m.qrSizePx}
+                                      compact={true}
+                                      physicalSizeMm={splitMetrics.splitQrSizeMm || Math.max(m.qrSizeMm, 11)}
+                                      marginModules={0}
                                     />
-                                  </div>
-                                )}
-
-                                {el.id === 'custom_text' && (
-                                  <div 
-                                    className="w-full text-center text-gray-800"
-                                    style={{
-                                      fontSize: `${el.fontSize}pt`,
-                                      fontWeight: el.bold ? 700 : 500,
-                                      lineHeight: labelModalLayout.lineSpacing
-                                    }}
-                                  >
-                                    {el.customContent || localStorage.getItem('lblCustomText') || 'يرجى إبراز هذا الملصق عند الاستلام'}
-                                  </div>
-                                )}
+                                  );
+                                })()}
                               </div>
-                            );
-                          })}
+                            )}
+                          </div>
                         </div>
 
                         {/* Simulated Cut Line Bottom */}
-                        <div className="w-[240px] flex items-center justify-between text-slate-400 text-[8px] font-mono border-t border-dashed border-slate-300 pt-1 select-none">
+                        <div className="w-full max-w-[260px] flex items-center justify-between text-slate-400 text-[8px] font-mono border-t border-dashed border-slate-300 pt-1 select-none">
                           <span>✂️ حد قطع الورق السفلي</span>
-                          <span>{pHeight}mm</span>
+                          <span>{containerStyles.widthMm} × {containerStyles.heightMm} mm</span>
                         </div>
                       </>
                     );
@@ -2330,10 +2528,15 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                           e.preventDefault();
                           if (dragOverModalId !== el.id) setDragOverModalId(el.id);
                         }}
+                        onDragLeave={() => setDragOverModalId(prev => prev === el.id ? null : prev)}
                         onDrop={(e) => {
                           e.preventDefault();
                           const src = e.dataTransfer.getData('text/plain') || draggedModalId;
-                          if (!src || src === el.id) return;
+                          if (!src || src === el.id) {
+                            setDraggedModalId(null);
+                            setDragOverModalId(null);
+                            return;
+                          }
                           const fIdx = labelModalLayout.elements.findIndex(x => x.id === src);
                           const tIdx = labelModalLayout.elements.findIndex(x => x.id === el.id);
                           if (fIdx !== -1 && tIdx !== -1) {
@@ -2342,6 +2545,10 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                             setLabelModalLayout(updated);
                             saveStoredLabelLayout(updated);
                           }
+                          setDraggedModalId(null);
+                          setDragOverModalId(null);
+                        }}
+                        onDragEnd={() => {
                           setDraggedModalId(null);
                           setDragOverModalId(null);
                         }}
@@ -2576,243 +2783,351 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
       )})()}
 
       {/* Customer Claim Ticket Modal */}
-      {showCustomerTicket && (
-        <div className="fixed inset-0 bg-transparent z-50 flex items-start justify-center p-2 pt-1 sm:pt-2 overflow-y-auto">
-          {/* Print style block specific to this modal */}
-          <style dangerouslySetInnerHTML={{ __html: `
-            @media print {
-              body * {
-                visibility: hidden !important;
-              }
-              #customer-receipt-print-modal, #customer-receipt-print-modal * {
-                visibility: visible !important;
-              }
-              html, body, #root {
-                margin: 0 !important;
-                padding: 0 !important;
-                height: auto !important;
-                overflow: visible !important;
-              }
-              /* Reset any fixed overlays or animated containers */
-              .fixed, [class*="fixed"], [class*="animate-in"] {
-                position: static !important;
-                transform: none !important;
-                animation: none !important;
-                background: none !important;
-                backdrop-filter: none !important;
-                box-: none !important;
-                border: none !important;
-                padding: 0 !important;
-                margin: 0 !important;
-                width: auto !important;
-                height: auto !important;
-                overflow: visible !important;
-              }
-              #customer-receipt-print-modal {
-                position: absolute !important;
-                left: 0 !important;
-                top: 0 !important;
-                width: 100% !important;
-                background: white !important;
-                border: none !important;
-                box-shadow: none !important;
-                padding: 15px !important;
-                margin: 0 !important;
-                display: block !important;
-                visibility: visible !important;
-                zoom: ${rcptZoom}% !important;
-                font-family: ${rcptFormat.fontFamily}, 'Cairo', sans-serif !important;
-                text-align: ${rcptFormat.textAlign} !important;
-                line-height: ${rcptFormat.lineHeight} !important;
-                font-size: ${rcptFormat.fontSize}px !important;
-                font-weight: ${rcptFormat.fontWeight === '900' ? 900 : rcptFormat.fontWeight === 'bold' ? 700 : 400} !important;
-              }
-              .no-print {
-                display: none !important;
-              }
-            }
-          `}} />
-
+      {showCustomerTicket && (() => {
+        const activePaperSize = receiptModalLayout.paperSize || rcptSize || '80mm';
+        const paperMetrics = getReceiptPaperMetrics(activePaperSize);
+        return (
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-start justify-center p-2 pt-1 sm:pt-2 overflow-y-auto">
           <div 
             id="customer-receipt-print-modal" 
-            className="bg-white rounded-3xl max-w-xl w-full overflow-hidden shadow-2xl border border-gray-200 p-6 sm:p-8 space-y-6 text-center animate-in slide-in-from-top-2 duration-150 mb-4 transition-all"
+            className={`bg-white rounded-3xl ${showFullReceiptDesignerInModal ? 'max-w-4xl' : 'max-w-xl'} w-full overflow-x-hidden shadow-2xl border border-gray-200 p-3.5 sm:p-6 space-y-4 sm:space-y-5 text-center animate-in slide-in-from-top-2 duration-150 mb-4 transition-all`}
             style={{
-              fontFamily: rcptFormat.fontFamily,
+              fontFamily: receiptModalLayout.fontFamily || rcptFormat.fontFamily,
               textAlign: 'center',
-              lineHeight: rcptFormat.lineHeight,
+              lineHeight: receiptModalLayout.lineSpacing || rcptFormat.lineHeight,
               fontSize: `${rcptFormat.fontSize}px`,
               fontWeight: rcptFormat.fontWeight === '900' ? 900 : rcptFormat.fontWeight === 'bold' ? 700 : 400
             }}
           >
             {/* Modal Header */}
-            <div className="border-b-2 border-gray-100 pb-4 flex justify-between items-center no-print">
-              <div>
-                <span className="font-sans text-[10px] text-teal-600 font-extrabold tracking-widest uppercase">طباعة إيصال استلام الصيانة</span>
-                <h3 className="font-sans font-extrabold text-base text-gray-800 mt-0.5 flex items-center gap-2">
-                  <span className="text-[10px] bg-teal-50 text-teal-700 font-sans font-extrabold px-2.5 py-0.5 rounded-full border border-teal-100/50">
-                    {rcptSize === '80mm' ? 'حراري 80mm' : 
-                     rcptSize === '58mm' ? 'حراري 58mm' : 
-                     rcptSize === 'A5' ? 'ورق A5' : 
+            <div className="border-b border-gray-100 pb-3 flex flex-wrap justify-between items-center gap-2 no-print">
+              <div className="text-right">
+                <span className="font-sans text-[10px] text-teal-600 font-extrabold tracking-wide block">طباعة إيصال استلام الصيانة</span>
+                <div className="font-sans font-extrabold text-xs text-gray-600 mt-0.5 flex items-center gap-1.5">
+                  <span>قياس الورق:</span>
+                  <span className="text-teal-700 font-bold">
+                    {activePaperSize === '80mm' ? 'حراري 80mm' : 
+                     activePaperSize === '58mm' ? 'حراري 58mm' : 
+                     activePaperSize === 'A5' ? 'ورق A5' : 
                      'ورق A4'}
                   </span>
-                </h3>
+                </div>
               </div>
-              <button
-                onClick={() => setShowCustomerTicket(null)}
-                className="text-gray-400 hover:text-gray-600 font-sans font-bold bg-gray-50 hover:bg-gray-100 p-2 rounded-xl transition-colors text-xs"
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowFullReceiptDesignerInModal(!showFullReceiptDesignerInModal)}
+                  className={`text-xs font-bold px-3 py-1.5 rounded-xl border transition-all flex items-center gap-1.5 whitespace-nowrap ${
+                    showFullReceiptDesignerInModal 
+                      ? 'bg-teal-600 text-white border-teal-600' 
+                      : 'bg-teal-50 text-teal-800 border-teal-200 hover:bg-teal-100'
+                  }`}
+                >
+                  <Sliders className="w-3.5 h-3.5" />
+                  <span>{showFullReceiptDesignerInModal ? 'معاينة الطباعة' : 'تخصيص وترتيب الإيصال 🎨'}</span>
+                </button>
+                <button
+                  onClick={() => {
+                    setShowCustomerTicket(null);
+                    setShowFullReceiptDesignerInModal(false);
+                  }}
+                  className="text-gray-400 hover:text-gray-600 font-sans font-bold bg-gray-50 hover:bg-gray-100 px-2.5 py-1.5 rounded-xl transition-colors text-xs whitespace-nowrap"
+                >
+                  إغلاق ×
+                </button>
+              </div>
+            </div>
+
+            {showFullReceiptDesignerInModal ? (
+              <div className="animate-in fade-in duration-200 text-right no-print">
+                <ReceiptDesigner
+                  mockOrder={{
+                    id: showCustomerTicket.id,
+                    customerName: showCustomerTicket.customerName,
+                    customerPhone: showCustomerTicket.customerPhone,
+                    deviceType: showCustomerTicket.deviceType,
+                    brandModel: showCustomerTicket.brandModel,
+                    faultDescription: showCustomerTicket.faultDescription,
+                    estimatedCost: showCustomerTicket.estimatedCost,
+                    advancePayment: showCustomerTicket.advancePayment,
+                    createdAt: showCustomerTicket.createdAt
+                  }}
+                  onLayoutChange={(newLayout) => setReceiptModalLayout(newLayout)}
+                />
+              </div>
+            ) : (
+              /* Printable Receipt Sheet - responsive & tight-fit boxes */
+              <div
+                id="customer-receipt-sheet"
+                className="w-full max-w-full mx-auto bg-[#FAF9F6]/70 border border-gray-200/80 rounded-2xl flex flex-col gap-2 transition-all"
+                style={{
+                  maxWidth: `${paperMetrics.screenMaxWidthPx}px`,
+                  padding: `clamp(10px, ${(receiptModalLayout.padding || 6) * 2}px, 24px)`,
+                  lineHeight: receiptModalLayout.lineSpacing || rcptFormat.lineHeight
+                }}
               >
-                إغلاق ×
-              </button>
-            </div>
+                {receiptModalLayout.elements
+                  .filter((el) => el.enabled)
+                  .map((el) => {
+                    const alignClass = getReceiptAlignmentClass(el.textAlign);
+                    return (
+                      <div
+                        key={el.id}
+                        style={{
+                          marginTop: `${el.marginTop ?? 0}px`,
+                          marginBottom: `${el.marginBottom ?? 0}px`,
+                          textAlign: el.textAlign || 'center'
+                        }}
+                        className={`w-fit max-w-full min-w-0 ${alignClass} transition-all`}
+                      >
+                        {el.id === 'header_logo' && (
+                          localStorage.getItem('centerLogo') ? (
+                            <div className="inline-flex justify-center max-w-full py-0.5">
+                              <img
+                                src={localStorage.getItem('centerLogo') || ''}
+                                alt="Logo"
+                                style={{ height: `${el.height || 48}px`, maxHeight: '120px' }}
+                                className="max-w-full object-contain rounded-xl border border-gray-100"
+                                referrerPolicy="no-referrer"
+                              />
+                            </div>
+                          ) : (
+                            <div className="inline-flex justify-center py-0.5">
+                              <div className="p-2 bg-teal-600 rounded-xl text-white inline-flex">
+                                <Wrench className="w-5 h-5" />
+                              </div>
+                            </div>
+                          )
+                        )}
 
-            {/* Printable Receipt Area */}
-            <div className="space-y-6 text-center">
-              
-              {/* Receipt Header (Logo & Company name) */}
-              <div className="flex flex-col items-center justify-center gap-3 border-b border-gray-100 pb-5 text-center">
-                <div className="text-center flex flex-col items-center justify-center">
-                  <div className="flex items-center justify-center gap-2">
-                    {localStorage.getItem('centerLogo') ? (
-                      <img
-                        src={localStorage.getItem('centerLogo') || ''}
-                        alt="Logo"
-                        className="w-10 h-10 rounded-xl object-cover border border-gray-100"
-                        referrerPolicy="no-referrer"
-                      />
-                    ) : (
-                      <div className="p-1.5 bg-teal-600 rounded-xl text-white">
-                        <Wrench className="w-5 h-5" />
+                        {el.id === 'center_info' && (
+                          <div 
+                            className="w-fit max-w-full min-w-0 space-y-0.5 leading-tight break-words [overflow-wrap:anywhere]"
+                            style={{ 
+                              fontSize: getResponsiveReceiptFontSize(el.fontSize, 13, activePaperSize),
+                              fontWeight: el.bold ? 800 : 600,
+                              textAlign: el.textAlign || 'center'
+                            }}
+                          >
+                            <div className="font-sans font-extrabold text-gray-950 tracking-tight break-words">
+                              {rcptCenterNameText || localStorage.getItem('centerName') || 'TECHNO'}
+                            </div>
+                            <div className="text-gray-500 text-[0.78em] font-sans break-words">
+                              بإشراف المهندس: {localStorage.getItem('engineerName') || 'م. محمد وليد'}
+                            </div>
+                            <div className="text-gray-500 text-[0.75em] font-mono tabular-nums flex flex-wrap items-center justify-center gap-x-1.5 gap-y-0.5 break-all" dir="ltr">
+                              <span>{localStorage.getItem('centerMobile') || '0776400465'}</span>
+                              {localStorage.getItem('centerEmail') && (
+                                <>
+                                  <span aria-hidden="true">|</span>
+                                  <span className="break-all">{localStorage.getItem('centerEmail')}</span>
+                                </>
+                              )}
+                            </div>
+                          </div>
+                        )}
+
+                        {el.id === 'invoice_badge' && (
+                          <div 
+                            className="inline-flex flex-col w-fit max-w-full min-w-0 bg-gray-50 px-3 py-1.5 rounded-xl border border-gray-200/80 leading-tight break-words [overflow-wrap:anywhere]"
+                            style={{
+                              fontSize: getResponsiveReceiptFontSize(el.fontSize, 11, activePaperSize),
+                              textAlign: el.textAlign || 'center'
+                            }}
+                          >
+                            <span className="text-[0.82em] text-gray-500 block font-semibold">إيصال استلام جهاز للصيانة</span>
+                            <span className="font-mono tabular-nums text-[1.15em] font-black text-teal-700 block tracking-wider break-all" dir="ltr">#{showCustomerTicket.id}</span>
+                            <span className="font-mono tabular-nums text-[0.75em] font-bold text-gray-600" dir="ltr">
+                              {formatCountryDateTime24h(showCustomerTicket.createdAt, getActiveCountrySettings())}
+                            </span>
+                          </div>
+                        )}
+
+                        {el.id === 'customer_info' && (
+                          <div 
+                            className="w-fit max-w-full min-w-0 space-y-1.5 bg-white px-3 py-2 rounded-xl border border-gray-200/80 text-right leading-tight"
+                            style={{
+                              fontSize: getResponsiveReceiptFontSize(el.fontSize, 11, activePaperSize),
+                              fontWeight: el.bold ? 700 : undefined,
+                              textAlign: el.textAlign || 'right'
+                            }}
+                          >
+                            <h4 className="font-sans font-bold text-gray-900 text-[0.95em] border-b border-gray-100 pb-1 flex items-center justify-start gap-1.5">
+                              <User className="w-3.5 h-3.5 text-teal-600 shrink-0" />
+                              <span>بيانات العميل المستلم</span>
+                            </h4>
+                            <div className="space-y-1 text-[1em] font-sans text-gray-600">
+                              <div className="flex flex-wrap justify-between items-baseline gap-x-2.5 gap-y-0.5">
+                                <span className="text-gray-400 shrink-0">اسم العميل:</span>
+                                <strong className="text-gray-900 font-extrabold min-w-0 break-words [overflow-wrap:anywhere]">{showCustomerTicket.customerName}</strong>
+                              </div>
+                              <div className="flex flex-wrap justify-between items-baseline gap-x-2.5 gap-y-0.5">
+                                <span className="text-gray-400 shrink-0">رقم الجوال:</span>
+                                <strong className="text-gray-900 font-mono tabular-nums font-extrabold min-w-0 break-all" dir="ltr">{showCustomerTicket.customerPhone}</strong>
+                              </div>
+                              <div className="flex flex-wrap justify-between items-baseline gap-x-2.5 gap-y-0.5">
+                                <span className="text-gray-400 shrink-0">البلد والمفتاح:</span>
+                                <strong className="text-gray-900 font-sans font-extrabold min-w-0 break-words">{countryName} ({countryDialCode}+)</strong>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+
+                        {el.id === 'device_info' && (
+                          <div 
+                            className="w-fit max-w-full min-w-0 space-y-1.5 bg-white px-3 py-2 rounded-xl border border-gray-200/80 text-right leading-tight"
+                            style={{
+                              fontSize: getResponsiveReceiptFontSize(el.fontSize, 11, activePaperSize),
+                              fontWeight: el.bold ? 700 : undefined,
+                              textAlign: el.textAlign || 'right'
+                            }}
+                          >
+                            <h4 className="font-sans font-bold text-gray-900 text-[0.95em] border-b border-gray-100 pb-1 flex items-center justify-start gap-1.5">
+                              <Wrench className="w-3.5 h-3.5 text-teal-600 shrink-0" />
+                              <span>مواصفات الجهاز</span>
+                            </h4>
+                            <div className="space-y-1 text-[1em] font-sans text-gray-600">
+                              <div className="flex flex-wrap justify-between items-baseline gap-x-2.5 gap-y-0.5">
+                                <span className="text-gray-400 shrink-0">الجهاز والموديل:</span>
+                                <strong className="text-gray-900 font-extrabold min-w-0 break-words [overflow-wrap:anywhere]">{showCustomerTicket.deviceType} • {showCustomerTicket.brandModel}</strong>
+                              </div>
+                              <div className="flex flex-wrap justify-between items-baseline gap-x-2.5 gap-y-0.5">
+                                <span className="text-gray-400 shrink-0">الرقم التسلسلي:</span>
+                                <strong className="text-gray-900 font-mono tabular-nums min-w-0 break-all" dir="ltr">{showCustomerTicket.serialNumber || 'غير متوفر'}</strong>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+
+                        {el.id === 'fault_info' && (
+                          <div 
+                            className="w-fit max-w-full min-w-0 bg-white px-3 py-2 rounded-xl border border-gray-200/80 space-y-1.5 text-right leading-tight"
+                            style={{
+                              fontSize: getResponsiveReceiptFontSize(el.fontSize, 10.5, activePaperSize),
+                              fontWeight: el.bold ? 700 : undefined,
+                              textAlign: el.textAlign || 'right'
+                            }}
+                          >
+                            <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-0.5 text-[1em] font-sans">
+                              <span className="text-gray-400 font-bold shrink-0">وصف العطل:</span>
+                              <p className="text-gray-800 font-medium leading-snug min-w-0 break-words [overflow-wrap:anywhere]">{showCustomerTicket.faultDescription}</p>
+                            </div>
+                            {showCustomerTicket.notes && (
+                              <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-0.5 text-[0.95em] font-sans border-t border-gray-100 pt-1">
+                                <span className="text-gray-400 font-bold shrink-0">ملاحظات إضافية:</span>
+                                <p className="text-gray-500 font-medium leading-snug min-w-0 break-words [overflow-wrap:anywhere]">{showCustomerTicket.notes}</p>
+                              </div>
+                            )}
+                            <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-0.5 text-[0.95em] font-sans border-t border-gray-100 pt-1">
+                              <span className="text-gray-400 font-bold shrink-0">موعد الاستلام المتوقع:</span>
+                              <p className="text-teal-700 font-extrabold min-w-0 break-words">{formatSafeDate(showCustomerTicket.expectedDeliveryDate)} ({showCustomerTicket.technician || 'الفني المختص'})</p>
+                            </div>
+                          </div>
+                        )}
+
+                        {el.id === 'cost_info' && (
+                          <div 
+                            className="w-fit max-w-full min-w-0 bg-emerald-50/50 px-3 py-2 rounded-xl border border-emerald-200/70 space-y-1 text-right font-sans leading-tight"
+                            style={{
+                              fontSize: getResponsiveReceiptFontSize(el.fontSize, 12, activePaperSize),
+                              fontWeight: el.bold ? 800 : undefined,
+                              textAlign: el.textAlign || 'right'
+                            }}
+                          >
+                            <div className="flex flex-wrap justify-between items-baseline text-[1em] gap-x-2.5 gap-y-0.5">
+                              <span className="text-gray-500 font-bold shrink-0">التكلفة التقديرية:</span>
+                              <strong className="text-gray-900 font-black tabular-nums text-[1.05em] break-words">{showCustomerTicket.estimatedCost || 0} {showCustomerTicket.currency || currencyName}</strong>
+                            </div>
+                            <div className="flex flex-wrap justify-between items-baseline text-[0.92em] gap-x-2.5 gap-y-0.5">
+                              <span className="text-gray-500 font-bold shrink-0">الدفعة المقدمة:</span>
+                              <strong className="text-emerald-700 font-extrabold tabular-nums break-words">{showCustomerTicket.advancePayment || 0} {showCustomerTicket.currency || currencyName}</strong>
+                            </div>
+                            <div className="flex flex-wrap justify-between items-baseline text-[1em] border-t border-emerald-200/60 pt-1 gap-x-2.5 gap-y-0.5">
+                              <span className="text-teal-900 font-bold shrink-0">المتبقي عند الاستلام:</span>
+                              <strong className="text-teal-800 font-black tabular-nums text-[1.05em] break-words">
+                                {Math.max(0, (showCustomerTicket.estimatedCost || 0) - (showCustomerTicket.advancePayment || 0))} {showCustomerTicket.currency || currencyName}
+                              </strong>
+                            </div>
+                          </div>
+                        )}
+
+                        {el.id === 'barcode_section' && (
+                          <div 
+                            className="inline-flex flex-col items-center justify-center w-fit max-w-full min-w-0 bg-white border border-teal-600/30 rounded-xl px-2.5 py-2 gap-1 text-center overflow-hidden"
+                            style={{
+                              textAlign: el.textAlign || 'center'
+                            }}
+                          >
+                            <div className="flex items-center justify-center gap-1 text-[10px] font-bold text-gray-700">
+                              <Barcode className="w-3.5 h-3.5 text-teal-600 shrink-0" />
+                              <span>رمز QR تتبع الطلب</span>
+                            </div>
+                            <div className="max-w-full flex flex-col items-center justify-center overflow-hidden">
+                              <BarcodeGenerator 
+                                value={showCustomerTicket.id} 
+                                qrContent={getOrderQrContent(showCustomerTicket, 550)}
+                                width={el.width || 1.4} 
+                                height={el.height ? Math.max(10, Math.min(99, el.height)) : 40} 
+                                showText={true} 
+                                showModeBadge={true}
+                                format={localStorage.getItem('lblBarcodeFormat') || 'AUTO'} 
+                                fontSize={Math.max(10, Math.min(99, el.fontSize || 11))} 
+                                maxWidthMm={paperMetrics.maxBarcodeMm}
+                              />
+                            </div>
+                            <p className="text-[9px] text-gray-400 font-sans text-center break-words max-w-full">
+                              يرجى الاحتفاظ بهذا الوصل لتتبع الفاتورة واستلام الجهاز
+                            </p>
+                          </div>
+                        )}
+
+                        {el.id === 'qr_section' && (
+                          <div 
+                            className="inline-flex flex-col items-center justify-center w-fit max-w-full min-w-0 py-1.5 border-b border-dashed border-gray-200"
+                            style={{
+                              textAlign: el.textAlign || 'center'
+                            }}
+                          >
+                            <div className="bg-white p-1.5 rounded-xl border border-gray-200 inline-flex flex-col items-center w-fit max-w-full">
+                              <QRCodeGenerator value={buildTrackingUrl(showCustomerTicket.id, appUrl)} size={el.height ? Math.max(10, Math.min(99, el.height)) : 60} />
+                            </div>
+                            <span className="text-[9px] text-gray-400 mt-1 font-sans break-words max-w-full">امسح الكود لتتبع حالة جهازك مباشرة</span>
+                          </div>
+                        )}
+
+                        {el.id === 'terms_section' && (
+                          <div 
+                            className="w-fit max-w-full min-w-0 bg-gray-50 rounded-xl px-2.5 py-2 border border-gray-200/80 text-gray-500 font-sans leading-snug space-y-0.5 break-words [overflow-wrap:anywhere]"
+                            style={{
+                              fontSize: getResponsiveReceiptFontSize(el.fontSize, 10, activePaperSize),
+                              fontWeight: el.bold ? 700 : undefined,
+                              textAlign: el.textAlign || 'center'
+                            }}
+                          >
+                            <p className="font-bold text-gray-700 text-[1em]">شروط وأحكام الصيانة المعتمدة:</p>
+                            {(rcptTermsText || '').split('\n').map((line: string, idx: number) => (
+                              <p key={idx} className="text-[0.9em] break-words">{line}</p>
+                            ))}
+                          </div>
+                        )}
+
+                        {el.id === 'footer_thanks' && (
+                          <div 
+                            className="w-fit max-w-full min-w-0 px-2 pt-1 font-bold text-teal-800 font-sans leading-tight break-words [overflow-wrap:anywhere]"
+                            style={{
+                              fontSize: getResponsiveReceiptFontSize(el.fontSize, 10, activePaperSize),
+                              fontWeight: el.bold ? 800 : 700,
+                              textAlign: el.textAlign || 'center'
+                            }}
+                          >
+                            شكراً لثقتكم بنا، ونتمنى لكم يوماً سعيداً!
+                          </div>
+                        )}
                       </div>
-                    )}
-                    <span className="font-sans font-extrabold text-lg text-gray-950">
-                      {rcptCenterNameText || localStorage.getItem('centerName') || 'TECHNO'}
-                    </span>
-                  </div>
-                  <p className="text-gray-400 text-[10px] font-sans mt-1 text-center">
-                    بإشراف المهندس: {localStorage.getItem('engineerName') || 'م. محمد وليد'}
-                  </p>
-                  <p className="text-gray-400 text-[10px] font-mono mt-0.5 text-center" dir="ltr">
-                    هاتف: {localStorage.getItem('centerMobile') || '962790000000'} | {localStorage.getItem('centerEmail') || 'info@techno-repair.com'}
-                  </p>
-                </div>
-                
-                <div className="text-center bg-gray-50 px-4 py-2 rounded-2xl border border-gray-100/80 mx-auto">
-                  <span className="text-[10px] text-gray-400 block font-semibold">تاريخ ورقم الفاتورة</span>
-                  <span className="font-mono text-xs font-black text-teal-700 block tracking-wider" dir="ltr">#{showCustomerTicket.id}</span>
-                  <span className="font-mono text-[10px] font-bold text-gray-600">{new Date(showCustomerTicket.createdAt).toLocaleDateString('ar-SA')} - {new Date(showCustomerTicket.createdAt).toLocaleTimeString('ar-SA', {hour: '2-digit', minute:'2-digit'})}</span>
-                </div>
+                    );
+                  })}
               </div>
-
-              {/* Unique Serial Number & Barcode Block - 100% Crisp & Unencrypted Readable Text */}
-              <div className="bg-white border-2 border-teal-600/30 rounded-2xl p-4 flex flex-col items-center justify-center gap-2.5 shadow-2xs text-center">
-                <div className="text-center flex flex-col items-center w-full max-w-sm">
-                  <div className="flex items-center justify-center gap-1.5 text-xs font-bold text-gray-800 mb-1">
-                    <Barcode className="w-4 h-4 text-teal-600" />
-                    <span>رقم وباركود تتبع الفاتورة والطلب:</span>
-                  </div>
-                  
-                  <div className="w-full flex flex-col items-center justify-center py-2 px-3 bg-gray-50/80 rounded-xl border border-gray-200">
-                    <BarcodeGenerator 
-                      value={showCustomerTicket.id} 
-                      width={1.6} 
-                      height={42} 
-                      showText={true} 
-                      format="CODE128" 
-                      fontSize={13} 
-                    />
-                  </div>
-
-                  <div className="mt-2 text-center flex flex-col items-center gap-1">
-                    <span className="font-mono font-black text-gray-950 text-base sm:text-lg tracking-[0.25em] bg-teal-50 px-4 py-1 rounded-xl border border-teal-200 text-teal-950 select-all text-center" dir="ltr">
-                      {showCustomerTicket.id}
-                    </span>
-                    <span className="text-[10px] text-gray-500 font-sans font-medium text-center">
-                      رمز غير مشفر ومقروء بوضوح: {parseBarcodeId(showCustomerTicket.id).prefix || 'TEC'} (المحل) • {parseBarcodeId(showCustomerTicket.id).year || ''} • شهر {parseBarcodeId(showCustomerTicket.id).month || ''} • دقيقة {parseBarcodeId(showCustomerTicket.id).minute || ''}
-                    </span>
-                  </div>
-
-                  <p className="text-[11px] text-gray-500 font-sans mt-1 text-center">
-                    يرجى الاحتفاظ بهذا الوصل والباركود لتتبع وإصدار الفاتورة واستلام الجهاز
-                  </p>
-                </div>
-              </div>
-
-              {/* Grid Information: Customer & Device details */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-5 pt-2">
-                
-                {/* Column 1: Customer Details */}
-                <div className="space-y-3.5 bg-white p-4.5 rounded-2xl border border-gray-100/80 text-center">
-                  <h4 className="font-sans font-bold text-gray-900 text-xs border-b border-gray-100 pb-2 flex items-center justify-center gap-1.5">
-                    <User className="w-4 h-4 text-teal-600" />
-                    بيانات العميل المستلم
-                  </h4>
-                  <div className="space-y-2 text-xs font-sans text-gray-600">
-                    <div className="flex justify-between items-center">
-                      <span className="text-gray-400">اسم العميل:</span>
-                      <strong className="text-gray-900 font-extrabold">{showCustomerTicket.customerName}</strong>
-                    </div>
-                    <div className="flex justify-between items-center">
-                      <span className="text-gray-400">رقم جوال العميل:</span>
-                      <strong className="text-gray-900 font-mono font-extrabold">{showCustomerTicket.customerPhone}</strong>
-                    </div>
-                    <div className="flex justify-between items-center">
-                      <span className="text-gray-400">البلد والمفتاح الدولي:</span>
-                      <strong className="text-gray-900 font-sans font-extrabold">{countryName} ({countryDialCode}+)</strong>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Column 2: Device & Cost Details */}
-                <div className="space-y-3.5 bg-white p-4.5 rounded-2xl border border-gray-100/80 text-center">
-                  <h4 className="font-sans font-bold text-gray-900 text-xs border-b border-gray-100 pb-2 flex items-center justify-center gap-1.5">
-                    <Wrench className="w-4 h-4 text-teal-600" />
-                    مواصفات الجهاز والعطل
-                  </h4>
-                  <div className="space-y-2 text-xs font-sans text-gray-600">
-                    <div className="flex justify-between items-center">
-                      <span className="text-gray-400">نوع وموديل الجهاز:</span>
-                      <strong className="text-gray-900 font-extrabold">{showCustomerTicket.deviceType} • {showCustomerTicket.brandModel}</strong>
-                    </div>
-                    <div className="flex justify-between items-center">
-                      <span className="text-gray-400">الرقم التسلسلي للجهاز:</span>
-                      <strong className="text-gray-900 font-mono">{showCustomerTicket.serialNumber || 'غير متوفر'}</strong>
-                    </div>
-                    <div className="flex justify-between items-center">
-                      <span className="text-gray-400">التكلفة التقديرية المعتمدة:</span>
-                      <strong className="text-emerald-700 font-extrabold bg-emerald-50 px-2 py-0.5 rounded-lg border border-emerald-100">{showCustomerTicket.estimatedCost} {showCustomerTicket.currency || currencyName}</strong>
-                    </div>
-                  </div>
-                </div>
-
-              </div>
-
-              {/* Fault & Notes Detail Card */}
-              <div className="bg-white p-4 rounded-2xl border border-gray-100/80 space-y-2 text-center">
-                <div className="flex flex-col sm:flex-row items-center justify-center gap-1.5 text-xs font-sans text-center">
-                  <span className="text-gray-400 font-bold shrink-0">وصف العطل المصرح به:</span>
-                  <p className="text-gray-800 font-medium leading-relaxed">{showCustomerTicket.faultDescription}</p>
-                </div>
-                {showCustomerTicket.notes && (
-                  <div className="flex flex-col sm:flex-row items-center justify-center gap-1.5 text-xs font-sans border-t border-gray-50 pt-2 text-center">
-                    <span className="text-gray-400 font-bold shrink-0">ملاحظات إضافية:</span>
-                    <p className="text-gray-500 font-medium leading-relaxed">{showCustomerTicket.notes}</p>
-                  </div>
-                )}
-                <div className="flex flex-col sm:flex-row items-center justify-center gap-1.5 text-xs font-sans border-t border-gray-50 pt-2 text-center">
-                  <span className="text-gray-400 font-bold shrink-0">موعد الاستلام المتوقع:</span>
-                  <p className="text-teal-700 font-extrabold">{new Date(showCustomerTicket.expectedDeliveryDate).toLocaleDateString('ar-SA')} ({showCustomerTicket.technician || 'الفني المختص'})</p>
-                </div>
-              </div>
-
-              {/* Store Terms & Conditions Signature */}
-              <div className="bg-gray-50 rounded-xl p-3 border border-gray-100 text-[10px] text-gray-400 font-sans leading-relaxed space-y-1 text-center">
-                <p className="font-bold text-gray-500 text-center">📄 شروط وأحكام الصيانة المعتمدة:</p>
-                {rcptTermsText.split('\n').map((line, idx) => (
-                  <p key={idx} className="text-center">{line}</p>
-                ))}
-              </div>
-
-            </div>
+            )}
 
             {/* Active Invoice Printer status in modal */}
             {(() => {
@@ -2897,10 +3212,10 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
             )}
 
             {/* Modal Actions */}
-            <div className="flex gap-2.5 pt-4 border-t border-gray-100 no-print">
+            <div className="flex flex-wrap gap-2.5 pt-4 border-t border-gray-100 no-print">
               <button
                 onClick={() => handlePrintElement('customer-receipt-print-modal', 'إيصال استلام الصيانة')}
-                className="flex-1 bg-gray-800 hover:bg-gray-900 text-white font-sans font-bold py-3 rounded-xl text-xs transition-colors flex items-center justify-center gap-1.5 "
+                className="flex-1 min-w-[160px] bg-gray-800 hover:bg-gray-900 text-white font-sans font-bold py-3 px-4 rounded-xl text-xs transition-colors flex items-center justify-center gap-1.5"
               >
                 <Printer className="w-4 h-4" />
                 طباعة عبر المتصفح
@@ -2911,7 +3226,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                   setIsDirectPrinting(false);
                   setDirectPrintMessage(null);
                 }}
-                className="px-6 py-3 bg-gray-100 hover:bg-gray-200 text-gray-600 font-sans font-semibold rounded-xl text-xs transition-colors"
+                className="px-6 py-3 bg-gray-100 hover:bg-gray-200 text-gray-600 font-sans font-semibold rounded-xl text-xs transition-colors whitespace-nowrap"
               >
                 إغلاق النافذة
               </button>
@@ -2919,7 +3234,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
 
           </div>
         </div>
-      )}
+      )})()}
 
       {/* 2. Add / Edit Order Modal */}
       {showAddModal && (
@@ -2940,22 +3255,22 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
 
             <form onSubmit={handleFormSubmit} className="p-6 space-y-4 max-h-[500px] overflow-y-auto">
               
-              {/* Barcode Section: 3-Letter Prefix + Date/Time Numbers */}
+              {/* Order Number Section: ***yymmddhhmm (Editable 3-char prefix + Country local 24h time) */}
               <div className="bg-gradient-to-r from-teal-50 to-emerald-50/70 p-3.5 rounded-2xl border border-teal-200/80 text-right space-y-2.5 font-sans" dir="rtl">
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-1.5 font-bold text-xs text-teal-900">
                     <Barcode className="w-4 h-4 text-teal-600" />
-                    <span>رقم الباركود المخصص للطلب:</span>
+                    <span>رقم الطلب:</span>
                   </div>
-                  <span className="font-mono bg-teal-600 text-white font-black px-2.5 py-1 rounded-xl text-xs tracking-wider shadow-xs">
+                  <span dir="ltr" className="font-mono bg-teal-600 text-white font-black px-2.5 py-1 rounded-xl text-xs tracking-wider shadow-xs">
                     {isEditing ? (selectedOrder?.id || formBarcodeId) : formBarcodeId}
                   </span>
                 </div>
 
                 {!isEditing ? (
-                  <div className="pt-1 border-t border-teal-100 flex items-center justify-between gap-2">
+                  <div className="pt-1.5 border-t border-teal-100 flex flex-wrap items-center justify-between gap-2">
                     <div className="flex items-center gap-1.5">
-                      <span className="text-[11px] font-bold text-gray-700">رمز الباركود (3 أحرف):</span>
+                      <span className="text-[11px] font-bold text-gray-700">تعديل الأحرف (***):</span>
                       <input
                         type="text"
                         maxLength={3}
@@ -2963,16 +3278,22 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                         onChange={(e) => {
                           const val = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 3);
                           setFormBarcodePrefix(val);
-                          setFormBarcodeId(generateBarcodeId(val, orders.map(o => o.id)));
+                          setFormBarcodeId(
+                            generateBarcodeId(val, orders.map(o => o.id), new Date(), getActiveCountrySettings())
+                          );
                         }}
-                        className="w-16 px-2 py-1 bg-white border border-teal-300 rounded-lg font-mono text-center font-black text-xs text-teal-800 focus:outline-none focus:ring-2 focus:ring-teal-500"
+                        dir="ltr"
+                        className="w-16 px-2 py-1 bg-white border border-teal-300 rounded-lg font-mono text-center font-black text-xs text-teal-800 focus:outline-none focus:ring-2 focus:ring-teal-500 uppercase"
                         placeholder="TEC"
                       />
                     </div>
+                    <span className="text-[10px] font-semibold text-teal-800/80">
+                      <span dir="ltr" className="font-mono font-bold">***yymmddhhmm</span> · توقيت {getActiveCountrySettings().countryName} (24 ساعة)
+                    </span>
                   </div>
                 ) : (
                   <div className="text-[11px] text-teal-800 font-medium">
-                    الباركود مسجل مسبقاً لهذا الجهاز في النظام.
+                    رقم الطلب مسجل مسبقاً لهذا الجهاز في النظام.
                   </div>
                 )}
               </div>
@@ -3020,7 +3341,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                       onClick={() => handleVoiceInput('customerName')}
                       className={`absolute left-2.5 p-1.5 rounded-lg transition-all flex items-center justify-center ${
                         listeningField === 'customerName' 
-                          ? 'bg-rose-100 text-rose-600 animate-pulse  -100' 
+                          ? 'bg-rose-100 text-rose-600 animate-pulse' 
                           : 'bg-teal-50 text-teal-600 hover:bg-teal-100'
                       }`}
                       title={listeningField === 'customerName' ? "إيقاف الاستماع" : "تسجيل الاسم بالصوت"}
@@ -3031,15 +3352,17 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
 
                   {/* Suggestions list for Name */}
                   {showSuggestions && activeSuggestionField === 'name' && customerSuggestions.length > 0 && (
-                    <div className="absolute z-50 left-0 right-0 mt-1 bg-white border border-gray-150 rounded-xl  max-h-48 overflow-y-auto divide-y divide-gray-50 font-sans" dir="rtl">
+                    <div className="absolute z-50 left-0 right-0 mt-1 bg-white border border-gray-200 rounded-xl shadow-lg max-h-48 overflow-y-auto divide-y divide-gray-50 font-sans" dir="rtl">
                       {customerSuggestions.map((c, index) => (
                         <div
                           key={index}
                           onMouseDown={() => selectSuggestion(c)}
-                          className="px-4 py-2.5 hover:bg-teal-50/50 cursor-pointer transition-colors flex items-center justify-between text-xs"
+                          className="px-4 py-2.5 hover:bg-teal-50/50 cursor-pointer transition-colors flex items-center justify-between text-xs gap-2"
                         >
-                          <span className="font-bold text-gray-800">{c.name}</span>
-                          <span className="font-mono text-gray-400 text-[11px]">{c.phone}</span>
+                          <span className="font-bold text-gray-800 truncate">{c.name}</span>
+                          <span className="font-mono text-gray-500 text-[11px] shrink-0" dir="ltr">
+                            {c.phone}
+                          </span>
                         </div>
                       ))}
                     </div>
@@ -3061,9 +3384,11 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                       onFocus={() => {
                         setActiveSuggestionField('phone');
                         if (formCustomerPhone.trim()) {
+                          const q = formCustomerPhone.toLowerCase();
                           const filtered = uniqueCustomers.filter(c => 
                             c.phone.includes(formCustomerPhone) ||
-                            c.name.toLowerCase().includes(formCustomerPhone.toLowerCase())
+                            c.name.toLowerCase().includes(q) ||
+                            (c.customerBarcode && c.customerBarcode.toLowerCase().includes(q))
                           );
                           setCustomerSuggestions(filtered);
                           setShowSuggestions(true);
@@ -3077,15 +3402,17 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
 
                     {/* Suggestions list for Phone */}
                     {showSuggestions && activeSuggestionField === 'phone' && customerSuggestions.length > 0 && (
-                      <div className="absolute z-50 left-0 right-0 mt-1 bg-white border border-gray-150 rounded-xl  max-h-48 overflow-y-auto divide-y divide-gray-50 font-sans" dir="rtl">
+                      <div className="absolute z-50 left-0 right-0 mt-1 bg-white border border-gray-200 rounded-xl shadow-lg max-h-48 overflow-y-auto divide-y divide-gray-50 font-sans" dir="rtl">
                         {customerSuggestions.map((c, index) => (
                           <div
                             key={index}
                             onMouseDown={() => selectSuggestion(c)}
-                            className="px-4 py-2.5 hover:bg-teal-50/50 cursor-pointer transition-colors flex items-center justify-between text-xs"
+                            className="px-4 py-2.5 hover:bg-teal-50/50 cursor-pointer transition-colors flex items-center justify-between text-xs gap-2"
                           >
-                            <span className="font-bold text-gray-800">{c.name}</span>
-                            <span className="font-mono text-gray-400 text-[11px]">{c.phone}</span>
+                            <span className="font-bold text-gray-800 truncate">{c.name}</span>
+                            <span className="font-mono text-gray-500 text-[11px] shrink-0" dir="ltr">
+                              {c.phone}
+                            </span>
                           </div>
                         ))}
                       </div>
@@ -3157,7 +3484,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                       onClick={() => handleVoiceInput('faultDescription')}
                       className={`flex items-center gap-1 font-sans font-extrabold text-[10px] px-2 py-0.5 rounded-lg border transition-all ${
                         listeningField === 'faultDescription'
-                          ? 'bg-rose-100 border-rose-200 text-rose-600 animate-pulse  -100'
+                          ? 'bg-rose-100 border-rose-200 text-rose-600 animate-pulse'
                           : 'bg-teal-50 border-teal-100 text-teal-600 hover:bg-teal-100'
                       }`}
                       title="تسجيل العطل بالصوت"
@@ -3178,7 +3505,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
               </div>
 
               {/* Fault & Device Photos Camera Documentation inside Modal */}
-              <div className="bg-emerald-50/60 p-3.5 rounded-2xl border border-emerald-150/80 space-y-2.5">
+              <div className="bg-emerald-50/60 p-3.5 rounded-2xl border border-emerald-200/80 space-y-2.5">
                 <div className="flex justify-between items-center">
                   <span className="font-sans font-bold text-xs text-emerald-950 flex items-center gap-1.5">
                     <Camera className="w-4 h-4 text-emerald-600" />
@@ -3282,6 +3609,130 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                 </div>
               </div>
 
+              {/* Additional Costs, Advance Payment, Waiting Parts & Custom Variables during Reception / Edit */}
+              <div className="bg-amber-50/50 border border-amber-200/70 rounded-2xl p-3.5 space-y-3">
+                <div className="flex items-center justify-between border-b border-amber-200/50 pb-1.5">
+                  <span className="font-sans font-extrabold text-xs text-amber-950 flex items-center gap-1.5">
+                    <PlusCircle className="w-3.5 h-3.5 text-amber-600" />
+                    <span>العربون، الكلف الإضافية، انتظار القطع ومتغيرات مخصصة (اختياري):</span>
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                  <div className="space-y-1">
+                    <label className="text-[11px] font-bold text-gray-700">الدفعة المقدمة (العربون):</label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.5"
+                      placeholder="0"
+                      value={formAdvancePayment}
+                      onChange={(e) => setFormAdvancePayment(e.target.value === '' ? '' : Number(e.target.value))}
+                      className="w-full bg-white border border-gray-200 rounded-xl py-2 px-3 text-xs font-mono font-bold text-teal-800"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[11px] font-bold text-amber-900">كلف إضافية:</label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.5"
+                      placeholder="0"
+                      value={formExtraCost}
+                      onChange={(e) => setFormExtraCost(e.target.value === '' ? '' : Number(e.target.value))}
+                      className="w-full bg-white border border-amber-300 rounded-xl py-2 px-3 text-xs font-mono font-bold text-amber-900"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[11px] font-bold text-gray-700">سبب الكلفة الإضافية:</label>
+                    <input
+                      type="text"
+                      placeholder="مثال: قطعة إضافية..."
+                      value={formExtraCostReason}
+                      onChange={(e) => setFormExtraCostReason(e.target.value)}
+                      className="w-full bg-white border border-gray-200 rounded-xl py-2 px-3 text-xs font-sans"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                  <div className="sm:col-span-2 space-y-1">
+                    <label className="text-[11px] font-bold text-sky-900 flex items-center gap-1">
+                      <Package className="w-3 h-3 text-sky-600" />
+                      <span>انتظار القطع (إن وجد):</span>
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="مثال: بانتظار شاشة أصلية..."
+                      value={formWaitingPartsDetails}
+                      onChange={(e) => setFormWaitingPartsDetails(e.target.value)}
+                      className="w-full bg-white border border-sky-200 rounded-xl py-2 px-3 text-xs font-sans"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[11px] font-bold text-sky-900">تاريخ وصول القطعة:</label>
+                    <input
+                      type="date"
+                      value={formWaitingPartsExpectedDate}
+                      onChange={(e) => setFormWaitingPartsExpectedDate(e.target.value)}
+                      className="w-full bg-white border border-sky-200 rounded-xl py-2 px-2.5 text-xs font-mono"
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-1.5 pt-1 border-t border-amber-200/40">
+                  <label className="text-[11px] font-bold text-violet-900 flex items-center gap-1">
+                    <Tag className="w-3 h-3 text-violet-600" />
+                    <span>إضافة متغير مخصص للرسالة والسجل:</span>
+                  </label>
+                  {formCustomVariables.map((cv, idx) => (
+                    <div key={`${cv.key}-${idx}`} className="flex items-center gap-2 bg-white px-2.5 py-1.5 rounded-xl border border-violet-200 text-xs">
+                      <span className="font-bold text-violet-900">{cv.label}:</span>
+                      <span className="flex-1 text-gray-800">{cv.value}</span>
+                      <button
+                        type="button"
+                        onClick={() => setFormCustomVariables(prev => prev.filter((_, i) => i !== idx))}
+                        className="text-rose-500 hover:bg-rose-50 p-1 rounded-lg cursor-pointer"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                  <div className="grid grid-cols-1 sm:grid-cols-12 gap-1.5">
+                    <input
+                      type="text"
+                      placeholder="اسم المتغير"
+                      value={newFormVarLabel}
+                      onChange={(e) => setNewFormVarLabel(e.target.value)}
+                      className="sm:col-span-4 bg-white border border-violet-200 rounded-xl py-1.5 px-2.5 text-xs"
+                    />
+                    <input
+                      type="text"
+                      placeholder="القيمة"
+                      value={newFormVarValue}
+                      onChange={(e) => setNewFormVarValue(e.target.value)}
+                      className="sm:col-span-5 bg-white border border-violet-200 rounded-xl py-1.5 px-2.5 text-xs"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!newFormVarLabel.trim() || !newFormVarValue.trim()) return;
+                        setFormCustomVariables(prev => [
+                          ...prev,
+                          { key: `var_${Date.now().toString(36).slice(-4)}`, label: newFormVarLabel.trim(), value: newFormVarValue.trim() }
+                        ]);
+                        setNewFormVarLabel('');
+                        setNewFormVarValue('');
+                      }}
+                      disabled={!newFormVarLabel.trim() || !newFormVarValue.trim()}
+                      className="sm:col-span-3 bg-violet-600 hover:bg-violet-700 disabled:opacity-40 text-white font-bold text-xs py-1.5 px-2.5 rounded-xl cursor-pointer"
+                    >
+                      + إضافة متغير
+                    </button>
+                  </div>
+                </div>
+              </div>
+
               {/* Technician and store notes */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="space-y-1.5">
@@ -3291,7 +3742,9 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                     onChange={(e) => setFormTechnician(e.target.value)}
                     className="w-full bg-gray-50 border border-gray-200 rounded-xl py-2.5 px-3 text-xs focus:outline-none focus:ring-2 focus:ring-teal-500 focus:bg-white font-sans font-medium text-gray-800"
                   >
-                    <option value="م. محمد وليد">م. محمد وليد</option>
+                    {Array.from(new Set(['م. محمد وليد', localStorage.getItem('engineerName') || '', formTechnician].filter(Boolean))).map(tech => (
+                      <option key={tech} value={tech}>{tech}</option>
+                    ))}
                   </select>
                 </div>
 
@@ -3309,7 +3762,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                         onClick={() => handleVoiceInput('notes')}
                         className={`flex items-center gap-1 font-sans font-extrabold text-[10px] px-2 py-0.5 rounded-lg border transition-all ${
                           listeningField === 'notes'
-                            ? 'bg-rose-100 border-rose-200 text-rose-600 animate-pulse  -100'
+                            ? 'bg-rose-100 border-rose-200 text-rose-600 animate-pulse'
                             : 'bg-teal-50 border-teal-100 text-teal-600 hover:bg-teal-100'
                         }`}
                         title="تسجيل الملاحظات بالصوت"
@@ -3333,7 +3786,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
               <div className="flex gap-3 pt-4 border-t border-gray-100">
                 <button
                   type="submit"
-                  className="flex-1 bg-teal-600 hover:bg-teal-700 text-white font-sans font-bold py-3 rounded-2xl transition-all text-xs  -600/15"
+                  className="flex-1 bg-teal-600 hover:bg-teal-700 text-white font-sans font-bold py-3 rounded-2xl transition-all text-xs shadow-lg shadow-teal-600/15"
                 >
                   {isEditing ? 'حفظ التعديلات' : 'تسجيل الجهاز وإرسال الإشعار'}
                 </button>
@@ -3370,6 +3823,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
 
             // 2. Dispatch notification if requested
             if (shouldDispatch) {
+              const latestSnapshot = updatedOrder.statusHistory?.[updatedOrder.statusHistory.length - 1]?.snapshot;
               if (channel === 'whatsapp') {
                 const url = getWhatsAppLink(updatedOrder.customerPhone, finalMessage);
                 openWhatsAppDirectly(updatedOrder.customerPhone, finalMessage);
@@ -3380,7 +3834,8 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                   updatedOrder.customerPhone,
                   'whatsapp',
                   finalMessage,
-                  `تحديث مسار الصيانة (${updatedOrder.status})`
+                  `تحديث مسار الصيانة (${getStatusArabicLabel(updatedOrder.status)})`,
+                  latestSnapshot
                 );
 
                 setWhatsappModal({
@@ -3397,7 +3852,8 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                   updatedOrder.customerPhone,
                   'sms',
                   finalMessage,
-                  `رسالة SMS مسار الصيانة (${updatedOrder.status})`
+                  `رسالة SMS مسار الصيانة (${getStatusArabicLabel(updatedOrder.status)})`,
+                  latestSnapshot
                 );
                 window.open(`sms:${updatedOrder.customerPhone}?body=${encodeURIComponent(finalMessage)}`, '_blank');
               }
@@ -3574,7 +4030,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                     return (
                       <div className="text-xs text-gray-700 space-y-1.5 font-semibold bg-white p-3 rounded-xl border border-rose-100/60">
                         <div className="flex justify-between items-center"><span className="text-gray-400 font-sans font-normal">اسم العميل:</span> <strong className="text-gray-900">{o.customerName}</strong></div>
-                        <div className="flex justify-between items-center"><span className="text-gray-400 font-sans font-normal">رقم الباركود:</span> <strong className="text-teal-700 font-mono">{o.id}</strong></div>
+                        <div className="flex justify-between items-center"><span className="text-gray-400 font-sans font-normal">رقم الطلب:</span> <strong className="text-teal-700 font-mono">{o.id}</strong></div>
                         <div className="flex justify-between items-center"><span className="text-gray-400 font-sans font-normal">الجهاز والموديل:</span> <strong className="text-gray-800">{o.brandModel}</strong></div>
                         {o.faultDescription && (
                           <div className="flex justify-between items-start gap-2 pt-1 border-t border-gray-100">

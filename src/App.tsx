@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { MaintenanceOrder, DeviceStatus, NotificationTemplate, NotificationLog, AppUser, isContactOrder } from './types';
+import { MaintenanceOrder, DeviceStatus, NotificationTemplate, NotificationLog, AppUser, CustomerProfile, StatusHistorySnapshot, isContactOrder } from './types';
 import { 
   dbService, 
   LocalStorageDB, 
@@ -10,20 +10,31 @@ import {
   loginWithGoogle, 
   logoutUser, 
   resetPasswordEmail, 
+  deleteUserAccount,
+  deleteCurrentLoggedInAccount,
   getCurrentUserId 
 } from './lib/firebase';
-import { DEFAULT_TEMPLATES, formatNotification, getWhatsAppLink, openWhatsAppDirectly } from './lib/notifications';
+import { DEFAULT_TEMPLATES, formatNotification, getWhatsAppLink, openWhatsAppDirectly, buildStatusHistorySnapshot } from './lib/notifications';
 import { initializeLocalDatabase } from './lib/seed';
 
 // Import Views
 import DashboardView from './components/DashboardView';
 import OrdersView from './components/OrdersView';
 import NotificationSettingsView from './components/NotificationSettingsView';
-import DeliverDeviceModal from './components/DeliverDeviceModal';
+import DeliverDeviceModal, { DeliveryConfirmPayload } from './components/DeliverDeviceModal';
 import { ContactsView } from './components/ContactsView';
 import { LogsView } from './components/LogsView';
 import { ScannerModal } from "./components/ScannerModal";
 import { CustomerProfileModal } from './components/CustomerProfileModal';
+import { extractScannedBarcodeId } from './utils/barcode';
+import {
+  reconcileCustomersAndOrders,
+  linkOrderWithCustomer,
+  sanitizeCustomCustomerBarcode,
+  buildCustomerId,
+  normalizeCustomerNameKey,
+  phonesMatch,
+} from './utils/customerBarcode';
 
 // Import Lucide Icons
 import { 
@@ -47,19 +58,34 @@ import {
   CheckCircle,
   FileText,
   Mail,
+  Phone,
   Eye,
   EyeOff,
   Mic,
   MicOff,
-  CheckCircle2
+  CheckCircle2,
+  Upload,
+  Building2,
+  Globe,
+  Coins,
+  Trash2,
+  Image as ImageIcon
 } from 'lucide-react';
+import { RegisterCenterProfile } from './lib/firebase';
 import { checkMicrophonePermission, requestMicrophonePermission } from './utils/microphonePermissions';
+
+import { COUNTRIES_LIST } from './utils/countries';
+import type { CountryConfig } from './utils/countries';
+import { getEffectiveAppUrl } from './utils/appDomain';
+export { COUNTRIES_LIST };
+export type { CountryConfig };
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'orders' | 'completed' | 'notifications' | 'contacts' | 'logs'>('dashboard');
   
   // App state
   const [orders, setOrders] = useState<MaintenanceOrder[]>([]);
+  const [customers, setCustomers] = useState<CustomerProfile[]>([]);
   const [templates, setTemplates] = useState<NotificationTemplate[]>([]);
   const [notificationLogs, setNotificationLogs] = useState<NotificationLog[]>([]);
   
@@ -69,19 +95,43 @@ export default function App() {
   const [isScannerOpen, setIsScannerOpen] = useState(false);
   const [ordersSearchTerm, setOrdersSearchTerm] = useState<string>('');
   const [ordersStatusFilter, setOrdersStatusFilter] = useState<string>('');
+  const [openAddOrderModal, setOpenAddOrderModal] = useState<boolean>(false);
+  const [prefillCustomerForAdd, setPrefillCustomerForAdd] = useState<{ name: string; phone: string } | null>(null);
+  const loadSeqRef = React.useRef<number>(0);
+  const isExplicitAuthRef = React.useRef<boolean>(false);
   const [deliveryOrder, setDeliveryOrder] = useState<MaintenanceOrder | null>(null);
-  const [selectedCustomerProfile, setSelectedCustomerProfile] = useState<{ name: string; phone?: string } | null>(null);
+  const [selectedCustomerProfile, setSelectedCustomerProfile] = useState<{ name: string; phone?: string; customer?: CustomerProfile } | null>(null);
   const [isOnline, setIsOnline] = useState(true);
   const [isSyncing, setIsSyncing] = useState(false);
   const [lastSyncTime, setLastSyncTime] = useState<Date | null>(null);
-  const [centerName, setCenterName] = useState(() => localStorage.getItem('centerName') || 'TECHNO');
-  const [centerLogo, setCenterLogo] = useState(() => localStorage.getItem('centerLogo') || '');
+  const [centerName, setCenterName] = useState(() => {
+    return (typeof localStorage !== 'undefined' && (localStorage.getItem('centerName') || localStorage.getItem('lastRegisteredCenterName'))) || 'TECHNO';
+  });
+  const [centerLogo, setCenterLogo] = useState(() => {
+    return (typeof localStorage !== 'undefined' && (localStorage.getItem('centerLogo') || localStorage.getItem('lastRegisteredCenterLogo'))) || '';
+  });
 
   // Authentication states - Strictly Firebase Auth
   const [currentUser, setCurrentUser] = useState<AppUser | null>(() => {
-    const userJson = (typeof localStorage !== 'undefined' && localStorage.getItem('appCurrentUser')) || 
-                     (typeof sessionStorage !== 'undefined' && sessionStorage.getItem('appCurrentUser'));
-    return userJson ? JSON.parse(userJson) : null;
+    try {
+      const userJson = (typeof localStorage !== 'undefined' && localStorage.getItem('appCurrentUser')) || 
+                       (typeof sessionStorage !== 'undefined' && sessionStorage.getItem('appCurrentUser'));
+      if (!userJson) return null;
+      const parsed = JSON.parse(userJson);
+      if (!parsed.permissions) {
+        parsed.permissions = {
+          view_dashboard: true,
+          view_orders: true,
+          add_orders: true,
+          edit_orders: true,
+          delete_orders: true,
+          access_settings: true
+        };
+      }
+      return parsed;
+    } catch (_) {
+      return null;
+    }
   });
 
   const [isAuthenticated, setIsAuthenticated] = useState(() => {
@@ -93,13 +143,151 @@ export default function App() {
   });
 
   const [loginPassVal, setLoginPassVal] = useState('');
-  const [loginEmailVal, setLoginEmailVal] = useState('');
-  const [registerNameVal, setRegisterNameVal] = useState('');
+  const [loginEmailVal, setLoginEmailVal] = useState(() => {
+    return (typeof localStorage !== 'undefined' && localStorage.getItem('lastLoginEmail')) || '';
+  });
+
+  // Registration profile fields (empty by default, without preset hints)
+  const [regCenterName, setRegCenterName] = useState('');
+  const [regTechnicianName, setRegTechnicianName] = useState('');
+  const [regCenterMobile, setRegCenterMobile] = useState('');
+  const [regCenterLogo, setRegCenterLogo] = useState('');
+  const [regCurrency, setRegCurrency] = useState('');
+  const [regCountry, setRegCountry] = useState('');
+  const [regCountryCode, setRegCountryCode] = useState('');
+
+  const handleCountryChange = (selectedCountryName: string) => {
+    setRegCountry(selectedCountryName);
+    const found = COUNTRIES_LIST.find(c => c.name === selectedCountryName);
+    if (found) {
+      setRegCurrency(found.currency);
+      setRegCountryCode(found.dialCode);
+    } else {
+      setRegCurrency('');
+      setRegCountryCode('');
+    }
+  };
+
+  // Camera & File capture for registration logo
+  const [isRegCameraOpen, setIsRegCameraOpen] = useState(false);
+  const regVideoRef = React.useRef<HTMLVideoElement | null>(null);
+  const regStreamRef = React.useRef<MediaStream | null>(null);
+  const regFileInputRef = React.useRef<HTMLInputElement | null>(null);
+
+  const stopRegCamera = () => {
+    if (regStreamRef.current) {
+      regStreamRef.current.getTracks().forEach(t => {
+        try { t.stop(); } catch (_) {}
+      });
+      regStreamRef.current = null;
+    }
+    if (regVideoRef.current) {
+      if (regVideoRef.current.srcObject) {
+        const stream = regVideoRef.current.srcObject as MediaStream;
+        stream.getTracks().forEach(t => {
+          try { t.stop(); } catch (_) {}
+        });
+      }
+      regVideoRef.current.srcObject = null;
+    }
+    setIsRegCameraOpen(false);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (regStreamRef.current) {
+        regStreamRef.current.getTracks().forEach(t => {
+          try { t.stop(); } catch (_) {}
+        });
+        regStreamRef.current = null;
+      }
+    };
+  }, []);
+
+  const startRegCamera = async () => {
+    try {
+      stopRegCamera();
+      setIsRegCameraOpen(true);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user', width: { ideal: 400 }, height: { ideal: 400 } }
+      });
+      regStreamRef.current = stream;
+      if (regVideoRef.current) {
+        regVideoRef.current.srcObject = stream;
+        regVideoRef.current.play().catch(() => {});
+      }
+    } catch (e) {
+      console.warn("Registration camera error:", e);
+      alert("تعذر الوصول إلى الكاميرا. يرجى التأكد من تفعيل إذن الكاميرا في المتصفح.");
+      setIsRegCameraOpen(false);
+    }
+  };
+
+  const captureRegCameraPhoto = () => {
+    if (!regVideoRef.current) return;
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = 300;
+      canvas.height = 300;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(regVideoRef.current, 0, 0, 300, 300);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+        setRegCenterLogo(dataUrl);
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      stopRegCamera();
+    }
+  };
+
+  const handleRegFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const img = new window.Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        let width = img.width;
+        let height = img.height;
+        const maxDim = 320;
+        if (width > maxDim || height > maxDim) {
+          if (width > height) {
+            height = Math.round((height * maxDim) / width);
+            width = maxDim;
+          } else {
+            width = Math.round((width * maxDim) / height);
+            height = maxDim;
+          }
+        }
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height);
+          const compressed = canvas.toDataURL('image/jpeg', 0.85);
+          setRegCenterLogo(compressed);
+        }
+      };
+      img.src = ev.target?.result as string;
+    };
+    reader.readAsDataURL(file);
+  };
+
   const [showPassword, setShowPassword] = useState(false);
   const [loginError, setLoginError] = useState('');
   const [resetSuccessMsg, setResetSuccessMsg] = useState('');
   const [authMode, setAuthMode] = useState<'firebase_login' | 'firebase_register'>('firebase_login');
   const [isAuthLoading, setIsAuthLoading] = useState(false);
+
+  // Deletion modal states for previously registered Firebase emails
+  const [showDeleteAccountModal, setShowDeleteAccountModal] = useState(false);
+  const [delEmailVal, setDelEmailVal] = useState('');
+  const [delPassVal, setDelPassVal] = useState('');
+  const [delLoading, setDelLoading] = useState(false);
+  const [delMsg, setDelMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // Microphone permission states for voice dictation
   const [micPermissionState, setMicPermissionState] = useState<'granted' | 'prompt' | 'denied' | 'unsupported'>('prompt');
@@ -134,6 +322,7 @@ export default function App() {
           const appUser: AppUser = {
             id: fbUser.uid,
             username: fbUser.email || fbUser.displayName || 'user',
+            email: fbUser.email || '',
             displayName: fbUser.displayName || fbUser.email?.split('@')[0] || 'فني صيانة معتمد',
             role: 'admin',
             permissions: {
@@ -157,12 +346,12 @@ export default function App() {
     }
   }, []);
 
-  // App URL for tracking links
-  const appUrl = window.location.origin;
+  // App URL for tracking links (uses built-in public domain or custom center domain)
+  const [appUrl, setAppUrl] = useState<string>(() => getEffectiveAppUrl());
 
-  // One-time automated system factory reset to clear out all records across LocalStorage & Firestore
+  // One-time automated local cleanup without triggering reload loops
   useEffect(() => {
-    const doFactoryReset = async () => {
+    try {
       if (localStorage.getItem('printer_settings_cleared_v1') !== 'true') {
         const keysToRemove = [
           'maintenance_printers', 'allow_select_printer_on_print', 'lblPaperSize', 
@@ -175,72 +364,25 @@ export default function App() {
         ];
         keysToRemove.forEach(k => localStorage.removeItem(k));
         localStorage.setItem('printer_settings_cleared_v1', 'true');
-        console.log("Printer settings cleared.");
-        window.location.reload();
-        return;
       }
 
       if (localStorage.getItem('removed_mock_data_v2') !== 'true') {
-         console.log("Forcing complete wipe of local orders and logs...");
-         localStorage.setItem('db_orders', '[]');
-         localStorage.setItem('db_notification_logs', '[]');
-         localStorage.setItem('removed_mock_data_v2', 'true');
-         window.location.reload();
-         return;
+        localStorage.setItem('db_orders', '[]');
+        localStorage.setItem('db_notification_logs', '[]');
+        localStorage.setItem('removed_mock_data_v2', 'true');
       }
 
       if (localStorage.getItem('removed_mock_data_v1') !== 'true') {
-         console.log("Removing experimental mock data...");
-         try {
-           const mockOrderIds = ['ORD-1001', 'ORD-1002', 'ORD-1003', 'ORD-1004'];
-           for (const id of mockOrderIds) {
-             await dbService.deleteOrder(id);
-           }
-           const mockLogIds = ['NOT-1001', 'NOT-1002', 'NOT-1003'];
-           for (const id of mockLogIds) {
-             await dbService.deleteNotificationLog(id);
-           }
-           
-           localStorage.setItem('removed_mock_data_v1', 'true');
-           console.log("Experimental data removed. Reloading...");
-           window.location.reload();
-           return;
-         } catch(e) {
-           console.error("Failed to remove mock data:", e);
-           localStorage.setItem('removed_mock_data_v1', 'true');
-         }
+        localStorage.setItem('removed_mock_data_v1', 'true');
       }
 
       if (localStorage.getItem('system_factory_reset_completed') !== 'true') {
-         console.log("Performing automated initial factory reset...");
-         try {
-           const currentOrders = await dbService.getOrders();
-           if (currentOrders.length > 0) {
-              await dbService.clearAllOrders(currentOrders);
-           }
-           const currentLogs = await dbService.getNotificationLogs();
-           if (currentLogs.length > 0) {
-              await dbService.clearAllLogs(currentLogs);
-           }
-           
-           // Clear specific localStorage keys
-           localStorage.removeItem('db_orders');
-           localStorage.removeItem('db_notification_logs');
-           localStorage.removeItem('appUsersList');
-           
-           // Mark as done so it doesn't loop
-           localStorage.setItem('system_factory_reset_completed', 'true');
-           console.log("Factory reset successful. Reloading...");
-           window.location.reload();
-           return;
-         } catch(e) {
-           console.error("Factory reset failed:", e);
-           // Still mark as done to prevent infinite loops on error
-           localStorage.setItem('system_factory_reset_completed', 'true');
-         }
+        localStorage.removeItem('appUsersList');
+        localStorage.setItem('system_factory_reset_completed', 'true');
       }
-    };
-    doFactoryReset();
+    } catch (e) {
+      console.warn("Initial local cleanup notice:", e);
+    }
   }, []);
 
   // 1. Initial mounting, database seeding, and routing
@@ -312,21 +454,41 @@ export default function App() {
     const handleStorage = () => {
       setCenterName(localStorage.getItem('centerName') || 'TECHNO');
       setCenterLogo(localStorage.getItem('centerLogo') || '');
-      const isAuth = sessionStorage.getItem('isAppAuthenticated') === 'true';
+      setAppUrl(getEffectiveAppUrl());
+      const isAuthLocal = typeof localStorage !== 'undefined' && localStorage.getItem('isAppAuthenticated') === 'true';
+      const isAuthSession = typeof sessionStorage !== 'undefined' && sessionStorage.getItem('isAppAuthenticated') === 'true';
+      const isAuth = isAuthLocal || isAuthSession;
       setIsAuthenticated(isAuth);
       if (isAuth) {
-        const userJson = sessionStorage.getItem('appCurrentUser');
-        setCurrentUser(userJson ? JSON.parse(userJson) : null);
+        try {
+          const userJson = (typeof localStorage !== 'undefined' && localStorage.getItem('appCurrentUser')) ||
+                           (typeof sessionStorage !== 'undefined' && sessionStorage.getItem('appCurrentUser'));
+          if (userJson) {
+            const parsed = JSON.parse(userJson);
+            if (!parsed.permissions) {
+              parsed.permissions = {
+                view_dashboard: true,
+                view_orders: true,
+                add_orders: true,
+                edit_orders: true,
+                delete_orders: true,
+                access_settings: true
+              };
+            }
+            setCurrentUser(parsed);
+          }
+        } catch (_) {}
       } else {
         setCurrentUser(null);
       }
     };
     window.addEventListener('storage', handleStorage);
 
-    // Deep linking: check if URL has ?track=ORD-XXXX
+    // Deep linking: check if URL has ?track=ORD-XXXX or ?customer=CUS...
     const searchParams = new URLSearchParams(window.location.search);
-    const trackId = searchParams.get('track');
-    if (trackId) {
+    const customerQueryCode = searchParams.get('customer');
+    const trackId = searchParams.get('track') || searchParams.get('tracking') || searchParams.get('id');
+    if (trackId && !customerQueryCode) {
       setOrdersSearchTerm(trackId.toUpperCase());
       setActiveTab('orders');
     }
@@ -334,8 +496,9 @@ export default function App() {
     // Load initial data
     loadAllData();
 
-    // Automatic sync and save every 5 minutes
+    // Automatic sync and save every 5 minutes (only when authenticated)
     const syncInterval = setInterval(async () => {
+      if (!auth?.currentUser) return;
       console.log("Auto-syncing with cloud every 5 minutes..."); setIsSyncing(true);
       try {
         // Backup settings and configurations
@@ -343,7 +506,15 @@ export default function App() {
 
         // Sync database records
         const synced = await dbService.syncData();
-        setOrders(synced.orders);
+        const reconciled = reconcileCustomersAndOrders(synced.customers || [], synced.orders || []);
+        setCustomers(reconciled.customers);
+        setOrders(reconciled.orders);
+        if (reconciled.changedCustomers.length > 0) {
+          dbService.saveCustomersBatch(reconciled.changedCustomers).catch(() => {});
+        }
+        if (reconciled.changedOrders.length > 0) {
+          dbService.saveOrdersBatch(reconciled.changedOrders).catch(() => {});
+        }
         setNotificationLogs(synced.logs); setLastSyncTime(new Date()); setIsSyncing(false);
       } catch (err) {
         console.warn("Auto-sync failed:", err); setIsSyncing(false);
@@ -351,6 +522,7 @@ export default function App() {
     }, 5 * 60 * 1000);
 
     const handleAuthChange = () => {
+      if (isExplicitAuthRef.current) return;
       console.log("Active Auth UID updated, reloading isolated data...");
       loadAllData();
     };
@@ -364,13 +536,44 @@ export default function App() {
       clearInterval(syncInterval);
     };
   }, []);
+
+  const applyReconciliationAndPersist = async (
+    rawCustomers: CustomerProfile[],
+    rawOrders: MaintenanceOrder[]
+  ) => {
+    const reconciled = reconcileCustomersAndOrders(rawCustomers || [], rawOrders || []);
+    setCustomers(reconciled.customers);
+    setOrders(reconciled.orders);
+    if (reconciled.changedCustomers.length > 0) {
+      dbService.saveCustomersBatch(reconciled.changedCustomers).catch((err) =>
+        console.warn("Background customer reconciliation save deferred:", err)
+      );
+    }
+    if (reconciled.changedOrders.length > 0) {
+      dbService.saveOrdersBatch(reconciled.changedOrders).catch((err) =>
+        console.warn("Background order linking save deferred:", err)
+      );
+    }
+    return reconciled;
+  };
+
+  const openCustomerProfile = (name: string, phone?: string, explicitCustomer?: CustomerProfile) => {
+    const matched =
+      explicitCustomer ||
+      customers.find((c) => {
+        if (phone && c.phone && phonesMatch(c.phone, phone)) return true;
+        return normalizeCustomerNameKey(c.name) === normalizeCustomerNameKey(name);
+      });
+    setSelectedCustomerProfile({ name, phone, customer: matched });
+  };
+
   const handleManualSync = async () => {
     if (isSyncing) return;
     setIsSyncing(true);
     try {
       await dbService.syncAppSettingsBackup();
       const synced = await dbService.syncData();
-      setOrders(synced.orders);
+      await applyReconciliationAndPersist(synced.customers || [], synced.orders || []);
       setNotificationLogs(synced.logs);
       setLastSyncTime(new Date());
     } catch (err) {
@@ -382,6 +585,7 @@ export default function App() {
   };
 
   const loadAllData = async () => {
+    const seq = ++loadSeqRef.current;
     setLoading(true);
     try {
       // 0. Sync and restore comprehensive settings and configurations on startup
@@ -391,15 +595,33 @@ export default function App() {
         console.warn("Initial app settings sync failed:", e);
       }
 
-      // 1. Bidirectional sync & Load orders and logs on startup
-      const synced = await dbService.syncData();
-      let fetchedOrders = synced.orders;
+      if (seq !== loadSeqRef.current) return;
 
-      setOrders(fetchedOrders);
+      // 1. Bidirectional sync & Load orders, customers, and logs on startup
+      const synced = await dbService.syncData();
+      if (seq !== loadSeqRef.current) return;
+      const fetchedOrders = (synced && synced.orders) ? synced.orders : [];
+      const fetchedCustomers = (synced && synced.customers) ? synced.customers : [];
+
+      const reconciled = await applyReconciliationAndPersist(fetchedCustomers, fetchedOrders);
+
+      // Deep link support for Customer Alphanumeric QR codes (?customer=CUS... or ?track=CUS...)
+      if (typeof window !== 'undefined') {
+        const sp = new URLSearchParams(window.location.search);
+        const rawLookup = (sp.get('customer') || sp.get('track') || sp.get('tracking') || sp.get('id') || '').trim().toUpperCase();
+        if (rawLookup) {
+          const matchedCust = reconciled.customers.find(
+            (c) => c.customerBarcode.trim().toUpperCase() === rawLookup
+          );
+          if (matchedCust) {
+            setSelectedCustomerProfile({ name: matchedCust.name, phone: matchedCust.phone, customer: matchedCust });
+          }
+        }
+      }
 
       // 2. Load templates (from localStorage if edited, otherwise default)
       const storedTemplates = localStorage.getItem('db_templates');
-if (storedTemplates) {
+      if (storedTemplates) {
         try {
           let loaded = JSON.parse(storedTemplates);
           let needsUpdate = false;
@@ -441,12 +663,14 @@ if (storedTemplates) {
       }
 
       // 3. Load logs
-      let fetchedLogs = synced.logs;
+      const fetchedLogs = (synced && synced.logs) ? synced.logs : [];
       setNotificationLogs(fetchedLogs);
     } catch (error) {
       console.warn("Notice: Loading application data fallback active:", error);
     } finally {
-      setLoading(false);
+      if (seq === loadSeqRef.current) {
+        setLoading(false);
+      }
     }
   };
 
@@ -456,9 +680,9 @@ if (storedTemplates) {
       // 1. Force upload of current local settings to cloud first (so local modifications are exported)
       await dbService.saveAppSettingsBackup();
       
-      // 2. Sync orders and logs bidirectionally
+      // 2. Sync orders, customers, and logs bidirectionally
       const synced = await dbService.syncData();
-      setOrders(synced.orders);
+      await applyReconciliationAndPersist(synced.customers || [], synced.orders || []);
       setNotificationLogs(synced.logs); setLastSyncTime(new Date()); setIsSyncing(false);
       
       alert('✨ تم تصدير السجلات المحلية وتطبيق التعديلات والمزامنة بنجاح!');
@@ -473,12 +697,175 @@ if (storedTemplates) {
   // 2. Action handlers
   const handleSaveOrder = async (updatedOrder: MaintenanceOrder) => {
     try {
-      await dbService.saveOrder(updatedOrder);
-      // Reload orders to reflect changes
-      const freshOrders = await dbService.getOrders();
-      setOrders(freshOrders);
+      const { linkedOrder, customer, isNewCustomer } = linkOrderWithCustomer(updatedOrder, customers, orders);
+      await dbService.saveOrder(linkedOrder);
+      if (isNewCustomer || !customers.some(c => c.id === customer.id)) {
+        await dbService.saveCustomer(customer);
+      }
+      const [freshOrders, freshCustomers] = await Promise.all([
+        dbService.getOrders(),
+        dbService.getCustomers(),
+      ]);
+      await applyReconciliationAndPersist(freshCustomers, freshOrders);
     } catch (err) {
       console.error("Failed to save order:", err);
+    }
+  };
+
+  const handleSaveCustomer = async (customer: CustomerProfile) => {
+    try {
+      const now = Date.now();
+      const cleanBarcode = sanitizeCustomCustomerBarcode(customer.customerBarcode) || customer.customerBarcode;
+      const normalized: CustomerProfile = {
+        ...customer,
+        customerBarcode: cleanBarcode,
+        createdAt: customer.createdAt || now,
+        updatedAt: now,
+      };
+      await dbService.saveCustomer(normalized);
+
+      const linkedOrdersToUpdate = orders
+        .filter((o) => o.customerId === normalized.id && o.customerBarcode !== cleanBarcode)
+        .map((o) => ({ ...o, customerBarcode: cleanBarcode }));
+      if (linkedOrdersToUpdate.length > 0) {
+        await dbService.saveOrdersBatch(linkedOrdersToUpdate);
+      }
+
+      const [freshCustomers, freshOrders] = await Promise.all([
+        dbService.getCustomers(),
+        dbService.getOrders(),
+      ]);
+      await applyReconciliationAndPersist(freshCustomers, freshOrders);
+    } catch (err) {
+      console.error("Failed to save customer:", err);
+    }
+  };
+
+  const handleUpdateCustomerBarcode = async (
+    customerId: string,
+    rawNewBarcode: string
+  ): Promise<{ ok: boolean; error?: string }> => {
+    const cleanCode = sanitizeCustomCustomerBarcode(rawNewBarcode);
+    if (!cleanCode || cleanCode.length < 3) {
+      return { ok: false, error: 'يجب أن يتكون الباركود من 3 خانات على الأقل (أحرف إنجليزية أو أرقام).' };
+    }
+
+    const duplicateCustomer = customers.find(
+      (c) => c.id !== customerId && c.customerBarcode.trim().toUpperCase() === cleanCode
+    );
+    if (duplicateCustomer) {
+      return { ok: false, error: `هذا الباركود مرتبط بالفعل بالزبون: ${duplicateCustomer.name}` };
+    }
+
+    const duplicateOrder = orders.find(
+      (o) => !isContactOrder(o) && o.id.trim().toUpperCase() === cleanCode
+    );
+    if (duplicateOrder) {
+      return { ok: false, error: `هذا الباركود مستخدم مسبقاً لطلب صيانة (${duplicateOrder.id}).` };
+    }
+
+    const target = customers.find((c) => c.id === customerId);
+    if (!target) {
+      return { ok: false, error: 'تعذر العثور على ملف الزبون لتحديث الباركود.' };
+    }
+
+    const updatedCustomer: CustomerProfile = {
+      ...target,
+      customerBarcode: cleanCode,
+      updatedAt: Date.now(),
+    };
+
+    await dbService.saveCustomer(updatedCustomer);
+
+    const ordersToUpdate = orders
+      .filter(
+        (o) =>
+          o.customerId === customerId ||
+          (o.customerBarcode && o.customerBarcode.trim().toUpperCase() === target.customerBarcode.trim().toUpperCase())
+      )
+      .map((o) => ({
+        ...o,
+        customerId,
+        customerBarcode: cleanCode,
+      }));
+    if (ordersToUpdate.length > 0) {
+      await dbService.saveOrdersBatch(ordersToUpdate);
+    }
+
+    const [freshCustomers, freshOrders] = await Promise.all([
+      dbService.getCustomers(),
+      dbService.getOrders(),
+    ]);
+    const reconciled = await applyReconciliationAndPersist(freshCustomers, freshOrders);
+    const updatedProfile = reconciled.customers.find((c) => c.id === customerId) || updatedCustomer;
+    setSelectedCustomerProfile((prev) =>
+      prev && (prev.customer?.id === customerId || normalizeCustomerNameKey(prev.name) === normalizeCustomerNameKey(target.name))
+        ? { ...prev, customer: updatedProfile }
+        : prev
+    );
+    return { ok: true };
+  };
+
+  const handleAssignBarcodeToCustomer = async (customerId: string, rawBarcode: string) => {
+    const res = await handleUpdateCustomerBarcode(customerId, rawBarcode);
+    if (!res.ok) {
+      throw new Error(res.error || 'تعذر ربط الباركود بالزبون المختار.');
+    }
+  };
+
+  const handleRegisterCustomerWithBarcode = async (
+    name: string,
+    phone: string,
+    rawBarcode: string
+  ): Promise<CustomerProfile> => {
+    const cleanCode = sanitizeCustomCustomerBarcode(rawBarcode);
+    if (!cleanCode || cleanCode.length < 3) {
+      throw new Error('رمز الباركود غير صالح (يجب أن يكون 3 خانات على الأقل).');
+    }
+
+    const duplicateCustomer = customers.find(
+      (c) => c.customerBarcode.trim().toUpperCase() === cleanCode
+    );
+    if (duplicateCustomer) {
+      throw new Error(`هذا الباركود مرتبط مسبقاً بالزبون: ${duplicateCustomer.name}`);
+    }
+
+    const duplicateOrder = orders.find(
+      (o) => !isContactOrder(o) && o.id.trim().toUpperCase() === cleanCode
+    );
+    if (duplicateOrder) {
+      throw new Error(`هذا الباركود مستخدم بالفعل في طلب صيانة (${duplicateOrder.id}).`);
+    }
+
+    const existingIds = new Set(customers.map((c) => c.id));
+    const now = Date.now();
+    const newCustomer: CustomerProfile = {
+      id: buildCustomerId(name, phone, existingIds),
+      name: name.trim(),
+      phone: phone.trim(),
+      customerBarcode: cleanCode,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    await dbService.saveCustomer(newCustomer);
+    const [freshCustomers, freshOrders] = await Promise.all([
+      dbService.getCustomers(),
+      dbService.getOrders(),
+    ]);
+    const reconciled = await applyReconciliationAndPersist(freshCustomers, freshOrders);
+    return reconciled.customers.find((c) => c.id === newCustomer.id) || newCustomer;
+  };
+
+  const handleDeleteCustomer = async (customerId: string) => {
+    try {
+      await dbService.deleteCustomer(customerId);
+      setCustomers(prev => prev.filter(c => c.id !== customerId));
+      if (selectedCustomerProfile?.customer?.id === customerId) {
+        setSelectedCustomerProfile(null);
+      }
+    } catch (err) {
+      console.error("Failed to delete customer:", err);
     }
   };
 
@@ -499,13 +886,17 @@ if (storedTemplates) {
           await dbService.clearAllOrders(orders);
           setOrders([]);
         }
-        alert('تم مسح كافة جهات الاتصال وطلبات الصيانة بالكامل بنجاح.');
+        if (customers.length > 0) {
+          await dbService.clearAllCustomers(customers);
+          setCustomers([]);
+        }
+        alert('تم مسح كافة جهات الاتصال وباركودات الزبائن وطلبات الصيانة بالكامل بنجاح.');
       } else {
         const namesToDelete = orders.filter(isContactOrder);
         
         if (namesToDelete.length > 0) {
           await dbService.clearAllOrders(namesToDelete);
-          setOrders(orders.filter(o => !isContactOrder(o)));
+          setOrders(prev => prev.filter(o => !isContactOrder(o)));
         }
         alert('تم مسح كافة الأسماء المستوردة بنجاح.');
       }
@@ -554,58 +945,90 @@ if (storedTemplates) {
     setDeliveryOrder(order);
   };
 
-  const handleConfirmDelivery = async (
-    recipientName: string,
-    relationToCustomer: string,
-    notes: string,
-    statusUpdateText: string,
-    finalCost?: number,
-    updatedDiagnosis?: string
-  ) => {
+  const handleConfirmDelivery = async (payload: DeliveryConfirmPayload) => {
     if (!deliveryOrder) return;
 
-    const actualCostVal = finalCost !== undefined && !isNaN(finalCost) ? finalCost : (deliveryOrder.actualCost ?? deliveryOrder.estimatedCost);
-    const faultDescVal = updatedDiagnosis?.trim() || deliveryOrder.faultDescription;
+    const faultDescVal = payload.updatedDiagnosis?.trim() || deliveryOrder.faultDescription;
+    const currencyVal = deliveryOrder.currency || localStorage.getItem('currencyName') || 'دينار';
 
-    const updatedOrder: MaintenanceOrder = {
+    const baseUpdatedOrder: MaintenanceOrder = {
       ...deliveryOrder,
       status: DeviceStatus.DELIVERED,
       faultDescription: faultDescVal,
-      actualCost: actualCostVal,
-      statusUpdateText: (statusUpdateText || '').trim(),
+      estimatedCost: payload.estimatedCost,
+      extraCost: payload.extraCost,
+      extraCostReason: payload.extraCostReason || '',
+      advancePayment: payload.advancePayment,
+      actualCost: payload.finalCost,
+      waitingPartsDetails: payload.waitingPartsDetails || '',
+      customVariables: payload.customVariables || [],
+      currency: currencyVal,
+      statusUpdateText: (payload.statusUpdateText || payload.notes || '').trim(),
       updatedAt: Date.now(),
+      deliveryInfo: {
+        recipientName: payload.recipientName,
+        deliveryDate: Date.now(),
+        relationToCustomer: payload.relationToCustomer,
+        notes: payload.notes
+      }
+    };
+
+    const deliveryMsg = payload.sendNotification ? payload.notificationMessage : '';
+    const snapshot = buildStatusHistorySnapshot(baseUpdatedOrder, {
+      statusNote: payload.notes || `تم تسليم الجهاز إلى ${payload.recipientName}`,
+      sentMessage: deliveryMsg || undefined,
+      notificationChannel: payload.sendNotification ? payload.notificationChannel : 'none',
+      currency: currencyVal,
+    });
+
+    const summaryParts = [
+      `تم تسليم الجهاز بنجاح إلى المستلم: (${payload.recipientName}) بصفته (${payload.relationToCustomer})`,
+      `الإجمالي المحصل: ${snapshot.totalCost} ${currencyVal}`,
+    ];
+    if (snapshot.extraCost > 0) {
+      summaryParts.push(
+        `كلف إضافية: ${snapshot.extraCost} ${currencyVal}${snapshot.extraCostReason ? ` (${snapshot.extraCostReason})` : ''}`
+      );
+    }
+    if (snapshot.waitingPartsDetails) {
+      summaryParts.push(`حالة القطع: ${snapshot.waitingPartsDetails}`);
+    }
+    summaryParts.push(`التشخيص: ${faultDescVal}`);
+
+    const updatedOrder: MaintenanceOrder = {
+      ...baseUpdatedOrder,
       statusHistory: [
         ...(deliveryOrder.statusHistory || []),
         {
           status: DeviceStatus.DELIVERED,
           timestamp: Date.now(),
-          note: `تم تسليم الجهاز بنجاح إلى المستلم: (${recipientName}) بصفته (${relationToCustomer}) - التكلفة المحصلة: ${actualCostVal} - التشخيص: ${faultDescVal}.`,
-          updatedBy: 'موظف الاستقبال'
+          note: summaryParts.join(' - '),
+          updatedBy: currentUser?.displayName || 'موظف الاستقبال',
+          snapshot
         }
       ],
-      deliveryInfo: {
-        recipientName,
-        deliveryDate: Date.now(),
-        relationToCustomer,
-        notes
-      }
     };
 
     await handleSaveOrder(updatedOrder);
     setDeliveryOrder(null);
 
-    // Auto trigger WhatsApp delivery receipt message!
-    const tpl = templates.find(t => t.statusTrigger === DeviceStatus.DELIVERED);
-    if (tpl) {
-      const msgs = formatNotification(tpl, updatedOrder, appUrl);
-      openWhatsAppDirectly(updatedOrder.customerPhone, msgs.whatsapp);
+    if (payload.sendNotification && deliveryMsg) {
+      if (payload.notificationChannel === 'whatsapp') {
+        openWhatsAppDirectly(updatedOrder.customerPhone, deliveryMsg);
+      } else {
+        const cleanPhone = (updatedOrder.customerPhone || '').replace(/[\s()-]/g, '');
+        if (cleanPhone) {
+          window.open(`sms:${cleanPhone}?body=${encodeURIComponent(deliveryMsg)}`, '_blank');
+        }
+      }
       handleLogNotification(
         updatedOrder.id,
         updatedOrder.customerName,
         updatedOrder.customerPhone,
-        'whatsapp',
-        msgs.whatsapp,
-        tpl.name
+        payload.notificationChannel,
+        deliveryMsg,
+        'تأكيد تسليم الجهاز',
+        snapshot
       );
     }
   };
@@ -617,7 +1040,8 @@ if (storedTemplates) {
     customerPhone: string,
     type: 'sms' | 'whatsapp',
     content: string,
-    triggerEvent: string
+    triggerEvent: string,
+    variablesSnapshot?: StatusHistorySnapshot
   ) => {
     const newLog: NotificationLog = {
       id: `LOG-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
@@ -628,7 +1052,8 @@ if (storedTemplates) {
       content,
       status: 'sent',
       timestamp: Date.now(),
-      triggerEvent
+      triggerEvent,
+      ...(variablesSnapshot ? { variablesSnapshot } : {})
     };
 
     await dbService.saveNotificationLog(newLog);
@@ -667,17 +1092,21 @@ if (storedTemplates) {
           order.status === DeviceStatus.DELIVERED || 
           order.status === DeviceStatus.UNREPAIRABLE || 
           order.status === DeviceStatus.READY ||
-          order.deviceType === 'جهة اتصال' ||
-          order.brandModel.includes('مستورد')
+          isContactOrder(order)
         ) {
           return false;
         }
         
         if (!order.expectedDeliveryDate) return false;
         
-        const expectedDate = new Date(order.expectedDeliveryDate);
-        // Set to end of the expected delivery day
-        expectedDate.setHours(23, 59, 59, 999);
+        const ymdMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(order.expectedDeliveryDate).trim());
+        const expectedDate = ymdMatch
+          ? new Date(Number(ymdMatch[1]), Number(ymdMatch[2]) - 1, Number(ymdMatch[3]), 23, 59, 59, 999)
+          : new Date(order.expectedDeliveryDate);
+        if (isNaN(expectedDate.getTime())) return false;
+        if (!ymdMatch) {
+          expectedDate.setHours(23, 59, 59, 999);
+        }
         const overdueMs = now - expectedDate.getTime();
         
         // Check if more than 48 hours delayed
@@ -691,7 +1120,7 @@ if (storedTemplates) {
           const hasLog = notificationLogs.some(log => log.orderId === order.id && log.triggerEvent === 'تأخير أكثر من 48 ساعة (مجدول)');
           
           if (!hasLog) {
-            const tpl = templates.find(t => t.id === 'overdue_48h') || templates.find(t => t.statusTrigger === 'overdue_48h');
+            const tpl = templates.find(t => t.id === 'overdue_48h') || templates.find(t => (t.statusTrigger as string) === 'overdue_48h');
             
             if (tpl) {
               const msgs = formatNotification(tpl, order, appUrl);
@@ -729,22 +1158,22 @@ if (storedTemplates) {
   const getOverdueMaintenanceOrders = () => {
     const threeDaysInMs = 3 * 24 * 60 * 60 * 1000;
     const now = Date.now();
-    return orders.filter(
-      (order) => order.status !== DeviceStatus.DELIVERED && (now - order.createdAt) > threeDaysInMs
+    return (orders || []).filter(
+      (order) => order && order.status !== DeviceStatus.DELIVERED && (now - (order.createdAt || now)) > threeDaysInMs
     );
   };
 
   // Search filter for orders
   const getFilteredOrders = (term: string) => {
-    if (!term.trim()) return orders;
+    if (!term || !term.trim()) return orders || [];
     const t = term.toLowerCase().trim();
-    return orders.filter(o => 
-      o.customerName.toLowerCase().includes(t) ||
-      o.customerPhone.includes(t) ||
-      o.id.toLowerCase().includes(t) ||
-      o.brandModel.toLowerCase().includes(t) ||
-      (o.notes && o.notes.toLowerCase().includes(t)) ||
-      (o.technician && o.technician.toLowerCase().includes(t))
+    return (orders || []).filter(o => 
+      (o?.customerName && o.customerName.toLowerCase().includes(t)) ||
+      (o?.customerPhone && o.customerPhone.includes(t)) ||
+      (o?.id && o.id.toLowerCase().includes(t)) ||
+      (o?.brandModel && o.brandModel.toLowerCase().includes(t)) ||
+      (o?.notes && o.notes.toLowerCase().includes(t)) ||
+      (o?.technician && o.technician.toLowerCase().includes(t))
     );
   };
 
@@ -752,55 +1181,14 @@ if (storedTemplates) {
   const handleGoogleLogin = async () => {
     setIsAuthLoading(true);
     setLoginError('');
+    isExplicitAuthRef.current = true;
     try {
       const user = await loginWithGoogle();
       const appUser: AppUser = {
         id: user.uid,
         username: user.email || 'google_user',
+        email: user.email || '',
         displayName: user.displayName || user.email?.split('@')[0] || 'فني معتمد',
-        role: 'admin',
-        permissions: {
-          view_dashboard: true,
-          view_orders: true,
-          add_orders: true,
-          edit_orders: true,
-          delete_orders: true,
-          access_settings: true
-        }
-      };
-      sessionStorage.setItem('isAppAuthenticated', 'true');
-      sessionStorage.setItem('appCurrentUser', JSON.stringify(appUser));
-      setCurrentUser(appUser);
-      setIsAuthenticated(true);
-      await loadAllData();
-    } catch (err: any) {
-      console.error("Google sign-in error:", err);
-      setLoginError(err.message || 'فشل تسجيل الدخول بحساب Google');
-    } finally {
-      setIsAuthLoading(false);
-    }
-  };
-
-  const handleEmailAuth = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!loginEmailVal.trim() || !loginPassVal.trim()) {
-      setLoginError('يرجى ملء البريد الإلكتروني وكلمة المرور');
-      return;
-    }
-    setIsAuthLoading(true);
-    setLoginError('');
-    setResetSuccessMsg('');
-    try {
-      let user;
-      if (authMode === 'firebase_register') {
-        user = await registerWithEmail(loginEmailVal, loginPassVal, registerNameVal.trim());
-      } else {
-        user = await loginWithEmail(loginEmailVal, loginPassVal);
-      }
-      const appUser: AppUser = {
-        id: user.uid,
-        username: user.email || 'technician',
-        displayName: registerNameVal.trim() || user.displayName || user.email?.split('@')[0] || 'فني صيانة معتمد',
         role: 'admin',
         permissions: {
           view_dashboard: true,
@@ -819,12 +1207,124 @@ if (storedTemplates) {
       setIsAuthenticated(true);
       await loadAllData();
     } catch (err: any) {
-      console.error("Email auth error:", err);
-      const code = err.code || '';
+      console.warn("Google sign-in notice:", err?.code || err?.message);
+      setLoginError(err.message || 'فشل تسجيل الدخول بحساب Google');
+    } finally {
+      isExplicitAuthRef.current = false;
+      setIsAuthLoading(false);
+    }
+  };
+
+  const handleEmailAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanEmail = loginEmailVal.trim();
+    const cleanPass = loginPassVal.trim();
+
+    // Verification and validation of input fields before processing
+    if (!cleanEmail) {
+      setLoginError('يرجى إدخال البريد الإلكتروني');
+      return;
+    }
+    if (!cleanEmail.includes('@') || !cleanEmail.includes('.')) {
+      setLoginError('صيغة البريد الإلكتروني غير صالحة');
+      return;
+    }
+    if (!cleanPass) {
+      setLoginError('يرجى إدخال كلمة المرور');
+      return;
+    }
+    if (cleanPass.length < 6) {
+      setLoginError('يجب أن تتكون كلمة المرور من 6 خانات أو أحرف على الأقل');
+      return;
+    }
+
+    if (authMode === 'firebase_register') {
+      if (!regCenterName.trim()) {
+        setLoginError('يرجى إدخال اسم مركز الصيانة');
+        return;
+      }
+      if (!regTechnicianName.trim()) {
+        setLoginError('يرجى إدخال اسم المهندس المسؤول / الفني');
+        return;
+      }
+      if (!regCenterMobile.trim()) {
+        setLoginError('يرجى إدخال رقم موبايل مركز الصيانة');
+        return;
+      }
+      if (!regCountry.trim()) {
+        setLoginError('يرجى اختيار اسم البلد من القائمة المنسدلة');
+        return;
+      }
+    }
+
+    setIsAuthLoading(true);
+    setLoginError('');
+    setResetSuccessMsg('');
+    isExplicitAuthRef.current = true;
+    try {
+      let user;
+      let activeDisplayName = 'فني صيانة معتمد';
+
+      if (authMode === 'firebase_register') {
+        const profilePayload: RegisterCenterProfile = {
+          centerName: regCenterName.trim(),
+          centerLogo: regCenterLogo || '',
+          technicianName: regTechnicianName.trim(),
+          centerPhone: regCenterMobile.trim(),
+          email: cleanEmail,
+          currency: regCurrency.trim() || 'دينار',
+          countryName: regCountry.trim(),
+          countryCode: regCountryCode.trim()
+        };
+        user = await registerWithEmail(cleanEmail, cleanPass, profilePayload);
+        activeDisplayName = profilePayload.technicianName || 'فني صيانة';
+        setCenterName(profilePayload.centerName);
+        if (profilePayload.centerLogo) setCenterLogo(profilePayload.centerLogo);
+      } else {
+        user = await loginWithEmail(cleanEmail, cleanPass);
+        activeDisplayName = user.displayName || localStorage.getItem('engineerName') || user.email?.split('@')[0] || 'فني صيانة معتمد';
+        const savedCenter = localStorage.getItem('centerName') || localStorage.getItem('lastRegisteredCenterName');
+        const savedLogo = localStorage.getItem('centerLogo') || localStorage.getItem('lastRegisteredCenterLogo');
+        if (savedCenter) setCenterName(savedCenter);
+        if (savedLogo) setCenterLogo(savedLogo);
+      }
+
+      const appUser: AppUser = {
+        id: user.uid,
+        username: user.email || cleanEmail || 'technician',
+        email: user.email || cleanEmail,
+        displayName: activeDisplayName,
+        role: 'admin',
+        permissions: {
+          view_dashboard: true,
+          view_orders: true,
+          add_orders: true,
+          edit_orders: true,
+          delete_orders: true,
+          access_settings: true
+        }
+      };
+      localStorage.setItem('isAppAuthenticated', 'true');
+      localStorage.setItem('appCurrentUser', JSON.stringify(appUser));
+      sessionStorage.setItem('isAppAuthenticated', 'true');
+      sessionStorage.setItem('appCurrentUser', JSON.stringify(appUser));
+      setCurrentUser(appUser);
+      setIsAuthenticated(true);
+
+      // Clean load of isolated data for this specific user UID
+      setOrders([]);
+      setCustomers([]);
+      setNotificationLogs([]);
+      await loadAllData();
+    } catch (err: any) {
+      console.warn("Email auth notice:", err?.code || err?.message);
+      const code = err?.code || '';
       if (code === 'auth/operation-not-allowed') {
         setLoginError('مزود البريد الإلكتروني غير مفعّل في لوحة Firebase Console. يرجى تفعيل (Email/Password) في قسم Authentication > Sign-in method.');
-      } else if (code === 'auth/user-not-found' || code === 'auth/invalid-credential') {
+      } else if (code === 'auth/user-not-found' || code === 'auth/invalid-credential' || code === 'auth/wrong-password') {
         setLoginError('البريد الإلكتروني أو كلمة المرور غير صحيحة');
+      } else if (code === 'auth/too-many-requests') {
+        setLoginError('تم تجاوز الحد المسموح من المحاولات، يرجى الانتظار قليلاً ثم المحاولة مرة أخرى');
       } else if (code === 'auth/email-already-in-use') {
         setLoginError('هذا البريد مسجل مسبقاً، يمكنك تسجيل الدخول به مباشرة بدلاً من إنشاء حساب جديد');
       } else if (code === 'auth/weak-password') {
@@ -832,9 +1332,10 @@ if (storedTemplates) {
       } else if (code === 'auth/invalid-email') {
         setLoginError('صيغة البريد الإلكتروني غير صحيحة');
       } else {
-        setLoginError(err.message || 'حدث خطأ أثناء المصادقة');
+        setLoginError(err?.message || 'حدث خطأ أثناء المصادقة');
       }
     } finally {
+      isExplicitAuthRef.current = false;
       setIsAuthLoading(false);
     }
   };
@@ -861,13 +1362,82 @@ if (storedTemplates) {
     await logoutUser();
     localStorage.removeItem('isAppAuthenticated');
     localStorage.removeItem('appCurrentUser');
+    localStorage.removeItem('db_app_settings_backup');
     sessionStorage.removeItem('isAppAuthenticated');
     sessionStorage.removeItem('appCurrentUser');
     setCurrentUser(null);
     setIsAuthenticated(false);
     setOrders([]);
+    setCustomers([]);
     setNotificationLogs([]);
   };
+
+  const handleDeletePreviousAccount = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const targetEmail = delEmailVal.trim().toLowerCase();
+    const targetPass = delPassVal.trim();
+    if (!targetEmail || !targetPass) {
+      setDelMsg({ type: 'error', text: 'يرجى إدخال البريد الإلكتروني وكلمة المرور للحساب المراد حذفه' });
+      return;
+    }
+    setDelLoading(true);
+    setDelMsg(null);
+    try {
+      await deleteUserAccount(targetEmail, targetPass);
+      setDelMsg({ 
+        type: 'success', 
+        text: '✓ تم حذف الحساب والبريد الإلكتروني من Firebase بنجاح! تم تحرير البريد بالكامل ويمكنك الآن تسجيله كحساب جديد.' 
+      });
+      setDelEmailVal('');
+      setDelPassVal('');
+      if (loginEmailVal.toLowerCase() === targetEmail) {
+        setLoginEmailVal('');
+      }
+      setLoginError('');
+    } catch (err: any) {
+      console.warn("Delete account notice:", err?.code || err?.message);
+      let errMsg = err?.message || 'فشل حذف الحساب';
+      if (err?.code === 'auth/wrong-password' || err?.code === 'auth/invalid-credential') {
+        errMsg = 'كلمة المرور غير صحيحة، يرجى كتابة كلمة مرور هذا الحساب لحذفه';
+      } else if (err?.code === 'auth/user-not-found') {
+        errMsg = 'هذا البريد غير موجود أو تم حذفه مسبقاً من Firebase';
+      }
+      setDelMsg({ type: 'error', text: errMsg });
+    } finally {
+      setDelLoading(false);
+    }
+  };
+
+  const handleDeleteCurrentAccount = async () => {
+    if (!window.confirm("تحذير أمان: هل أنت متأكد من رغبتك في حذف حسابك الحالي والبريد الإلكتروني من Firebase نهائياً؟\nسيتم مسح بيانات تسجيل الدخول بالكامل وتحرير هذا البريد.")) {
+      return;
+    }
+    try {
+      await deleteCurrentLoggedInAccount();
+      localStorage.removeItem('isAppAuthenticated');
+      localStorage.removeItem('appCurrentUser');
+      localStorage.removeItem('db_app_settings_backup');
+      sessionStorage.clear();
+      setCurrentUser(null);
+      setIsAuthenticated(false);
+      setOrders([]);
+      setCustomers([]);
+      setNotificationLogs([]);
+      alert("تم حذف حسابك والبريد الإلكتروني من Firebase بنجاح.");
+    } catch (err: any) {
+      console.warn("Delete current account notice:", err?.code || err?.message);
+      alert("تعذر حذف الحساب: " + (err.message || 'حدث خطأ غير متوقع'));
+    }
+  };
+
+  const userDisplayEmail = (
+    currentUser?.email ||
+    (currentUser?.username && currentUser.username.includes('@') ? currentUser.username : '') ||
+    auth?.currentUser?.email ||
+    (typeof localStorage !== 'undefined' ? (localStorage.getItem('centerEmail') || localStorage.getItem('lastLoginEmail')) : '') ||
+    currentUser?.displayName ||
+    'حساب الصيانة'
+  );
 
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col antialiased text-gray-800" dir="rtl">
@@ -918,23 +1488,29 @@ if (storedTemplates) {
               </span>
             )}
 
-            {/* User Profile Badge & Logout */}
-            <div className="flex items-center gap-2 bg-gray-50 border border-gray-200/80 px-2.5 py-1 rounded-xl">
-              <div className="w-6 h-6 rounded-full bg-teal-600 text-white flex items-center justify-center font-bold text-[10px]">
-                {currentUser?.displayName ? currentUser.displayName[0].toUpperCase() : 'U'}
+            {/* User Profile Badge & Logout (Full Email Display) */}
+            <div className="flex items-center gap-2 bg-gray-50 hover:bg-gray-100/90 border border-gray-200/80 px-2.5 py-1.5 rounded-xl transition-all">
+              <div className="w-6 h-6 rounded-lg bg-teal-600 text-white flex items-center justify-center shrink-0">
+                <Mail className="w-3.5 h-3.5" />
               </div>
-              <div className="hidden sm:flex flex-col text-right">
-                <span className="font-bold text-gray-800 text-[11px] leading-tight">
-                  {currentUser?.displayName || currentUser?.username}
+              <div className="flex flex-col text-right overflow-hidden min-w-0">
+                <span 
+                  className="font-mono font-bold text-gray-800 text-[11px] leading-tight truncate max-w-[170px] sm:max-w-[260px]"
+                  title={userDisplayEmail}
+                  dir="ltr"
+                >
+                  {userDisplayEmail}
                 </span>
-                <span className="text-[9px] text-teal-700 font-mono tracking-tight" title={getCurrentUserId()}>
-                  UID: {getCurrentUserId().slice(0, 10)}...
-                </span>
+                {currentUser?.displayName && currentUser.displayName !== userDisplayEmail && (
+                  <span className="hidden md:inline text-[9px] text-teal-700 font-sans truncate">
+                    {currentUser.displayName}
+                  </span>
+                )}
               </div>
               <button
                 onClick={handleLogout}
                 title="تسجيل الخروج والتبديل"
-                className="text-gray-400 hover:text-rose-600 p-1 rounded-lg hover:bg-white transition-all cursor-pointer ml-1"
+                className="text-gray-400 hover:text-rose-600 p-1 rounded-lg hover:bg-white transition-all cursor-pointer shrink-0 mr-0.5"
               >
                 <LogOut className="w-3.5 h-3.5" />
               </button>
@@ -943,7 +1519,7 @@ if (storedTemplates) {
 
           {/* Navigation Tabs */}
           <nav className="flex p-1 bg-gray-50 rounded-2xl border border-gray-100/60 overflow-x-auto max-w-full relative order-1 sm:order-2 mx-auto">
-            {isAuthenticated && (!currentUser || currentUser.permissions.view_dashboard) && (
+            {isAuthenticated && (!currentUser || !currentUser.permissions || currentUser.permissions.view_dashboard) && (
               <button
                 onClick={() => {
                   setActiveTab('dashboard');
@@ -970,7 +1546,7 @@ if (storedTemplates) {
               </button>
             )}
             
-            {isAuthenticated && (!currentUser || currentUser.permissions.view_orders) && (
+            {isAuthenticated && (!currentUser || !currentUser.permissions || currentUser.permissions.view_orders) && (
               <button
                 onClick={() => setActiveTab('orders')}
                 className={`relative px-4 py-2.5 rounded-xl text-xs font-sans font-extrabold transition-all flex items-center gap-2 whitespace-nowrap z-10 ${
@@ -991,7 +1567,7 @@ if (storedTemplates) {
               </button>
             )}
 
-            {isAuthenticated && (!currentUser || currentUser.permissions.view_orders) && (
+            {isAuthenticated && (!currentUser || !currentUser.permissions || currentUser.permissions.view_orders) && (
               <button
                 onClick={() => setActiveTab('completed')}
                 className={`relative px-4 py-2.5 rounded-xl text-xs font-sans font-extrabold transition-all flex items-center gap-2 whitespace-nowrap z-10 ${
@@ -1014,7 +1590,7 @@ if (storedTemplates) {
             
 
 
-            {isAuthenticated && (!currentUser || currentUser.permissions.view_orders) && (
+            {isAuthenticated && (!currentUser || !currentUser.permissions || currentUser.permissions.view_orders) && (
               <button
                 onClick={() => setActiveTab('contacts')}
                 className={`relative px-4 py-2.5 rounded-xl text-xs font-sans font-extrabold transition-all flex items-center gap-2 whitespace-nowrap z-10 ${
@@ -1056,7 +1632,7 @@ if (storedTemplates) {
               </button>
             )}
             
-            {isAuthenticated && (!currentUser || currentUser.permissions.access_settings) && (
+            {isAuthenticated && (!currentUser || !currentUser.permissions || currentUser.permissions.access_settings) && (
               <>
               <button
                 onClick={() => setActiveTab('logs')}
@@ -1123,7 +1699,9 @@ if (storedTemplates) {
                 animate={{ opacity: 1, scale: 1 }}
                 exit={{ opacity: 0, scale: 0.95 }}
                 transition={{ duration: 0.3, ease: "easeOut" }}
-                className="max-w-md w-full mx-auto my-12 bg-white rounded-3xl border border-gray-100  overflow-hidden text-right"
+                className={`w-full mx-auto my-8 bg-white rounded-3xl border border-gray-100 overflow-hidden text-right shadow-2xl transition-all duration-300 ${
+                  authMode === 'firebase_register' ? 'max-w-xl' : 'max-w-md'
+                }`}
                 dir="rtl"
               >
                 <div className="bg-gradient-to-r from-teal-700 to-teal-900 px-6 py-8 text-white text-center relative font-sans">
@@ -1136,45 +1714,28 @@ if (storedTemplates) {
                         referrerPolicy="no-referrer"
                       />
                     ) : (
-                      <Wrench className="w-8 h-8 text-teal-150 animate-pulse" />
+                      <Wrench className="w-8 h-8 text-teal-100 animate-pulse" />
                     )}
                   </div>
                   <h3 className="font-extrabold text-xl tracking-tight">{centerName || 'مركز الصيانة الذكي'}</h3>
-                  <p className="text-teal-100 text-xs mt-1.5 leading-relaxed font-medium">
-                    تسجيل الدخول السحابي الموحد - بياناتك معزولة بأمان عبر معرّف UID الخاص بك
-                  </p>
                 </div>
 
                 <div className="p-6 sm:p-8 space-y-5">
-                  {/* Google Fast Sign-In Button */}
-                  <button
-                    type="button"
-                    onClick={handleGoogleLogin}
-                    disabled={isAuthLoading}
-                    className="w-full bg-white hover:bg-gray-50 active:bg-gray-100 text-gray-700 border border-gray-300 font-sans font-bold py-3.5 px-4 rounded-2xl transition-all text-xs flex items-center justify-center gap-3 shadow-sm cursor-pointer disabled:opacity-50"
-                  >
-                    <svg className="w-4 h-4 flex-shrink-0" viewBox="0 0 24 24">
-                      <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
-                      <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
-                      <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z" />
-                      <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z" />
-                    </svg>
-                    <span>الدخول السريع عبر Google</span>
-                  </button>
 
-                  <div className="relative flex items-center justify-center my-3">
-                    <div className="border-t border-gray-200 w-full"></div>
-                    <span className="bg-white px-3 text-[11px] text-gray-400 font-sans font-medium whitespace-nowrap">
-                      أو بواسطة البريد الإلكتروني
-                    </span>
-                    <div className="border-t border-gray-200 w-full"></div>
-                  </div>
 
                   {/* Auth Mode Tabs: Login / Register */}
                   <div className="flex bg-gray-100 p-1 rounded-xl text-xs font-sans font-bold">
                     <button
                       type="button"
-                      onClick={() => { setAuthMode('firebase_login'); setLoginError(''); setResetSuccessMsg(''); }}
+                      onClick={() => { 
+                        setAuthMode('firebase_login'); 
+                        setLoginError(''); 
+                        setResetSuccessMsg(''); 
+                        stopRegCamera(); 
+                        const savedEmail = (typeof localStorage !== 'undefined' && localStorage.getItem('lastLoginEmail')) || '';
+                        setLoginEmailVal(savedEmail);
+                        setLoginPassVal('');
+                      }}
                       className={`flex-1 py-2 rounded-lg transition-all cursor-pointer ${
                         authMode === 'firebase_login' ? 'bg-white text-teal-800 shadow-sm' : 'text-gray-500 hover:text-gray-800'
                       }`}
@@ -1183,7 +1744,21 @@ if (storedTemplates) {
                     </button>
                     <button
                       type="button"
-                      onClick={() => { setAuthMode('firebase_register'); setLoginError(''); setResetSuccessMsg(''); }}
+                      onClick={() => { 
+                        setAuthMode('firebase_register'); 
+                        setLoginError(''); 
+                        setResetSuccessMsg(''); 
+                        // Empty all fields without hints
+                        setRegCenterName('');
+                        setRegTechnicianName('');
+                        setRegCenterMobile('');
+                        setRegCenterLogo('');
+                        setRegCurrency('');
+                        setRegCountry('');
+                        setRegCountryCode('');
+                        setLoginEmailVal('');
+                        setLoginPassVal('');
+                      }}
                       className={`flex-1 py-2 rounded-lg transition-all cursor-pointer ${
                         authMode === 'firebase_register' ? 'bg-white text-teal-800 shadow-sm' : 'text-gray-500 hover:text-gray-800'
                       }`}
@@ -1194,36 +1769,184 @@ if (storedTemplates) {
 
                   {/* Firebase Email & Password Form */}
                   <form onSubmit={handleEmailAuth} className="space-y-4">
-                    {/* Full Name field (Only in register mode) */}
+                    {/* Full Maintenance Center Onboarding Fields for New Users */}
                     {authMode === 'firebase_register' && (
-                      <div className="space-y-1.5 text-right">
-                        <label className="block text-gray-700 font-sans font-bold text-xs flex items-center gap-1.5 justify-end">
-                          <User className="w-3.5 h-3.5 text-teal-600" />
-                          <span>الاسم الكامل / اسم الفني أو المحل</span>
-                        </label>
-                        <input
-                          type="text"
-                          placeholder="مثال: أحمد محمد (فني الصيانة)"
-                          value={registerNameVal}
-                          onChange={(e) => setRegisterNameVal(e.target.value)}
-                          className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-xl font-sans text-right text-xs focus:bg-white focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 outline-none transition-all font-medium"
-                          required
-                        />
+                      <div className="space-y-4 animate-in fade-in duration-200">
+                        {/* 1. Center Logo with Upload and Camera */}
+                        <div className="bg-emerald-50/60 p-4 rounded-2xl border border-emerald-200/80 space-y-3">
+                          <label className="block text-gray-800 font-sans font-extrabold text-xs flex items-center gap-1.5 justify-end">
+                            <ImageIcon className="w-4 h-4 text-teal-700" />
+                            <span>شعار المركز</span>
+                          </label>
+                          <div className="flex flex-col sm:flex-row items-center gap-4">
+                            {/* Logo Preview box */}
+                            <div className="relative w-24 h-24 rounded-2xl bg-white border-2 border-dashed border-teal-300 flex items-center justify-center overflow-hidden shrink-0 shadow-xs">
+                              {regCenterLogo ? (
+                                <>
+                                  <img src={regCenterLogo} alt="Logo" className="w-full h-full object-cover" />
+                                  <button
+                                    type="button"
+                                    onClick={() => setRegCenterLogo('')}
+                                    className="absolute inset-0 bg-black/60 opacity-0 hover:opacity-100 transition-opacity flex items-center justify-center text-white cursor-pointer"
+                                    title="حذف الشعار"
+                                  >
+                                    <Trash2 className="w-4 h-4 text-rose-300" />
+                                  </button>
+                                </>
+                              ) : (
+                                <div className="text-center p-2 text-gray-400">
+                                  <ImageIcon className="w-7 h-7 mx-auto mb-1 opacity-50 text-teal-600" />
+                                  <span className="text-[9px] font-bold block text-gray-400">شعار المركز</span>
+                                </div>
+                              )}
+                            </div>
+
+                            <div className="space-y-2 w-full text-right">
+                              <div className="flex flex-wrap gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => regFileInputRef.current?.click()}
+                                  className="px-3 py-2 bg-white hover:bg-gray-50 border border-gray-200 text-gray-700 text-xs font-bold rounded-xl transition-all flex items-center gap-1.5 cursor-pointer shadow-xs active:scale-95"
+                                >
+                                  <Upload className="w-3.5 h-3.5 text-teal-600" />
+                                  <span>اختيار ملف صورة الشعار</span>
+                                </button>
+
+                                <button
+                                  type="button"
+                                  onClick={isRegCameraOpen ? stopRegCamera : startRegCamera}
+                                  className={`px-3 py-2 text-xs font-bold rounded-xl transition-all flex items-center gap-1.5 cursor-pointer shadow-xs active:scale-95 ${
+                                    isRegCameraOpen
+                                      ? 'bg-rose-50 text-rose-600 border border-rose-200'
+                                      : 'bg-white hover:bg-gray-50 text-gray-700 border border-gray-200'
+                                  }`}
+                                >
+                                  <Camera className="w-3.5 h-3.5 text-teal-600" />
+                                  <span>{isRegCameraOpen ? 'إيقاف الكاميرا' : 'التقاط صورة فورا بالكاميرا'}</span>
+                                </button>
+                              </div>
+                              <p className="text-[10px] text-gray-500 leading-normal font-sans">
+                                يدعم صيغ JPG, PNG. يتم ضغط الصورة تلقائياً لسرعة تحميل الفاتورة وتوفير مساحة التخزين.
+                              </p>
+
+                              {isRegCameraOpen && (
+                                <div className="mt-2 bg-black rounded-xl p-2.5 flex flex-col items-center gap-2">
+                                  <video ref={regVideoRef} autoPlay playsInline className="w-48 h-48 object-cover rounded-lg border-2 border-teal-500" />
+                                  <div className="flex gap-2">
+                                    <button
+                                      type="button"
+                                      onClick={captureRegCameraPhoto}
+                                      className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-lg cursor-pointer"
+                                    >
+                                      التقاط الصورة الآن
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={stopRegCamera}
+                                      className="px-3 py-1.5 bg-gray-600 hover:bg-gray-700 text-white text-xs font-bold rounded-lg cursor-pointer"
+                                    >
+                                      إلغاء
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+
+                            <input
+                              type="file"
+                              ref={regFileInputRef}
+                              accept="image/*"
+                              onChange={handleRegFileChange}
+                              className="hidden"
+                            />
+                          </div>
+                        </div>
+
+                        {/* 2. Center Name */}
+                        <div className="space-y-1.5 text-right">
+                          <label className="block text-gray-700 font-sans font-bold text-xs flex items-center gap-1.5 justify-end">
+                            <Building2 className="w-3.5 h-3.5 text-teal-600" />
+                            <span>اسم المركز</span>
+                          </label>
+                          <input
+                            type="text"
+                            value={regCenterName}
+                            onChange={(e) => setRegCenterName(e.target.value)}
+                            className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-xl font-sans text-right text-xs focus:bg-white focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 outline-none transition-all font-bold"
+                            required
+                          />
+                        </div>
+
+                        {/* 3. Technician Name */}
+                        <div className="space-y-1.5 text-right">
+                          <label className="block text-gray-700 font-sans font-bold text-xs flex items-center gap-1.5 justify-end">
+                            <User className="w-3.5 h-3.5 text-teal-600" />
+                            <span>اسم المهندس</span>
+                          </label>
+                          <input
+                            type="text"
+                            value={regTechnicianName}
+                            onChange={(e) => setRegTechnicianName(e.target.value)}
+                            className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-xl font-sans text-right text-xs focus:bg-white focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 outline-none transition-all font-bold"
+                            required
+                          />
+                        </div>
+
+                        {/* 4. Center Mobile Phone */}
+                        <div className="space-y-1.5 text-right">
+                          <label className="block text-gray-700 font-sans font-bold text-xs flex items-center gap-1.5 justify-end">
+                            <Phone className="w-3.5 h-3.5 text-teal-600" />
+                            <span>رقم الموبايل</span>
+                          </label>
+                          <input
+                            type="tel"
+                            value={regCenterMobile}
+                            onChange={(e) => setRegCenterMobile(e.target.value)}
+                            className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-xl font-mono text-center text-xs focus:bg-white focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 outline-none transition-all font-bold"
+                            dir="ltr"
+                            required
+                          />
+                        </div>
+
+                        {/* 5. Country Selection Dropdown (Currency & Dial Code automatically mapped & hidden) */}
+                        <div className="space-y-1.5 text-right">
+                          <label className="block text-gray-700 font-sans font-bold text-xs flex items-center gap-1.5 justify-end">
+                            <Globe className="w-3.5 h-3.5 text-teal-600" />
+                            <span>اسم البلد</span>
+                          </label>
+                          <select
+                            value={regCountry}
+                            onChange={(e) => handleCountryChange(e.target.value)}
+                            className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-xl font-sans text-right text-xs focus:bg-white focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 outline-none transition-all font-bold cursor-pointer"
+                            required
+                          >
+                            <option value="">-- اختر اسم البلد من القائمة --</option>
+                            {COUNTRIES_LIST.map((country) => (
+                              <option key={country.name} value={country.name}>
+                                {country.name}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
                       </div>
                     )}
 
-                    {/* Email field */}
+                    {/* Email field (Shared for Login and Register) */}
                     <div className="space-y-1.5 text-right">
                       <label className="block text-gray-700 font-sans font-bold text-xs flex items-center gap-1.5 justify-end">
                         <Mail className="w-3.5 h-3.5 text-teal-600" />
-                        <span>البريد الإلكتروني (Email)</span>
+                        <span>
+                          {authMode === 'firebase_register'
+                            ? 'البريد الإلكتروني للمركز (لحجز مساحة التخزين السحابي)'
+                            : 'البريد الإلكتروني (Email)'}
+                        </span>
                       </label>
                       <input
                         type="email"
-                        placeholder="name@example.com"
                         value={loginEmailVal}
                         onChange={(e) => { setLoginEmailVal(e.target.value); setLoginError(''); setResetSuccessMsg(''); }}
                         className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-xl font-sans text-center text-xs focus:bg-white focus:ring-2 focus:ring-teal-500/20 focus:border-teal-500 outline-none transition-all font-medium"
+                        dir="ltr"
                         required
                       />
                     </div>
@@ -1248,7 +1971,6 @@ if (storedTemplates) {
                       <div className="relative">
                         <input
                           type={showPassword ? "text" : "password"}
-                          placeholder="لا تقل عن 6 أحرف"
                           value={loginPassVal}
                           onChange={(e) => { 
                             setLoginPassVal(e.target.value); 
@@ -1289,6 +2011,20 @@ if (storedTemplates) {
                         <div className="font-bold flex items-center gap-1.5 text-rose-700">
                           <span>⚠️ {loginError}</span>
                         </div>
+                        {authMode === 'firebase_register' && (loginError.includes('مسجل مسبقاً') || loginError.includes('already-in-use')) && (
+                          <div className="pt-1">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setAuthMode('firebase_login');
+                                setLoginError('');
+                              }}
+                              className="px-3 py-1.5 bg-teal-600 hover:bg-teal-700 text-white rounded-lg text-xs font-bold transition-all cursor-pointer shadow-xs inline-flex items-center gap-1.5"
+                            >
+                              <span>التبديل إلى تسجيل الدخول بهذا البريد فوراً ←</span>
+                            </button>
+                          </div>
+                        )}
                         {loginError.includes('Firebase Console') && (
                           <div className="bg-white/80 p-2.5 rounded-xl border border-rose-100 text-[11px] leading-relaxed text-gray-700 space-y-1">
                             <p className="font-bold text-teal-800">لتفعيل تسجيل الدخول الآن:</p>
@@ -1319,51 +2055,9 @@ if (storedTemplates) {
                         </>
                       )}
                     </button>
-                  </form>
 
-                  {/* Microphone Permission Pre-Activation Before Opening The App */}
-                  <div className="bg-emerald-50/80 border border-emerald-200/90 rounded-2xl p-4 text-right space-y-2.5 mt-4 font-sans shadow-xs">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-1.5">
-                        <Mic className="w-4 h-4 text-emerald-700" />
-                        <span className="font-bold text-xs text-emerald-950">
-                          صلاحية المايكروفون للإدخال الصوتي
-                        </span>
-                      </div>
-                      {micPermissionState === 'granted' ? (
-                        <span className="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full flex items-center gap-1 border border-emerald-200">
-                          <CheckCircle2 className="w-3 h-3 text-emerald-600" /> مفعل
-                        </span>
-                      ) : (
-                        <span className="text-[10px] bg-amber-100 text-amber-800 font-bold px-2 py-0.5 rounded-full border border-amber-200">
-                          بانتظار الإذن
-                        </span>
-                      )}
-                    </div>
-                    <p className="text-[11px] text-gray-600 leading-relaxed font-medium">
-                      فعّل المايكروفون الآن قبل فتح التطبيق لتتمكن من إملاء أسماء الزبائن، تفاصيل الأعطال، والملاحظات بالصوت مباشرة دون الحاجة للكتابة اليدوية.
-                    </p>
-                    {micPermissionState !== 'granted' ? (
-                      <button
-                        type="button"
-                        onClick={handleActivateMicrophone}
-                        disabled={isActivatingMic}
-                        className="w-full py-2.5 px-3 bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 shadow-xs cursor-pointer disabled:opacity-50"
-                      >
-                        {isActivatingMic ? (
-                          <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-                        ) : (
-                          <Mic className="w-4 h-4" />
-                        )}
-                        <span>السماح باستخدام المايكروفون الآن</span>
-                      </button>
-                    ) : (
-                      <div className="text-[11px] text-emerald-800 font-bold flex items-center gap-1.5 justify-center py-2 bg-white/90 rounded-xl border border-emerald-200">
-                        <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                        <span>المايكروفون مفعل وجاهز للإدخال الصوتي فور فتح التطبيق</span>
-                      </div>
-                    )}
-                  </div>
+
+                  </form>
                 </div>
               </motion.div>
             ) : (
@@ -1389,7 +2083,15 @@ if (storedTemplates) {
                       onSendWhatsAppReminder={handleSendWhatsAppReminder}
                       overdueOrders={getOverdueMaintenanceOrders()}
                       onScanClick={() => setIsScannerOpen(true)}
-                      onViewCustomer={(name, phone) => setSelectedCustomerProfile({ name, phone })}
+                      onViewCustomer={(name, phone) => openCustomerProfile(name, phone)}
+                      canAddOrder={currentUser?.permissions ? currentUser.permissions.add_orders : true}
+                      onAddOrderClick={() => {
+                        setPrefillCustomerForAdd(null);
+                        setOrdersSearchTerm('');
+                        setOrdersStatusFilter('all');
+                        setOpenAddOrderModal(true);
+                        setActiveTab('orders');
+                      }}
                     />
                   </motion.div>
                 )}
@@ -1404,6 +2106,7 @@ if (storedTemplates) {
                   >
                     <OrdersView
                       orders={orders}
+                      customers={customers}
                       viewType="active"
                       templates={templates}
                       appUrl={appUrl}
@@ -1418,7 +2121,11 @@ if (storedTemplates) {
                       initialStatusFilter={ordersStatusFilter}
                       onClearInitialStatusFilter={() => setOrdersStatusFilter('')}
                       currentUser={currentUser}
-                      onViewCustomer={(name, phone) => setSelectedCustomerProfile({ name, phone })}
+                      onViewCustomer={(name, phone) => openCustomerProfile(name, phone)}
+                      initialOpenAddModal={openAddOrderModal}
+                      onClearInitialOpenAddModal={() => setOpenAddOrderModal(false)}
+                      initialPrefillCustomer={prefillCustomerForAdd}
+                      onClearInitialPrefillCustomer={() => setPrefillCustomerForAdd(null)}
                     />
                   </motion.div>
                 )}
@@ -1433,6 +2140,7 @@ if (storedTemplates) {
                   >
                     <OrdersView
                       orders={orders}
+                      customers={customers}
                       viewType="completed"
                       templates={templates}
                       appUrl={appUrl}
@@ -1447,7 +2155,7 @@ if (storedTemplates) {
                       initialStatusFilter={ordersStatusFilter}
                       onClearInitialStatusFilter={() => setOrdersStatusFilter('')}
                       currentUser={currentUser}
-                      onViewCustomer={(name, phone) => setSelectedCustomerProfile({ name, phone })}
+                      onViewCustomer={(name, phone) => openCustomerProfile(name, phone)}
                     />
                   </motion.div>
                 )}
@@ -1463,12 +2171,16 @@ if (storedTemplates) {
                     transition={{ duration: 0.3, ease: "easeOut" }}
                   >
                     <ContactsView
+                      customers={customers}
                       orders={orders}
                       onSaveOrder={handleSaveOrder}
                       onDeleteOrder={handleDeleteOrder}
+                      onSaveCustomer={handleSaveCustomer}
+                      onDeleteCustomer={handleDeleteCustomer}
+                      onScanClick={() => setIsScannerOpen(true)}
                       currentUser={currentUser}
                       onClearNames={handleClearNames}
-                      onViewCustomer={(name, phone) => setSelectedCustomerProfile({ name, phone })}
+                      onViewCustomer={(name, phone, customer) => openCustomerProfile(name, phone, customer)}
                     />
                   </motion.div>
                 )}
@@ -1482,7 +2194,7 @@ if (storedTemplates) {
                   >
                     <LogsView 
                       notificationLogs={notificationLogs}
-                      onViewCustomer={(name, phone) => setSelectedCustomerProfile({ name, phone })}
+                      onViewCustomer={(name, phone) => openCustomerProfile(name, phone)}
                     />
                   </motion.div>
                 )}
@@ -1503,7 +2215,9 @@ if (storedTemplates) {
                       orders={orders}
                       onClearAllOrders={handleClearAllOrders}
                       onSettingsSaved={() => {
-                        setIsAuthenticated(sessionStorage.getItem('isAppAuthenticated') === 'true');
+                        const isAuthLocal = localStorage.getItem('isAppAuthenticated') === 'true';
+                        const isAuthSession = sessionStorage.getItem('isAppAuthenticated') === 'true';
+                        setIsAuthenticated(isAuthLocal || isAuthSession);
 
                         // Reload templates from localStorage to sync any auto-replacements
                         const storedTemplates = localStorage.getItem('db_templates');
@@ -1518,8 +2232,11 @@ if (storedTemplates) {
                         dbService.saveAppSettingsBackup(); // Trigger immediate cloud/local backup of settings
                       }}
                       onRefreshData={async () => {
-                        const freshOrders = await dbService.getOrders();
-                        setOrders(freshOrders);
+                        const [freshOrders, freshCustomers] = await Promise.all([
+                          dbService.getOrders(),
+                          dbService.getCustomers(),
+                        ]);
+                        await applyReconciliationAndPersist(freshCustomers, freshOrders);
                       }}
                       onForceSync={handleForceSync}
                     />
@@ -1533,17 +2250,62 @@ if (storedTemplates) {
       {isScannerOpen && (
         <ScannerModal
           onClose={() => setIsScannerOpen(false)}
+          customers={customers}
+          orders={orders}
+          onOpenCustomerProfile={(cust) => {
+            setIsScannerOpen(false);
+            openCustomerProfile(cust.name, cust.phone, cust);
+          }}
+          onSelectOrder={(foundOrder) => {
+            setIsScannerOpen(false);
+            const isCompleted =
+              foundOrder.status === DeviceStatus.DELIVERED ||
+              foundOrder.status === DeviceStatus.UNREPAIRABLE;
+            setScannedOrderId(foundOrder.id);
+            setOrdersSearchTerm(foundOrder.id);
+            setActiveTab(isCompleted ? 'completed' : 'orders');
+          }}
+          onNewOrderForCustomer={(cust) => {
+            setIsScannerOpen(false);
+            setPrefillCustomerForAdd({ name: cust.name, phone: cust.phone });
+            setOrdersSearchTerm('');
+            setOrdersStatusFilter('all');
+            setOpenAddOrderModal(true);
+            setActiveTab('orders');
+          }}
+          onAssignBarcodeToCustomer={handleAssignBarcodeToCustomer}
+          onRegisterCustomerWithBarcode={handleRegisterCustomerWithBarcode}
           onScan={(result) => {
             setIsScannerOpen(false);
-            const scannedId = result.trim().toUpperCase();
-            const foundOrder = orders.find(o => o.id.toUpperCase() === scannedId);
-            
-            if (foundOrder && foundOrder.customerPhone) {
-              // Go directly to the customer's record in OrdersView
-              setOrdersSearchTerm(foundOrder.customerPhone);
-              setActiveTab('orders');
+            const scannedId = extractScannedBarcodeId(result);
+            if (!scannedId) return;
+
+            const matchedCustomer = customers.find(
+              c =>
+                c.customerBarcode.trim().toUpperCase() === scannedId ||
+                phonesMatch(c.phone, scannedId)
+            );
+            if (matchedCustomer) {
+              openCustomerProfile(matchedCustomer.name, matchedCustomer.phone, matchedCustomer);
+              return;
+            }
+
+            const foundOrder = orders.find(
+              o =>
+                o.id.toUpperCase() === scannedId ||
+                (o.serialNumber && o.serialNumber.toUpperCase() === scannedId) ||
+                (o.deviceBarcode && o.deviceBarcode.toUpperCase() === scannedId) ||
+                phonesMatch(o.customerPhone, scannedId)
+            );
+
+            setScannedOrderId(scannedId);
+            if (foundOrder) {
+              const isCompleted =
+                foundOrder.status === DeviceStatus.DELIVERED ||
+                foundOrder.status === DeviceStatus.UNREPAIRABLE;
+              setOrdersSearchTerm(foundOrder.id);
+              setActiveTab(isCompleted ? 'completed' : 'orders');
             } else {
-              setScannedOrderId(scannedId);
               setOrdersSearchTerm(scannedId);
               setActiveTab('orders');
             }
@@ -1567,6 +2329,8 @@ if (storedTemplates) {
       {deliveryOrder && (
         <DeliverDeviceModal
           order={deliveryOrder}
+          templates={templates}
+          appUrl={appUrl}
           onConfirm={handleConfirmDelivery}
           onClose={() => setDeliveryOrder(null)}
         />
@@ -1575,6 +2339,8 @@ if (storedTemplates) {
       {/* Customer Full Profile, History & Reports Modal */}
       {selectedCustomerProfile && (
         <CustomerProfileModal
+          customer={selectedCustomerProfile.customer}
+          customers={customers}
           customerName={selectedCustomerProfile.name}
           customerPhone={selectedCustomerProfile.phone}
           orders={orders}
@@ -1583,6 +2349,7 @@ if (storedTemplates) {
           appUrl={appUrl}
           currentUser={currentUser}
           onSaveOrder={handleSaveOrder}
+          onUpdateCustomerBarcode={handleUpdateCustomerBarcode}
           onTriggerDelivery={(order) => setDeliveryOrder(order)}
           onLogNotification={handleLogNotification}
           onClose={() => setSelectedCustomerProfile(null)}
@@ -1593,10 +2360,105 @@ if (storedTemplates) {
           }}
           onOpenNewOrderForCustomer={(name, phone) => {
             setSelectedCustomerProfile(null);
-            setOrdersSearchTerm(phone || name);
+            setPrefillCustomerForAdd({ name, phone: phone || '' });
+            setOrdersSearchTerm('');
+            setOrdersStatusFilter('all');
+            setOpenAddOrderModal(true);
             setActiveTab('orders');
           }}
         />
+      )}
+
+      {/* Delete Previous Account Modal */}
+      {showDeleteAccountModal && (
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 backdrop-blur-xs animate-in fade-in duration-150">
+          <div className="bg-white rounded-3xl max-w-md w-full p-6 shadow-2xl border border-gray-100 space-y-4 text-right">
+            <div className="flex justify-between items-center border-b border-gray-100 pb-3">
+              <button
+                type="button"
+                onClick={() => setShowDeleteAccountModal(false)}
+                className="p-1 rounded-full text-gray-400 hover:text-gray-600 hover:bg-gray-100 cursor-pointer"
+              >
+                ✕
+              </button>
+              <div className="flex items-center gap-2 text-rose-600 font-bold text-sm">
+                <span>حذف بريد أو حساب سابق من Firebase</span>
+                <Trash2 className="w-4 h-4" />
+              </div>
+            </div>
+
+            <div className="bg-rose-50/70 p-3 rounded-2xl border border-rose-200/60 text-xs text-rose-900 leading-relaxed space-y-2">
+              <p className="font-bold">خيارات حذف الإيميلات المسجلة في Firebase:</p>
+              <div className="space-y-2 text-[11px]">
+                <div>
+                  <p className="mb-1">1. <strong>لوحة تحكم Firebase المباشرة (دون كلمة مرور وبضغطة واحدة):</strong></p>
+                  <a
+                    href="https://console.firebase.google.com/project/gen-lang-client-0706732363/authentication/users"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl font-bold transition-all shadow-xs text-[11px]"
+                  >
+                    <span>فتح قائمة مستخدمي Firebase Console وحذف أي إيميل فوراً ↗</span>
+                  </a>
+                </div>
+                <div className="pt-1 border-t border-rose-200/60">
+                  <p>2. <strong>أو الحذف المباشر من هنا بإدخال كلمة مرور الحساب:</strong></p>
+                </div>
+              </div>
+            </div>
+
+            <form onSubmit={handleDeletePreviousAccount} className="space-y-3 pt-1">
+              <div className="space-y-1">
+                <label className="block text-gray-700 font-bold text-xs">البريد الإلكتروني المراد حذفه:</label>
+                <input
+                  type="email"
+                  value={delEmailVal}
+                  onChange={(e) => setDelEmailVal(e.target.value)}
+                  className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl font-sans text-center text-xs focus:bg-white outline-none font-medium"
+                  dir="ltr"
+                  required
+                />
+              </div>
+
+              <div className="space-y-1">
+                <label className="block text-gray-700 font-bold text-xs">كلمة مرور هذا الحساب:</label>
+                <input
+                  type="password"
+                  value={delPassVal}
+                  onChange={(e) => setDelPassVal(e.target.value)}
+                  className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-xl font-mono text-center text-xs focus:bg-white outline-none font-medium"
+                  dir="ltr"
+                  required
+                />
+              </div>
+
+              {delMsg && (
+                <div className={`p-2.5 rounded-xl text-xs font-sans text-center border ${
+                  delMsg.type === 'success' ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-rose-50 border-rose-200 text-rose-800'
+                }`}>
+                  {delMsg.text}
+                </div>
+              )}
+
+              <div className="flex gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowDeleteAccountModal(false)}
+                  className="flex-1 py-2.5 px-3 rounded-xl border border-gray-200 text-gray-600 text-xs font-bold hover:bg-gray-50 cursor-pointer"
+                >
+                  إغلاق
+                </button>
+                <button
+                  type="submit"
+                  disabled={delLoading}
+                  className="flex-1 py-2.5 px-3 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold transition-all cursor-pointer shadow-md disabled:opacity-50 flex items-center justify-center gap-1.5"
+                >
+                  {delLoading ? 'جاري الحذف...' : 'حذف الحساب نهائياً'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
       )}
 
     </div>

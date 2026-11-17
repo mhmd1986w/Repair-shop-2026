@@ -1,4 +1,5 @@
 export const isContactOrder = (o: any) => {
+  if (!o || typeof o !== 'object') return false;
   return o.deviceType === 'جهة اتصال' || 
          o.brandModel === 'مستورد من الهاتف' || 
          o.brandModel === 'مستورد من VCF' || 
@@ -27,16 +28,59 @@ export interface MaintenancePhoto {
   takenBy?: string;              // اسم الفني الذي قام بالتصوير
 }
 
+export interface CustomNotificationVariable {
+  key: string;
+  label: string;
+  value: string;
+}
+
+export interface StatusHistorySnapshot {
+  statusLabel?: string;
+  faultDescription?: string;
+  estimatedCost: number;
+  extraCost: number;
+  extraCostReason?: string;
+  actualCost?: number;
+  totalCost: number;
+  advancePayment: number;
+  remainingCost: number;
+  currency: string;
+  waitingPartsDetails?: string;
+  waitingPartsExpectedDate?: string;
+  expectedDeliveryDate?: string;
+  technician?: string;
+  statusUpdateText?: string;
+  recipientName?: string;
+  relationToCustomer?: string;
+  sentMessage?: string;
+  notificationChannel?: 'whatsapp' | 'sms' | 'none';
+  customVariables?: CustomNotificationVariable[];
+}
+
 export interface StatusHistoryEntry {
   status: DeviceStatus;
   timestamp: number;
   note: string;
   updatedBy: string;
   photos?: MaintenancePhoto[];
+  snapshot?: StatusHistorySnapshot;
+}
+
+export interface CustomerProfile {
+  id: string;                    // معرّف الزبون الدائم
+  name: string;                  // اسم الزبون
+  phone: string;                 // رقم الهاتف
+  customerBarcode: string;       // الباركود الفريد المربوط بهذا الزبون
+  notes?: string;                // ملاحظات إضافية عن الزبون
+  createdAt: number;             // تاريخ التسجيل
+  updatedAt: number;             // تاريخ التحديث
 }
 
 export interface MaintenanceOrder {
   id: string;                    // رقم الطلب (مثلاً: Order-1001)
+  customerId?: string;           // معرّف الزبون المرتبط
+  customerBarcode?: string;      // باركود الزبون المرتبط بهذا الطلب
+  deviceBarcode?: string;        // باركود إضافي للجهاز إن وجد
   customerName: string;          // اسم العميل
   customerPhone: string;         // رقم هاتف العميل
   deviceType: string;            // نوع الجهاز (هاتف، لابتوب، تابلت، إلخ)
@@ -44,8 +88,14 @@ export interface MaintenanceOrder {
   serialNumber: string;          // الرقم التسلسلي للجهاز
   faultDescription: string;      // وصف العطل
   estimatedCost: number;         // التكلفة المتوقعة
+  extraCost?: number;            // الكلف الإضافية (قطع أو صيانة إضافية)
+  extraCostReason?: string;      // سبب أو بيان الكلفة الإضافية
+  advancePayment?: number;        // الدفعة المقدمة (العربون)
   actualCost?: number;           // التكلفة الفعلية (تحدد عند الانتهاء)
   currency?: string;             // العملة المحددة للطلب (مثل: USD, SAR, JOD, ... إلخ)
+  waitingPartsDetails?: string;  // تفاصيل انتظار القطع (إن وجدت)
+  waitingPartsExpectedDate?: string; // موعد وصول القطعة المتوقع
+  customVariables?: CustomNotificationVariable[]; // متغيرات مخصصة إضافية
   expectedDeliveryDate: string;  // تاريخ التسليم المتوقع (YYYY-MM-DD)
   status: DeviceStatus;          // الحالة الحالية
   statusUpdateText?: string;     // نص تحديث الحالة (ينتقل مع تغير الحالة)
@@ -89,11 +139,13 @@ export interface NotificationLog {
   status: 'sent' | 'pending' | 'failed';
   timestamp: number;
   triggerEvent: string; // تم الاستلام، جاهز، تذكير بموعد، إلخ
+  variablesSnapshot?: StatusHistorySnapshot;
 }
 
 export interface AppUser {
   id: string;
   username: string;
+  email?: string;
   password?: string;
   displayName: string;
   role: 'admin' | 'engineer' | 'viewer';

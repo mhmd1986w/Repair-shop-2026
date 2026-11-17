@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { MaintenanceOrder, DeviceStatus, NotificationTemplate, NotificationLog, AppUser, isContactOrder, MaintenancePhoto } from '../types';
+import { MaintenanceOrder, DeviceStatus, NotificationTemplate, NotificationLog, AppUser, isContactOrder, MaintenancePhoto, CustomerProfile, StatusHistorySnapshot } from '../types';
 import { 
   User, 
   Phone, 
@@ -22,14 +22,44 @@ import {
   History,
   Check,
   Share2,
-  Camera
+  Camera,
+  QrCode,
+  Copy,
+  Edit3,
+  RefreshCw,
+  Download
 } from 'lucide-react';
-import { getWhatsAppLink, openWhatsAppDirectly } from '../lib/notifications';
+import { getWhatsAppLink, openWhatsAppDirectly, buildStatusHistorySnapshot, getOrderFinancials, getStatusArabicLabel } from '../lib/notifications';
 import { PreNotificationModal } from './PreNotificationModal';
-import JsBarcode from 'jsbarcode';
-import { getStoredLabelLayout } from '../utils/labelDesigner';
+import { StatusSnapshotBadges } from './StatusSnapshotBadges';
+import {
+  getStoredLabelLayout,
+  getLabelContainerStyles,
+  getLabelElementMetrics,
+  getSplitThermalLabelMetrics,
+  FIXED_LABEL_PAPER_SIZE
+} from '../utils/labelDesigner';
+import { buildTrackingUrl, getEffectiveAppUrl } from '../utils/appDomain';
+import {
+  printHtmlViaIframe,
+  printPureContent,
+  downloadPrintableHtml,
+  isEmbeddedIframe
+} from '../lib/printUtils';
+import { renderPrintableBarcodeSvg } from '../utils/barcode';
+import { renderAlphanumericQrSvg } from '../utils/qrAlphanumeric';
+import {
+  buildCustomerQrPayload,
+  buildOrderCustomerQrPayload,
+  generateUniqueCustomerBarcode,
+  normalizeCustomerNameKey,
+  phonesMatch,
+  sanitizeCustomCustomerBarcode,
+} from '../utils/customerBarcode';
 
 interface CustomerProfileModalProps {
+  customer?: CustomerProfile | null;
+  customers?: CustomerProfile[];
   customerName: string;
   customerPhone?: string;
   orders: MaintenanceOrder[];
@@ -38,14 +68,17 @@ interface CustomerProfileModalProps {
   appUrl?: string;
   currentUser?: AppUser | null;
   onSaveOrder?: (order: MaintenanceOrder) => void;
+  onUpdateCustomerBarcode?: (customerId: string, newBarcode: string) => Promise<{ ok: boolean; error?: string }>;
   onTriggerDelivery?: (order: MaintenanceOrder) => void;
-  onLogNotification?: (orderId: string, customerName: string, customerPhone: string, type: 'sms' | 'whatsapp', content: string, triggerEvent: string) => void;
+  onLogNotification?: (orderId: string, customerName: string, customerPhone: string, type: 'sms' | 'whatsapp', content: string, triggerEvent: string, variablesSnapshot?: StatusHistorySnapshot) => void;
   onClose: () => void;
   onNavigateToOrder?: (orderId: string) => void;
   onOpenNewOrderForCustomer?: (customerName: string, customerPhone: string) => void;
 }
 
 export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
+  customer: propCustomer = null,
+  customers = [],
   customerName,
   customerPhone = '',
   orders,
@@ -54,6 +87,7 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
   appUrl,
   currentUser,
   onSaveOrder,
+  onUpdateCustomerBarcode,
   onTriggerDelivery,
   onLogNotification,
   onClose,
@@ -62,6 +96,21 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<'devices' | 'messages' | 'summary'>('devices');
   const [selectedGalleryPhoto, setSelectedGalleryPhoto] = useState<MaintenancePhoto | null>(null);
+  const [copiedCustomerBarcode, setCopiedCustomerBarcode] = useState(false);
+  const [isEditingBarcode, setIsEditingBarcode] = useState(false);
+  const [barcodeDraft, setBarcodeDraft] = useState('');
+  const [barcodeError, setBarcodeError] = useState('');
+  const [savingBarcode, setSavingBarcode] = useState(false);
+  const [printPreviewDoc, setPrintPreviewDoc] = useState<{
+    title: string;
+    subtitle: string;
+    filename: string;
+    contentHtml: string;
+    pageStyle: string;
+    fullHtml: string;
+    kind: 'label' | 'receipt' | 'sticker' | 'report';
+    previewMinHeightPx: number;
+  } | null>(null);
   const currencyName = localStorage.getItem('currencyName') || 'دينار';
   const centerName = localStorage.getItem('centerName') || 'مركز الصيانة الذكي';
 
@@ -70,14 +119,36 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
     window.scrollTo({ top: 0, behavior: 'instant' });
   }, []);
 
+  // Resolve matching CustomerProfile from customers list or order links
+  const resolvedCustomer = useMemo(() => {
+    if (propCustomer) {
+      const live = customers.find((c) => c.id === propCustomer.id);
+      return live || propCustomer;
+    }
+    if (customerPhone) {
+      const byPhone = customers.find((c) => phonesMatch(c.phone, customerPhone));
+      if (byPhone) return byPhone;
+    }
+    const nameKey = normalizeCustomerNameKey(customerName);
+    if (nameKey) {
+      const byName = customers.find((c) => normalizeCustomerNameKey(c.name) === nameKey);
+      if (byName) return byName;
+    }
+    return null;
+  }, [propCustomer, customers, customerPhone, customerName]);
+
   // Clean strings for fuzzy & exact matching
-  const cleanPhone = (customerPhone || '').replace(/[\s-+]/g, '');
-  const cleanName = (customerName || '').trim().toLowerCase();
+  const cleanPhone = (resolvedCustomer?.phone || customerPhone || '').replace(/[\s-+]/g, '');
+  const cleanName = (resolvedCustomer?.name || customerName || '').trim().toLowerCase();
 
   // Find all maintenance orders for this customer
   const customerOrders = useMemo(() => {
     return orders.filter(o => {
       if (isContactOrder(o)) return false;
+      if (resolvedCustomer) {
+        if (o.customerId && o.customerId === resolvedCustomer.id) return true;
+        if (o.customerBarcode && o.customerBarcode.toUpperCase() === resolvedCustomer.customerBarcode.toUpperCase()) return true;
+      }
       const orderPhone = (o.customerPhone || '').replace(/[\s-+]/g, '');
       const orderName = (o.customerName || '').trim().toLowerCase();
 
@@ -89,11 +160,185 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
       }
       return false;
     }).sort((a, b) => b.createdAt - a.createdAt);
-  }, [orders, cleanPhone, cleanName]);
+  }, [orders, cleanPhone, cleanName, resolvedCustomer]);
 
-  // Derive most accurate display phone and name from orders if available
-  const displayPhone = customerOrders[0]?.customerPhone || customerPhone || 'غير مسجل';
-  const displayName = customerOrders[0]?.customerName || customerName || 'بدون اسم';
+  // Derive most accurate display phone, name, and persistent customerBarcode
+  const displayPhone = resolvedCustomer?.phone || customerOrders[0]?.customerPhone || customerPhone || 'غير مسجل';
+  const displayName = resolvedCustomer?.name || customerOrders[0]?.customerName || customerName || 'بدون اسم';
+  const displayCustomerBarcode = resolvedCustomer?.customerBarcode || customerOrders[0]?.customerBarcode || '';
+
+  const usedBarcodesSet = useMemo(() => {
+    const s = new Set<string>();
+    customers.forEach((c) => {
+      if (c.customerBarcode) s.add(c.customerBarcode.toUpperCase());
+    });
+    orders.forEach((o) => {
+      if (o.id) s.add(o.id.toUpperCase());
+    });
+    return s;
+  }, [customers, orders]);
+
+  const customerQrPayload = useMemo(
+    () =>
+      buildCustomerQrPayload({
+        customer: resolvedCustomer,
+        name: displayName,
+        phone: displayPhone === 'غير مسجل' ? '' : displayPhone,
+        customerBarcode: displayCustomerBarcode,
+        orders: customerOrders,
+        currencyName,
+        centerName,
+        maxLength: 650,
+      }),
+    [resolvedCustomer, displayName, displayPhone, displayCustomerBarcode, customerOrders, currencyName, centerName]
+  );
+
+  const compactCustomerQrPayload = useMemo(
+    () =>
+      buildCustomerQrPayload({
+        customer: resolvedCustomer,
+        name: displayName,
+        phone: displayPhone === 'غير مسجل' ? '' : displayPhone,
+        customerBarcode: displayCustomerBarcode,
+        orders: customerOrders,
+        currencyName,
+        centerName,
+        maxLength: 280,
+      }),
+    [resolvedCustomer, displayName, displayPhone, displayCustomerBarcode, customerOrders, currencyName, centerName]
+  );
+
+  const handleCopyCustomerBarcode = async () => {
+    if (!displayCustomerBarcode) return;
+    try {
+      await navigator.clipboard.writeText(displayCustomerBarcode);
+      setCopiedCustomerBarcode(true);
+      setTimeout(() => setCopiedCustomerBarcode(false), 1600);
+    } catch {
+      // ignore
+    }
+  };
+
+  const handlePrintCustomerBarcodeSticker = () => {
+    const primaryOrderId = customerOrders[0]?.id || '';
+    const qrValue = compactCustomerQrPayload || primaryOrderId;
+    if (!qrValue) return;
+    const centerMobile = localStorage.getItem('centerMobile') || '';
+    const qrSvgHtml = renderAlphanumericQrSvg({
+      value: qrValue,
+      mode: 'auto',
+      physicalSizeMm: 14.5,
+      marginModules: 1,
+      errorCorrectionLevel: 'L',
+    });
+    const stickerStyle = `
+      @page { size: 38mm 25mm; margin: 0 !important; }
+      * { box-sizing: border-box !important; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+      body {
+        width: 38mm !important;
+        height: 25mm !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        overflow: hidden !important;
+        background: #ffffff !important;
+        font-family: 'Cairo', system-ui, sans-serif !important;
+        color: #000000 !important;
+      }
+      .card {
+        width: 38mm;
+        height: 25mm;
+        padding: 1.2mm 1.4mm;
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1.1mm;
+        margin: 0 auto;
+        background: #ffffff;
+      }
+      .qr-box {
+        flex: 0 0 14.8mm;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: #fff;
+      }
+      .meta {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        text-align: right;
+        gap: 0.45mm;
+      }
+      .center { font-size: 5.8pt; font-weight: 900; line-height: 1.1; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-bottom: 0.25mm solid #e5e7eb; padding-bottom: 0.3mm; }
+      .cust { font-size: 7.2pt; font-weight: 900; line-height: 1.1; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .phone { font-size: 6pt; font-family: system-ui, -apple-system, 'Cairo', sans-serif; font-variant-numeric: tabular-nums; font-weight: 700; direction: ltr; text-align: right; white-space: nowrap; }
+      .tag { font-size: 5pt; font-weight: 800; color: #374151; white-space: nowrap; }
+      .code { font-size: 5.8pt; font-family: 'Courier New', monospace; font-weight: 900; letter-spacing: 0.1px; direction: ltr; text-align: right; white-space: nowrap; }
+    `;
+    const bodyContent = `
+      <div class="card">
+        <div class="meta">
+          <div class="center">${centerName}${centerMobile ? ` · ${centerMobile}` : ''}</div>
+          <div class="cust">${displayName}</div>
+          ${displayPhone && displayPhone !== 'غير مسجل' ? `<div class="phone">${displayPhone}</div>` : ''}
+          <div class="tag">QR معلومات الزبون</div>
+          ${primaryOrderId ? `<div class="code">${primaryOrderId}</div>` : ''}
+        </div>
+        <div class="qr-box">
+          ${qrSvgHtml}
+        </div>
+      </div>
+    `;
+    const html = `
+      <!DOCTYPE html>
+      <html dir="rtl" lang="ar">
+        <head>
+          <meta charset="utf-8" />
+          <title>بطاقة QR الزبون - ${displayName}</title>
+          <style>${stickerStyle}</style>
+        </head>
+        <body>${bodyContent}</body>
+      </html>
+    `;
+    printPureContent(bodyContent, stickerStyle);
+    setPrintPreviewDoc({
+      title: 'ملصق QR الزبون (38×25 مم)',
+      subtitle: primaryOrderId ? `${displayName} · ${primaryOrderId}` : displayName,
+      filename: `customer-qr-${primaryOrderId || 'profile'}.html`,
+      contentHtml: bodyContent,
+      pageStyle: stickerStyle,
+      fullHtml: html,
+      kind: 'sticker',
+      previewMinHeightPx: 190,
+    });
+  };
+
+  const handleSaveEditedBarcode = async () => {
+    if (!resolvedCustomer || !onUpdateCustomerBarcode) return;
+    const sanitized = sanitizeCustomCustomerBarcode(barcodeDraft);
+    if (!sanitized) {
+      setBarcodeError('أدخل رمز باركود صالح بالأحرف الإنجليزية أو الأرقام');
+      return;
+    }
+    setSavingBarcode(true);
+    setBarcodeError('');
+    try {
+      const res = await onUpdateCustomerBarcode(resolvedCustomer.id, sanitized);
+      if (!res.ok) {
+        setBarcodeError(res.error || 'هذا الباركود مستخدم مسبقاً');
+      } else {
+        setIsEditingBarcode(false);
+        setStatusUpdateSuccess(`تم تحديث وربط باركود الزبون بنجاح: ${sanitized}`);
+        setTimeout(() => setStatusUpdateSuccess(null), 4000);
+      }
+    } finally {
+      setSavingBarcode(false);
+    }
+  };
 
   // Find all notification logs sent to this customer
   const customerLogs = useMemo(() => {
@@ -188,33 +433,44 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
         targetStatus: newStatus
       });
     } else {
-      const historyEntry = {
-        status: newStatus,
-        note: `تم تغيير مرحلة الجهاز إلى (${newStatus}) عبر ملف العميل`,
-        timestamp: Date.now(),
-        updatedBy: currentUser?.displayName || 'المهندس'
-      };
-      const updated: MaintenanceOrder = {
+      const updatedBase: MaintenanceOrder = {
         ...currentDevice,
         status: newStatus,
-        statusHistory: [...(currentDevice.statusHistory || []), historyEntry],
         updatedAt: Date.now()
+      };
+      const snapshot = buildStatusHistorySnapshot(updatedBase, {
+        statusNote: `تم تغيير مرحلة الجهاز إلى (${getStatusArabicLabel(newStatus)}) عبر ملف العميل`,
+        notificationChannel: 'none'
+      });
+      const historyEntry = {
+        status: newStatus,
+        note: `تم تغيير مرحلة الجهاز إلى (${getStatusArabicLabel(newStatus)}) عبر ملف العميل`,
+        timestamp: Date.now(),
+        updatedBy: currentUser?.displayName || 'المهندس',
+        snapshot
+      };
+      const updated: MaintenanceOrder = {
+        ...updatedBase,
+        statusHistory: [...(currentDevice.statusHistory || []), historyEntry],
       };
       if (onSaveOrder) {
         onSaveOrder(updated);
       }
-      setStatusUpdateSuccess(`تم تحديث مرحلة الجهاز إلى: ${newStatus}`);
+      setStatusUpdateSuccess(`تم تحديث مرحلة الجهاز إلى: ${getStatusArabicLabel(newStatus)}`);
       setTimeout(() => setStatusUpdateSuccess(null), 4000);
     }
   };
 
   const handlePrintCustomerReport = () => {
-    const printWindow = window.open('', '_blank');
-    if (!printWindow) {
-      alert('يرجى السماح بالنوافذ المنبثقة لطباعة التقرير.');
-      return;
-    }
-
+    const customerQrSvg = customerQrPayload
+      ? renderAlphanumericQrSvg({
+          value: customerQrPayload,
+          mode: 'auto',
+          sizePx: 88,
+          marginModules: 2,
+          errorCorrectionLevel: 'L',
+        })
+      : '';
     const reportHtml = `
       <!DOCTYPE html>
       <html dir="rtl" lang="ar">
@@ -225,7 +481,7 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
             body { font-family: 'Cairo', system-ui, sans-serif; margin: 20px; direction: rtl; color: #111; line-height: 1.5; }
             .header { text-align: center; border-bottom: 2px solid #0d9488; padding-bottom: 12px; margin-bottom: 16px; }
             .center-name { font-size: 20px; font-weight: bold; color: #0d9488; }
-            .customer-info { display: flex; justify-content: space-between; background: #f8fafc; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #e2e8f0; }
+            .customer-info { display: flex; justify-content: space-between; align-items: center; gap: 12px; background: #f8fafc; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #e2e8f0; }
             .stats { display: flex; gap: 12px; margin-bottom: 20px; }
             .stat-box { flex: 1; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px; text-align: center; background: #fff; }
             .stat-val { font-size: 18px; font-weight: bold; color: #0f766e; }
@@ -247,10 +503,14 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
           </div>
 
           <div class="customer-info">
-            <div><strong>اسم الزبون:</strong> ${displayName}</div>
-            <div><strong>رقم الهاتف:</strong> <span dir="ltr">${displayPhone}</span></div>
-            <div><strong>إجمالي الأجهزة:</strong> ${totalOrdersCount} جهاز</div>
-            <div><strong>إجمالي المبالغ:</strong> ${totalCostSum} ${currencyName}</div>
+            <div style="flex: 1; display: flex; flex-wrap: wrap; gap: 12px 24px;">
+              <div><strong>اسم الزبون:</strong> ${displayName}</div>
+              <div><strong>رقم الهاتف:</strong> <span dir="ltr">${displayPhone}</span></div>
+              ${customerOrders[0]?.id ? `<div><strong>آخر رقم طلب:</strong> <span dir="ltr" style="font-family: monospace; font-weight: bold;">${customerOrders[0].id}</span></div>` : ''}
+              <div><strong>إجمالي الأجهزة:</strong> ${totalOrdersCount} جهاز</div>
+              <div><strong>إجمالي المبالغ:</strong> ${totalCostSum} ${currencyName}</div>
+            </div>
+            ${customerQrSvg ? `<div style="background:#fff;padding:4px;border:1px solid #cbd5e1;border-radius:6px;text-align:center;">${customerQrSvg}</div>` : ''}
           </div>
 
           <div class="stats">
@@ -264,7 +524,7 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
           <table>
             <thead>
               <tr>
-                <th>رقم الباركود</th>
+                <th>رقم الطلب</th>
                 <th>نوع وموديل الجهاز</th>
                 <th>الرقم التسلسلي S/N</th>
                 <th>الحالة</th>
@@ -306,184 +566,273 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
           <div style="margin-top: 40px; text-align: center; font-size: 11px; color: #94a3b8; border-top: 1px dashed #cbd5e1; padding-top: 12px;">
             تم إصدار هذا التقرير آلياً عبر نظام إدارة الصيانة الذكي لمركز: ${centerName}
           </div>
-          <script>
-            window.onload = function() { window.print(); }
-          </script>
         </body>
       </html>
     `;
 
-    printWindow.document.write(reportHtml);
-    printWindow.document.close();
+    printHtmlViaIframe(reportHtml);
   };
 
   const handlePrintThermalLabel = (order: MaintenanceOrder) => {
-    const mainCenterName = localStorage.getItem('centerName') || 'TECHNO';
-    const centerMobile = localStorage.getItem('centerMobile') || '962790000000';
+    const mainCenterName = localStorage.getItem('centerName') || 'مركز تكنو للصيانة';
+    const centerMobile = localStorage.getItem('centerMobile') || '05xxxxxxxx';
+    const effectiveAppUrl = appUrl || getEffectiveAppUrl();
 
     const layoutConfig = getStoredLabelLayout();
-    const paperSize = layoutConfig.paperSize || localStorage.getItem('lblPaperSize') || '50x30';
-    const dims = paperSize.split('x');
-    const widthVal = dims[0] ? parseFloat(dims[0]) : 50;
-    const heightVal = dims[1] ? parseFloat(dims[1]) : 30;
-    const widthLabel = `${widthVal}mm`;
-    const heightLabel = `${heightVal}mm`;
+    const effectiveLayout = {
+      ...layoutConfig,
+      paperSize: FIXED_LABEL_PAPER_SIZE
+    };
+    const containerStyles = getLabelContainerStyles(effectiveLayout);
+    const widthLabel = `${containerStyles.widthMm}mm`;
+    const heightLabel = `${containerStyles.heightMm}mm`;
 
-    let barcodeBase64 = '';
-    try {
-      const canvas = document.createElement('canvas');
-      try {
-        JsBarcode(canvas, order.id, {
-          format: 'CODE128',
-          width: widthVal <= 40 ? 1.1 : 1.3,
-          height: heightVal <= 25 ? 22 : 28,
-          displayValue: false,
-          margin: 0,
-          background: '#ffffff',
-          lineColor: '#000000',
-        });
-      } catch (err) {
-        JsBarcode(canvas, order.id, {
-          format: 'CODE128',
-          width: 1.2,
-          height: 24,
-          displayValue: false,
-          margin: 0,
-          background: '#ffffff',
-          lineColor: '#000000',
-        });
-      }
-      barcodeBase64 = canvas.toDataURL('image/png');
-    } catch (err) {
-      console.error('Barcode generation error', err);
-    }
+    const activeElements = effectiveLayout.elements.filter(el => el.enabled);
+    const barcodeEl = activeElements.find(el => el.id === 'barcode');
+    const qrCodeEl = activeElements.find(el => el.id === 'qr_code');
+    const splitMetrics = getSplitThermalLabelMetrics(effectiveLayout, containerStyles, activeElements);
+    const {
+      hasQrSide,
+      isCompactHeight,
+      isNarrowWidth,
+      effectivePaddingMm,
+      effectiveLineSpacing,
+      effectiveInnerWidthMm,
+      colGapMm,
+      splitQrSizeMm,
+      compactFontPt,
+    } = splitMetrics;
 
-    const printWindow = window.open('', '_blank', 'width=350,height=250');
-    if (!printWindow) {
-      alert("يرجى تفعيل السماح للنوافذ المنبثقة (Popups) للطباعة.");
-      return;
+    let barcodeSvgHtml = '';
+    if (barcodeEl) {
+      const barcodeMetrics = getLabelElementMetrics(barcodeEl, effectiveLayout);
+      const preferredFormat = localStorage.getItem('lblBarcodeFormat') || 'AUTO';
+      const orderQrContent = buildOrderCustomerQrPayload({
+        order,
+        customer: resolvedCustomer,
+        customerOrders,
+        currencyName,
+        centerName: mainCenterName,
+        centerMobile,
+        appUrl: effectiveAppUrl,
+        maxLength: 520,
+      });
+      barcodeSvgHtml = renderPrintableBarcodeSvg({
+        code: order.id,
+        qrContent: orderQrContent,
+        preferredFormat,
+        baseWidth: barcodeEl.width || 1.3,
+        heightPx: barcodeMetrics.barcodeHeightPx,
+        heightMm: barcodeMetrics.barcodeHeightMm,
+        maxWidthMm: effectiveInnerWidthMm,
+        targetQrMm: splitQrSizeMm,
+        quietZonePx: 10,
+        marginModules: 0,
+      });
     }
 
     const orderDate = order.createdAt ? new Date(order.createdAt).toLocaleDateString('ar-SA') : new Date().toLocaleDateString('ar-SA');
-    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(`${window.location.origin}?track=${order.id}`)}`;
+    const trackingUrl = buildTrackingUrl(order.id, effectiveAppUrl);
 
-    const activeElements = layoutConfig.elements.filter(el => el.enabled);
-    const count = activeElements.length;
-    const isSmall = heightVal <= 25;
-    const isVerySmall = heightVal <= 20 || widthVal <= 35;
-    const scale = count > 5 ? 0.8 : (count > 4 ? 0.88 : 1.0);
-
-    const elementsHtml = activeElements.map(el => {
-      const itemStyle = `margin: 0 !important; padding: 0.1mm 0.4mm !important; text-align: center !important; width: 100% !important; max-width: 100% !important; white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important; box-sizing: border-box !important; line-height: 1.1 !important;`;
+    const rightInfoElementsHtml = activeElements.map(el => {
+      const m = getLabelElementMetrics(el, effectiveLayout);
+      const fontPt = compactFontPt ?? Math.min(m.fontSizePt, isNarrowWidth ? 8 : 11);
+      const mTopMm = isCompactHeight ? 0 : Math.min(m.marginTopMm, 0.4);
+      const mBotMm = isCompactHeight ? 0.2 : Math.min(m.marginBottomMm, 0.5);
+      const baseItemStyle = hasQrSide
+        ? `writing-mode: vertical-rl !important; text-orientation: mixed !important; margin: 0 !important; padding: 0 !important; max-height: 100% !important; white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important; box-sizing: border-box !important; text-align: center !important; line-height: 1 !important;`
+        : `margin-top: ${mTopMm}mm !important; margin-bottom: ${mBotMm}mm !important; padding: 0 !important; text-align: ${containerStyles.textAlign} !important; align-self: ${containerStyles.alignItems} !important; max-width: 100% !important; white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important; box-sizing: border-box !important; line-height: ${effectiveLineSpacing} !important;`;
 
       switch (el.id) {
         case 'center_name': {
-          const rawFs = Number(localStorage.getItem('lblFontSizeCenterName')) || el.fontSize || 13;
-          const maxAllowed = isVerySmall ? 10 : (isSmall ? 11.5 : (widthVal >= 60 ? 15 : 13.5));
-          const fs = Math.min(rawFs, maxAllowed) * (count > 5 ? 0.9 : 1.0);
-          return `<div class="center-name" style="${itemStyle} font-size: ${fs.toFixed(1)}pt !important; font-weight: 900 !important; letter-spacing: -0.2px !important; text-shadow: 0 0 0.5px rgba(0,0,0,0.2) !important;">${mainCenterName}</div>`;
+          const centerFontPt = hasQrSide
+            ? splitMetrics.getVerticalCenterNameFontPt(mainCenterName)
+            : splitMetrics.getCenterNameFontPt(mainCenterName, fontPt);
+          return `<div class="center-name" dir="auto" style="${baseItemStyle} font-size: ${centerFontPt}pt !important; font-weight: 900 !important; letter-spacing: ${hasQrSide ? '0px' : '-0.25px'} !important; line-height: 1 !important;">${mainCenterName}</div>`;
         }
         case 'center_mobile': {
-          const rawFs = Number(localStorage.getItem('lblFontSizeMobile')) || el.fontSize || 7;
-          const fs = Math.min(rawFs, isSmall ? 6.5 : 7.5) * scale;
-          return `<div class="center-mobile" style="${itemStyle} font-size: ${fs.toFixed(1)}pt !important; font-weight: ${el.bold ? 700 : 500} !important;">${centerMobile}</div>`;
+          const cleanMob = String(centerMobile || '').trim();
+          const mobileFontPt = hasQrSide
+            ? splitMetrics.getVerticalMobileFontPt(cleanMob)
+            : splitMetrics.getCenterMobileFontPt(cleanMob, fontPt);
+          return `<div class="center-mobile" dir="ltr" style="${baseItemStyle} text-overflow: clip !important; font-family: system-ui, -apple-system, 'Cairo', sans-serif !important; font-variant-numeric: tabular-nums !important; font-size: ${mobileFontPt}pt !important; font-weight: ${hasQrSide ? 900 : (el.bold ? 700 : 600)} !important; letter-spacing: ${hasQrSide ? '0px' : '-0.1px'} !important; direction: ltr !important;">${cleanMob}</div>`;
         }
         case 'customer_name': {
-          const fs = (el.fontSize || 8) * scale;
-          return `<div class="customer-name" style="${itemStyle} font-size: ${fs.toFixed(1)}pt !important; font-weight: ${el.bold ? 800 : 600} !important;">${order.customerName}</div>`;
+          const txt = `العميل: ${order.customerName}`;
+          const fPt = hasQrSide ? splitMetrics.getVerticalInfoFontPt(txt) : fontPt;
+          return `<div class="customer-name" dir="auto" style="${baseItemStyle} font-size: ${fPt}pt !important; font-weight: ${el.bold ? 800 : 600} !important;">${txt}</div>`;
         }
         case 'device_model': {
-          const fs = (el.fontSize || 7.5) * scale;
-          return `<div class="device-model" style="${itemStyle} font-size: ${fs.toFixed(1)}pt !important; font-weight: ${el.bold ? 700 : 500} !important;">${order.deviceType} ${order.brandModel}</div>`;
+          const txt = `الجهاز: ${order.brandModel}`;
+          const fPt = hasQrSide ? splitMetrics.getVerticalInfoFontPt(txt) : fontPt;
+          return `<div class="device-model" dir="auto" style="${baseItemStyle} font-size: ${fPt}pt !important; font-weight: ${el.bold ? 800 : 600} !important;">${txt}</div>`;
         }
         case 'order_date': {
-          const fs = (el.fontSize || 6.5) * scale;
-          return `<div class="order-date" style="${itemStyle} font-size: ${fs.toFixed(1)}pt !important; font-weight: ${el.bold ? 700 : 400} !important;">${orderDate}</div>`;
+          const txt = `التاريخ: ${orderDate}`;
+          const fPt = hasQrSide ? splitMetrics.getVerticalInfoFontPt(txt) : fontPt;
+          return `<div class="order-date" dir="auto" style="${baseItemStyle} font-size: ${fPt}pt !important; font-weight: ${el.bold ? 700 : 400} !important;">${txt}</div>`;
         }
         case 'barcode': {
-          if (!barcodeBase64) return '';
-          const imgHeight = isVerySmall ? '5.5mm' : (isSmall ? '6.5mm' : '8mm');
-          const fs = (el.fontSize || 8.5) * scale;
-          return `
-            <div class="barcode-container" style="margin: 0.1mm 0 !important; padding: 0 !important; width: 100% !important; text-align: center !important; line-height: 1 !important;">
-              <img src="${barcodeBase64}" style="width: 96% !important; max-width: 96% !important; height: ${imgHeight} !important; object-fit: contain !important; display: block !important; margin: 0 auto !important;" />
-              <div style="${itemStyle} font-size: ${fs.toFixed(1)}pt !important; font-family: monospace, Courier, sans-serif !important; font-weight: 800 !important; letter-spacing: 0.8px !important; margin-top: 0.2mm !important;">${order.id}</div>
-            </div>
-          `;
-        }
-        case 'qr_code': {
-          const qrSize = isSmall ? '8mm' : '10mm';
-          return `<div class="qr-container" style="margin: 0.1mm 0 !important; text-align: center !important; line-height: 0 !important;"><img src="${qrCodeUrl}" style="width: ${qrSize} !important; height: ${qrSize} !important; display: block !important; margin: 0 auto !important;" /></div>`;
+          const codeFontPt = hasQrSide
+            ? splitMetrics.getVerticalCodeFontPt(order.id)
+            : splitMetrics.getCodeFontPt(order.id, fontPt);
+          return `<div class="barcode-code-text" dir="ltr" style="${baseItemStyle} text-overflow: clip !important; font-size: ${codeFontPt}pt !important; font-family: system-ui, -apple-system, 'Cairo', sans-serif !important; font-variant-numeric: tabular-nums !important; font-weight: 900 !important; letter-spacing: ${hasQrSide ? '0px' : '-0.2px'} !important; direction: ltr !important; line-height: 1 !important;">${order.id}</div>`;
         }
         case 'custom_text': {
-          const fs = (el.fontSize || 7) * scale;
-          const txt = el.customContent || '';
-          return txt ? `<div style="${itemStyle} font-size: ${fs.toFixed(1)}pt !important;">${txt}</div>` : '';
+          const txt = el.customContent || 'يرجى إبراز هذا الملصق عند الاستلام';
+          const fPt = hasQrSide ? splitMetrics.getVerticalInfoFontPt(txt) : fontPt;
+          if (hasQrSide) {
+            return `<div dir="auto" style="${baseItemStyle} font-size: ${fPt}pt !important; font-weight: ${el.bold ? 700 : 500} !important;">${txt}</div>`;
+          }
+          return `<div style="margin-top: ${mTopMm}mm !important; margin-bottom: ${mBotMm}mm !important; padding: 0 !important; text-align: ${containerStyles.textAlign} !important; align-self: ${containerStyles.alignItems} !important; max-width: 100% !important; white-space: normal !important; word-break: break-word !important; box-sizing: border-box !important; line-height: ${effectiveLineSpacing} !important; font-size: ${fontPt}pt !important; font-weight: ${el.bold ? 700 : 500} !important;">${txt}</div>`;
         }
         default:
           return '';
       }
     }).filter(Boolean).join('');
 
-    printWindow.document.write(`
+    const leftQrBlocks: string[] = [];
+    if (barcodeSvgHtml) {
+      leftQrBlocks.push(`<div class="barcode-qr-wrap" style="display: flex !important; align-items: center !important; justify-content: center !important; background: #ffffff !important;">${barcodeSvgHtml}</div>`);
+    }
+    if (qrCodeEl) {
+      const m = getLabelElementMetrics(qrCodeEl, effectiveLayout);
+      const inlineQrSvg = renderAlphanumericQrSvg({
+        value: trackingUrl,
+        mode: 'auto',
+        physicalSizeMm: splitQrSizeMm || Math.max(m.qrSizeMm, 11),
+        marginModules: 0,
+        errorCorrectionLevel: 'M',
+      });
+      leftQrBlocks.push(`<div class="qr-container" style="display: flex !important; align-items: center !important; justify-content: center !important; background: #ffffff !important;">${inlineQrSvg}</div>`);
+    }
+    const leftQrHtml = leftQrBlocks.join('');
+
+    const hasInfoHtml = Boolean(rightInfoElementsHtml.trim());
+    const contentHtml = hasQrSide
+      ? (hasInfoHtml
+        ? `
+      <div class="thermal-label-container thermal-label-split" dir="rtl">
+        <div class="thermal-info-col">
+          ${rightInfoElementsHtml}
+        </div>
+        <div class="thermal-qr-col">
+          ${leftQrHtml}
+        </div>
+      </div>
+    `
+        : `
+      <div class="thermal-label-container thermal-label-split" dir="rtl">
+        <div class="thermal-qr-col">
+          ${leftQrHtml}
+        </div>
+      </div>
+    `)
+      : `
+      <div class="thermal-label-container" dir="rtl">
+        ${rightInfoElementsHtml}
+      </div>
+    `;
+
+    const labelStyle = `
+      @page {
+        size: ${widthLabel} ${heightLabel};
+        margin: 0 !important;
+      }
+      * {
+        box-sizing: border-box !important;
+        -webkit-print-color-adjust: exact !important;
+        print-color-adjust: exact !important;
+      }
+      .thermal-label-container {
+        width: ${widthLabel} !important;
+        height: ${heightLabel} !important;
+        max-width: ${widthLabel} !important;
+        max-height: ${heightLabel} !important;
+        box-sizing: border-box !important;
+        padding: ${effectivePaddingMm}mm !important;
+        margin: 0 auto !important;
+        background: #ffffff !important;
+        color: #000000 !important;
+        display: flex !important;
+        flex-direction: ${hasQrSide ? 'row' : 'column'} !important;
+        justify-content: ${hasQrSide && hasInfoHtml ? 'space-between' : 'center'} !important;
+        align-items: center !important;
+        gap: ${hasQrSide && hasInfoHtml ? `${colGapMm}mm` : '0'} !important;
+        font-family: ${containerStyles.fontFamilyCss} !important;
+        overflow: hidden !important;
+        page-break-inside: avoid !important;
+        break-inside: avoid !important;
+      }
+      .thermal-info-col {
+        flex: 1 1 0% !important;
+        min-width: 0 !important;
+        height: 100% !important;
+        display: flex !important;
+        flex-direction: ${hasQrSide ? 'row' : 'column'} !important;
+        justify-content: center !important;
+        align-items: ${hasQrSide ? 'center' : containerStyles.alignItems} !important;
+        gap: ${hasQrSide ? `${splitMetrics.verticalColGapMm}mm` : '0'} !important;
+        text-align: ${hasQrSide ? 'center' : containerStyles.textAlign} !important;
+        overflow: hidden !important;
+      }
+      .thermal-qr-col {
+        flex: 0 0 auto !important;
+        height: 100% !important;
+        display: flex !important;
+        flex-direction: column !important;
+        align-items: center !important;
+        justify-content: center !important;
+        gap: 0.25mm !important;
+        background: #ffffff !important;
+      }
+      .thermal-label-container svg {
+        max-width: 100% !important;
+        display: block !important;
+      }
+    `;
+
+    const fullHtml = `
       <!DOCTYPE html>
       <html dir="rtl" lang="ar">
         <head>
           <meta charset="utf-8">
           <title>ملصق صيانة - ${order.id}</title>
+          <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800;900&family=Tajawal:wght@400;500;700;800;900&display=swap" />
           <style>
-            @page {
-              size: ${widthLabel} ${heightLabel};
-              margin: 0 !important;
-            }
-            * {
-              box-sizing: border-box !important;
-              -webkit-print-color-adjust: exact !important;
-              print-color-adjust: exact !important;
-            }
             html, body {
-              width: ${widthLabel} !important;
-              height: ${heightLabel} !important;
-              max-width: ${widthLabel} !important;
-              max-height: ${heightLabel} !important;
-              margin: 0 !important;
-              padding: 0 !important;
-              overflow: hidden !important;
-              background: #ffffff !important;
-              font-family: 'Cairo', system-ui, -apple-system, sans-serif !important;
-              color: #000000 !important;
+              margin: 0;
+              padding: 0;
+              background: #ffffff;
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              min-height: 100%;
+              font-family: ${containerStyles.fontFamilyCss};
             }
-            .thermal-label-container {
-              width: ${widthLabel} !important;
-              height: ${heightLabel} !important;
-              max-width: ${widthLabel} !important;
-              max-height: ${heightLabel} !important;
-              box-sizing: border-box !important;
-              padding: 0.3mm 0.6mm !important;
-              display: flex !important;
-              flex-direction: column !important;
-              justify-content: space-between !important;
-              align-items: center !important;
-              text-align: center !important;
-              overflow: hidden !important;
-              page-break-inside: avoid !important;
-              break-inside: avoid !important;
-            }
+            ${labelStyle}
           </style>
         </head>
         <body>
-          <div class="thermal-label-container">
-            ${elementsHtml}
-          </div>
-          <script>
-            window.onload = function() {
-              window.print();
-            };
-          </script>
+          ${contentHtml}
         </body>
       </html>
-    `);
-    printWindow.document.close();
+    `;
+
+    // Dispatch synchronous print immediately inside click handler
+    printPureContent(contentHtml, labelStyle);
+
+    // Also open visual preview sheet so mobile/iframe preview users see instant confirmation and can re-print or download
+    setPrintPreviewDoc({
+      title: `ملصق الباركود الحراري (${widthLabel} × ${heightLabel})`,
+      subtitle: `طلب ${order.id} · ${order.brandModel}`,
+      filename: `label-${order.id}.html`,
+      contentHtml,
+      pageStyle: labelStyle,
+      fullHtml,
+      kind: 'label',
+      previewMinHeightPx: 210,
+    });
   };
 
   const handlePrintCustomerReceipt = (order: MaintenanceOrder) => {
@@ -495,222 +844,269 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
     const countryDialCode = localStorage.getItem('countryDialCode') || '962';
     const rcptTermsText = localStorage.getItem('rcptTermsText') || `1. المحل غير مسؤول عن فقدان أو تلف البيانات المحفوظة في ذاكرة الجهاز. يرجى أخذ نسخة احتياطية.\n2. يحق للمحل التصرف في الجهاز وإلغاء مسؤوليته عنه في حال عدم استلامه بعد مرور 14 يوماً من تاريخ الإشعار بالجهوزية.\n3. لا يتم تسليم الجهاز إلا بإبراز هذا الإيصال أو إثبات الهوية الأصلي المسجل.`;
     const rcptSize = localStorage.getItem('rcptSize') || '80mm';
+    const effectiveAppUrl = appUrl || getEffectiveAppUrl();
 
-    let barcodeBase64 = '';
-    try {
-      const canvas = document.createElement('canvas');
-      JsBarcode(canvas, order.id, {
-        format: 'CODE128',
-        width: 1.5,
-        height: 38,
-        displayValue: true,
-        font: 'monospace',
-        fontSize: 14,
-        textMargin: 3,
-        margin: 0,
-        background: '#ffffff',
-        lineColor: '#000000',
-      });
-      barcodeBase64 = canvas.toDataURL('image/png');
-    } catch (err) {
-      console.error('Barcode error', err);
-    }
+    const preferredFormat = localStorage.getItem('lblBarcodeFormat') || 'AUTO';
+    const rcptMaxMm = rcptSize === '58mm' ? 50 : 72;
+    const receiptOrderQrContent = buildOrderCustomerQrPayload({
+      order,
+      customer: resolvedCustomer,
+      customerOrders,
+      currencyName,
+      centerName: mainCenterName,
+      centerMobile,
+      appUrl: effectiveAppUrl,
+      maxLength: 550,
+    });
+    const barcodeSvgHtml = renderPrintableBarcodeSvg({
+      code: order.id,
+      qrContent: receiptOrderQrContent,
+      preferredFormat,
+      baseWidth: 1.5,
+      heightMm: 10,
+      maxWidthMm: rcptMaxMm,
+      quietZonePx: 10,
+    });
 
-    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=140x140&data=${encodeURIComponent(`${window.location.origin}?track=${order.id}`)}`;
+    const trackingQrSvg = renderAlphanumericQrSvg({
+      value: buildTrackingUrl(order.id, effectiveAppUrl),
+      mode: 'auto',
+      sizePx: 64,
+      marginModules: 2,
+      errorCorrectionLevel: 'M',
+    });
     const createdDateFormatted = order.createdAt ? new Date(order.createdAt).toLocaleDateString('ar-SA') : new Date().toLocaleDateString('ar-SA');
     const expectedDateFormatted = order.expectedDeliveryDate ? new Date(order.expectedDeliveryDate).toLocaleDateString('ar-SA') : 'غير محدد';
     const costDisplay = order.actualCost !== undefined ? order.actualCost : order.estimatedCost;
 
-    let receiptWidth = rcptSize === '58mm' ? '58mm' : (rcptSize === 'A4' ? '210mm' : (rcptSize === 'A5' ? '148mm' : '80mm'));
-    let pageSizeSpec = rcptSize === '58mm' ? '58mm auto' : (rcptSize === 'A4' ? 'A4 portrait' : (rcptSize === 'A5' ? 'A5 portrait' : '80mm auto'));
+    const receiptWidth = rcptSize === '58mm' ? '58mm' : (rcptSize === 'A4' ? '210mm' : (rcptSize === 'A5' ? '148mm' : '80mm'));
+    const pageSizeSpec = rcptSize === '58mm' ? '58mm auto' : (rcptSize === 'A4' ? 'A4 portrait' : (rcptSize === 'A5' ? 'A5 portrait' : '80mm auto'));
 
-    const printWindow = window.open('', '_blank', 'width=500,height=700');
-    if (!printWindow) {
-      alert("يرجى تفعيل السماح للنوافذ المنبثقة (Popups) للطباعة.");
-      return;
-    }
+    const receiptStyle = `
+      @page {
+        size: ${pageSizeSpec};
+        margin: 4mm !important;
+      }
+      * {
+        box-sizing: border-box !important;
+        -webkit-print-color-adjust: exact !important;
+        print-color-adjust: exact !important;
+      }
+      .receipt-sheet {
+        font-family: 'Cairo', system-ui, -apple-system, sans-serif;
+        margin: 0 auto;
+        padding: 6px;
+        width: 100%;
+        max-width: ${receiptWidth};
+        background: #ffffff;
+        color: #111;
+        direction: rtl;
+        text-align: center;
+        font-size: clamp(9.5px, 3.2vw, 11.5px);
+        line-height: 1.4;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
+      .header {
+        border-bottom: 2px dashed #0f766e;
+        padding-bottom: 8px;
+        margin-bottom: 10px;
+      }
+      .logo { max-height: 50px; max-width: 100%; margin: 0 auto 4px auto; object-fit: contain; display: block; }
+      .store-title { font-size: clamp(13px, 4.5vw, 16px); font-weight: 900; color: #0f766e; overflow-wrap: anywhere; }
+      .store-sub { font-size: 10px; color: #4b5563; overflow-wrap: anywhere; }
+      .badge-title {
+        display: inline-block;
+        width: fit-content;
+        max-width: 100%;
+        background: #f0fdfa;
+        color: #0f766e;
+        border: 1px solid #99f6e4;
+        font-weight: 800;
+        font-size: clamp(10px, 3.3vw, 12px);
+        padding: 3px 10px;
+        border-radius: 9999px;
+        margin: 6px auto 0 auto;
+      }
+      .barcode-box { margin: 8px 0; max-width: 100%; overflow: hidden; }
+      .qr-box-svg { width: 64px; height: 64px; max-width: 100%; display: flex; align-items: center; justify-content: center; flex-shrink: 0; background: #fff; }
+      .info-list {
+        width: 100%;
+        margin: 8px 0;
+        font-size: clamp(9.5px, 3.1vw, 11px);
+        text-align: right;
+      }
+      .info-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 2px 8px;
+        padding: 4px 2px;
+        border-bottom: 1px dotted #e5e7eb;
+      }
+      .info-label {
+        color: #6b7280;
+        font-weight: 600;
+        flex-shrink: 0;
+      }
+      .info-val {
+        font-weight: 700;
+        color: #111827;
+        min-width: 0;
+        overflow-wrap: anywhere;
+        word-break: break-word;
+      }
+      .cost-highlight {
+        display: inline-block;
+        width: fit-content;
+        max-width: 100%;
+        background: #f0fdf4;
+        border: 1px solid #bbf7d0;
+        padding: 5px 12px;
+        border-radius: 8px;
+        font-size: clamp(11px, 3.5vw, 13px);
+        font-weight: 900;
+        color: #15803d;
+        margin: 8px auto;
+      }
+      .qr-row {
+        margin: 8px 0;
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+      }
+      .terms-box {
+        display: inline-block;
+        width: 100%;
+        max-width: 100%;
+        background: #f9fafb;
+        border: 1px solid #e5e7eb;
+        border-radius: 6px;
+        padding: 6px 8px;
+        font-size: 9pt;
+        color: #4b5563;
+        text-align: right;
+        line-height: 1.4;
+        margin: 10px auto 0 auto;
+        overflow-wrap: anywhere;
+      }
+      .footer {
+        margin-top: 10px;
+        font-size: 9pt;
+        color: #6b7280;
+        border-top: 1px dashed #d1d5db;
+        padding-top: 6px;
+      }
+    `;
 
-    printWindow.document.write(`
+    const contentHtml = `
+      <div class="receipt-sheet" dir="rtl">
+        <div class="header">
+          ${centerLogo ? `<img src="${centerLogo}" class="logo" alt="logo" />` : ''}
+          <div class="store-title">${mainCenterName}</div>
+          <div class="store-sub">بإشراف: ${engineerName} • جوال: <span dir="ltr">${centerMobile}</span></div>
+          <div class="store-sub">${countryName} (${countryDialCode}+)</div>
+          <div class="badge-title">إيصال استلام جهاز للصيانة</div>
+        </div>
+
+        <div class="barcode-box" style="background: #ffffff; display: flex; flex-direction: column; align-items: center;">
+          ${barcodeSvgHtml || ''}
+          <div style="font-family: 'Courier New', Courier, monospace; font-size: 11pt; font-weight: 900; letter-spacing: 0.8px; margin-top: 1mm;" dir="ltr">${order.id}</div>
+        </div>
+
+        <div class="info-list">
+          <div class="info-row">
+            <span class="info-label">اسم الزبون:</span>
+            <span class="info-val">${order.customerName}</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">رقم الهاتف:</span>
+            <span class="info-val" dir="ltr">${order.customerPhone}</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">الجهاز والموديل:</span>
+            <span class="info-val">${order.deviceType} • ${order.brandModel}</span>
+          </div>
+          ${order.serialNumber ? `
+          <div class="info-row">
+            <span class="info-label">الرقم التسلسلي S/N:</span>
+            <span class="info-val" style="font-family: monospace;" dir="ltr">${order.serialNumber}</span>
+          </div>` : ''}
+          <div class="info-row">
+            <span class="info-label">العطل / المشكلة:</span>
+            <span class="info-val">${order.faultDescription || 'فحص وصيانة عامة'}</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">تاريخ الاستلام:</span>
+            <span class="info-val">${createdDateFormatted}</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">موعد التسليم المتوقع:</span>
+            <span class="info-val">${expectedDateFormatted}</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">الفني المسؤول:</span>
+            <span class="info-val">${order.technician || engineerName}</span>
+          </div>
+        </div>
+
+        <div class="cost-highlight">
+          التكلفة التقديرية: ${costDisplay} ${order.currency || currencyName}
+        </div>
+
+        <div class="qr-row">
+          <div class="qr-box-svg">${trackingQrSvg}</div>
+          <div style="font-size: 9px; color: #6b7280; text-align: right; max-width: 150px;">
+            امسح رمز QR لمتابعة حالة الجهاز ومرحلة الصيانة مباشرة عبر الإنترنت
+          </div>
+        </div>
+
+        <div class="terms-box">
+          <strong>شروط وأحكام الصيانة المعتمدة:</strong><br/>
+          ${rcptTermsText.split('\n').map(l => `<div>• ${l}</div>`).join('')}
+        </div>
+
+        <div class="footer">
+          شكراً لثقتكم بنا • يرجى إبراز هذا الإيصال عند الاستلام
+        </div>
+      </div>
+    `;
+
+    const fullHtml = `
       <!DOCTYPE html>
       <html dir="rtl" lang="ar">
         <head>
           <meta charset="utf-8">
           <title>إيصال استلام صيانة - ${order.id}</title>
+          <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800;900&display=swap" />
           <style>
-            @page {
-              size: ${pageSizeSpec};
-              margin: 4mm !important;
-            }
-            * {
-              box-sizing: border-box !important;
-              -webkit-print-color-adjust: exact !important;
-              print-color-adjust: exact !important;
-            }
-            body {
-              font-family: 'Cairo', system-ui, -apple-system, sans-serif;
-              margin: 0 auto;
-              padding: 6px;
-              width: ${receiptWidth};
-              max-width: 100%;
-              color: #111;
-              direction: rtl;
-              text-align: center;
-              font-size: 11px;
-              line-height: 1.4;
-            }
-            .header {
-              border-bottom: 2px dashed #0f766e;
-              padding-bottom: 8px;
-              margin-bottom: 10px;
-            }
-            .logo { max-height: 50px; margin-bottom: 4px; }
-            .store-title { font-size: 16px; font-weight: 900; color: #0f766e; }
-            .store-sub { font-size: 10px; color: #4b5563; }
-            .badge-title {
-              display: inline-block;
-              background: #f0fdfa;
-              color: #0f766e;
-              border: 1px solid #99f6e4;
-              font-weight: 800;
-              font-size: 12px;
-              padding: 3px 12px;
-              border-radius: 9999px;
-              margin: 6px 0;
-            }
-            .barcode-box { margin: 8px 0; }
-            .barcode-img { max-width: 90%; height: 35px; object-fit: contain; margin: 0 auto; display: block; }
-            .qr-img { width: 65px; height: 65px; display: block; margin: 0 auto 4px auto; }
-            .info-table {
-              width: 100%;
-              border-collapse: collapse;
-              margin: 8px 0;
-              font-size: 11px;
-            }
-            .info-table td {
-              padding: 4px 6px;
-              border-bottom: 1px dotted #e5e7eb;
-              text-align: right;
-            }
-            .info-table td.label {
-              color: #6b7280;
-              font-weight: 600;
-              width: 35%;
-            }
-            .info-table td.val {
-              font-weight: 700;
-              color: #111827;
-            }
-            .cost-highlight {
-              background: #f0fdf4;
-              border: 1px solid #bbf7d0;
-              padding: 6px;
-              border-radius: 8px;
-              font-size: 13px;
-              font-weight: 900;
-              color: #15803d;
-              margin: 8px 0;
-            }
-            .terms-box {
-              background: #f9fafb;
-              border: 1px solid #e5e7eb;
-              border-radius: 6px;
-              padding: 6px;
-              font-size: 8.5px;
-              color: #6b7280;
-              text-align: right;
-              line-height: 1.35;
-              margin-top: 10px;
-            }
-            .footer {
-              margin-top: 10px;
-              font-size: 9px;
-              color: #9ca3af;
-              border-top: 1px dashed #d1d5db;
-              padding-top: 6px;
-            }
-            @media print {
-              button { display: none !important; }
-            }
+            html, body { margin: 0; padding: 8px; background: #ffffff; }
+            ${receiptStyle}
           </style>
         </head>
         <body>
-          <div class="header">
-            ${centerLogo ? `<img src="${centerLogo}" class="logo" />` : ''}
-            <div class="store-title">${mainCenterName}</div>
-            <div class="store-sub">بإشراف: ${engineerName} • جوال: <span dir="ltr">${centerMobile}</span></div>
-            <div class="store-sub">${countryName} (${countryDialCode}+)</div>
-            <div class="badge-title">إيصال استلام جهاز للصيانة</div>
-          </div>
-
-          <div class="barcode-box">
-            ${barcodeBase64 ? `<img src="${barcodeBase64}" class="barcode-img" />` : `<div style="font-family: monospace; font-size: 14px; font-weight: bold;">${order.id}</div>`}
-          </div>
-
-          <table class="info-table">
-            <tr>
-              <td class="label">اسم الزبون:</td>
-              <td class="val">${order.customerName}</td>
-            </tr>
-            <tr>
-              <td class="label">رقم الهاتف:</td>
-              <td class="val" dir="ltr">${order.customerPhone}</td>
-            </tr>
-            <tr>
-              <td class="label">الجهاز والموديل:</td>
-              <td class="val">${order.deviceType} • ${order.brandModel}</td>
-            </tr>
-            ${order.serialNumber ? `
-            <tr>
-              <td class="label">الرقم التسلسلي S/N:</td>
-              <td class="val" style="font-family: monospace;">${order.serialNumber}</td>
-            </tr>` : ''}
-            <tr>
-              <td class="label">العطل / المشكلة:</td>
-              <td class="val">${order.faultDescription || 'فحص وصيانة عامة'}</td>
-            </tr>
-            <tr>
-              <td class="label">تاريخ الاستلام:</td>
-              <td class="val">${createdDateFormatted}</td>
-            </tr>
-            <tr>
-              <td class="label">موعد التسليم المتوقع:</td>
-              <td class="val">${expectedDateFormatted}</td>
-            </tr>
-            <tr>
-              <td class="label">الفني المسؤول:</td>
-              <td class="val">${order.technician || engineerName}</td>
-            </tr>
-          </table>
-
-          <div class="cost-highlight">
-            التكلفة التقديرية: ${costDisplay} ${order.currency || currencyName}
-          </div>
-
-          <div style="margin: 8px 0; display: flex; align-items: center; justify-content: center; gap: 8px;">
-            <img src="${qrCodeUrl}" class="qr-img" />
-            <div style="font-size: 9px; color: #6b7280; text-align: right; max-width: 140px;">
-              امسح رمز QR لمتابعة حالة الجهاز ومرحلة الصيانة مباشرة عبر الإنترنت
-            </div>
-          </div>
-
-          <div class="terms-box">
-            <strong>شروط وأحكام الصيانة المعتمدة:</strong><br/>
-            ${rcptTermsText.split('\n').map(l => `<div>• ${l}</div>`).join('')}
-          </div>
-
-          <div class="footer">
-            شكراً لثقتكم بنا • يرجى إبراز هذا الإيصال عند الاستلام
-          </div>
-
-          <script>
-            window.onload = function() {
-              window.print();
-            };
-          </script>
+          ${contentHtml}
         </body>
       </html>
-    `);
-    printWindow.document.close();
+    `;
+
+    // Dispatch synchronous print immediately inside click handler
+    printPureContent(contentHtml, receiptStyle);
+
+    // Also open visual preview sheet so mobile/iframe preview users see instant confirmation and can re-print or download
+    setPrintPreviewDoc({
+      title: `إيصال استلام الصيانة (${rcptSize})`,
+      subtitle: `طلب ${order.id} · ${order.customerName}`,
+      filename: `receipt-${order.id}.html`,
+      contentHtml,
+      pageStyle: receiptStyle,
+      fullHtml,
+      kind: 'receipt',
+      previewMinHeightPx: 430,
+    });
   };
 
   return (
@@ -745,15 +1141,17 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
                   </h2>
                 </div>
                 
-                <div className="flex items-center gap-2 mt-1 text-teal-100 text-xs font-mono">
-                  <Phone className="w-3.5 h-3.5 text-teal-200" />
-                  <span dir="ltr">{displayPhone}</span>
+                <div className="flex items-center gap-3 mt-1 text-teal-100 text-xs font-mono flex-wrap">
+                  <span className="inline-flex items-center gap-1">
+                    <Phone className="w-3.5 h-3.5 text-teal-200" />
+                    <span dir="ltr">{displayPhone}</span>
+                  </span>
                 </div>
               </div>
             </div>
 
             {/* Quick Contact & Action Buttons */}
-            <div className="flex items-center gap-2 w-full sm:w-auto">
+            <div className="flex items-center gap-2 w-full sm:w-auto flex-wrap">
               {displayPhone && displayPhone !== 'غير مسجل' && (
                 <>
                   <a
@@ -794,7 +1192,7 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
           </div>
         </div>
 
-        {/* Quick Device Status & Repair Stage Updater - Located precisely at the orange arrow */}
+        {/* Quick Device Status & Repair Stage Updater + Relocated Customer Alphanumeric QR */}
         <div className="bg-gradient-to-b from-teal-50/70 to-white border-b border-teal-100 p-3.5 sm:px-6 space-y-2.5">
           {statusUpdateSuccess && (
             <div className="p-2.5 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-bold rounded-xl flex items-center justify-between animate-in fade-in">
@@ -812,37 +1210,14 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
             </div>
           )}
 
-          {customerOrders.length === 0 ? (
-            <div className="py-1 text-center text-xs text-gray-500 font-medium">
+          {customerOrders.length === 0 && (
+            <div className="py-1 text-center w-full text-xs text-gray-500 font-medium">
               لا توجد أجهزة مسجلة لهذا العميل حالياً.
             </div>
-          ) : (
-            <>
-              {/* Header and current device title */}
-              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2">
-                <div className="flex items-center gap-2">
-                  <span className="w-7 h-7 rounded-lg bg-teal-100 text-teal-700 flex items-center justify-center shrink-0">
-                    <Wrench className="w-4 h-4" />
-                  </span>
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <h4 className="font-sans font-extrabold text-gray-900 text-xs sm:text-sm">
-                      تحديث مرحلة الإصلاح وحالة الجهاز:
-                    </h4>
-                    {currentDevice && (
-                      <span className="font-mono text-[11px] font-extrabold text-teal-800 bg-teal-50 border border-teal-200/80 px-2 py-0.5 rounded-md">
-                        {currentDevice.id}
-                      </span>
-                    )}
-                  </div>
-                </div>
+          )}
 
-                {currentDevice && (
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] text-gray-500 font-bold">الحالة الحالية:</span>
-                    {getStatusBadge(currentDevice.status)}
-                  </div>
-                )}
-              </div>
+          {customerOrders.length > 0 && (
+            <>
 
               {/* Quick Print Action Buttons: زر ملصق وزر إيصال مكان الخط البرتقالي */}
               {currentDevice && (
@@ -956,7 +1331,7 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
         </div>
 
         {/* Modal Tabs Navigation */}
-        <div className="flex border-b border-gray-150 px-4 sm:px-6 bg-gray-50/80 gap-2 pt-2">
+        <div className="flex border-b border-gray-200 px-4 sm:px-6 bg-gray-50/80 gap-2 pt-2">
           <button
             type="button"
             onClick={() => setActiveTab('devices')}
@@ -1042,9 +1417,25 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
                       <div className="p-2.5 bg-gray-50 rounded-xl border border-gray-100">
                         <span className="text-gray-400 text-[10px] block font-bold">التكلفة والرسوم:</span>
                         <span className="font-mono font-extrabold text-teal-800 mt-0.5 block">
-                          {order.actualCost !== undefined ? order.actualCost : order.estimatedCost} {order.currency || currencyName}
+                          {getOrderFinancials(order, currencyName).totalCost} {order.currency || currencyName}
                         </span>
+                        {(order.extraCost || 0) > 0 && (
+                          <span className="text-[10px] text-amber-800 font-bold block mt-0.5">
+                            + كلفة إضافية: {order.extraCost} {order.currency || currencyName}
+                            {order.extraCostReason ? ` (${order.extraCostReason})` : ''}
+                          </span>
+                        )}
                       </div>
+
+                      {order.waitingPartsDetails && (
+                        <div className="p-2.5 bg-sky-50 rounded-xl border border-sky-200">
+                          <span className="text-sky-700 text-[10px] block font-bold">انتظار القطع:</span>
+                          <span className="font-bold text-sky-900 mt-0.5 block text-[11px]">
+                            {order.waitingPartsDetails}
+                            {order.waitingPartsExpectedDate ? ` (${order.waitingPartsExpectedDate})` : ''}
+                          </span>
+                        </div>
+                      )}
 
                       {order.expectedDeliveryDate && (
                         <div className="p-2.5 bg-gray-50 rounded-xl border border-gray-100">
@@ -1093,16 +1484,19 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
                           <span>سجل مراحل وتاريخ الصيانة ({order.statusHistory.length} تحديثات):</span>
                         </span>
                         
-                        <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
+                        <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
                           {order.statusHistory.map((step, sIdx) => (
-                            <div key={sIdx} className="bg-gray-50/80 p-2 rounded-xl border border-gray-100 flex items-start justify-between gap-2 text-[11px]">
-                              <div>
-                                <span className="font-bold text-gray-800 ml-1.5">{step.status}:</span>
-                                <span className="text-gray-600">{step.note}</span>
+                            <div key={sIdx} className="bg-gray-50/80 p-2.5 rounded-xl border border-gray-100 text-[11px] space-y-1">
+                              <div className="flex items-start justify-between gap-2">
+                                <div>
+                                  <span className="font-bold text-gray-800 ml-1.5">{getStatusArabicLabel(step.status)}:</span>
+                                  <span className="text-gray-600">{step.note}</span>
+                                </div>
+                                <span className="text-[9px] text-gray-400 font-mono shrink-0">
+                                  {new Date(step.timestamp).toLocaleDateString('ar-SA')}
+                                </span>
                               </div>
-                              <span className="text-[9px] text-gray-400 font-mono shrink-0">
-                                {new Date(step.timestamp).toLocaleDateString('ar-SA')}
-                              </span>
+                              <StatusSnapshotBadges snapshot={step.snapshot} compact />
                             </div>
                           ))}
                         </div>
@@ -1185,6 +1579,7 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
                     <div className="p-2.5 bg-gray-50/70 rounded-xl text-xs text-gray-700 leading-relaxed font-sans whitespace-pre-wrap">
                       {log.content}
                     </div>
+                    <StatusSnapshotBadges snapshot={log.variablesSnapshot} compact hideMessagePreview />
                   </div>
                 ))
               )}
@@ -1255,7 +1650,7 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
             </div>
 
             {selectedGalleryPhoto.note && (
-              <div className="p-4 bg-gray-50 border-t border-gray-150 text-xs text-gray-800">
+              <div className="p-4 bg-gray-50 border-t border-gray-200 text-xs text-gray-800">
                 <span className="font-bold text-gray-500 block text-[10px] mb-0.5">ملاحظة التوثيق:</span>
                 {selectedGalleryPhoto.note}
               </div>
@@ -1271,7 +1666,7 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
           order={preNotificationTarget.order}
           targetStatus={preNotificationTarget.targetStatus}
           templates={templates}
-          appUrl={appUrl || window.location.origin}
+          appUrl={appUrl || getEffectiveAppUrl()}
           currencyName={currencyName}
           currentUser={currentUser}
           onClose={() => setPreNotificationTarget(null)}
@@ -1286,21 +1681,103 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
             if (shouldDispatch) {
               if (channel === 'whatsapp') {
                 openWhatsAppDirectly(updatedOrder.customerPhone, finalMessage);
+              } else if (channel === 'sms') {
+                const cleanPhone = (updatedOrder.customerPhone || '').replace(/[\s()-]/g, '');
+                if (cleanPhone) {
+                  window.location.href = `sms:${cleanPhone}?body=${encodeURIComponent(finalMessage)}`;
+                }
               }
 
               if (onLogNotification) {
+                const latestSnapshot = updatedOrder.statusHistory?.[updatedOrder.statusHistory.length - 1]?.snapshot;
                 onLogNotification(
                   updatedOrder.id,
                   updatedOrder.customerName,
                   updatedOrder.customerPhone,
                   channel,
                   finalMessage,
-                  `تحديث الحالة: ${updatedOrder.status}`
+                  `تحديث الحالة: ${getStatusArabicLabel(updatedOrder.status)}`,
+                  latestSnapshot
                 );
               }
             }
           }}
         />
+      )}
+
+      {/* Quick Print Preview & Download Modal */}
+      {printPreviewDoc && (
+        <div
+          className="fixed inset-0 z-70 flex items-start justify-center p-2 pt-3 sm:pt-6 overflow-y-auto bg-black/50 backdrop-blur-xs animate-in fade-in duration-150 font-sans"
+          dir="rtl"
+          onClick={() => setPrintPreviewDoc(null)}
+        >
+          <div
+            className="bg-white rounded-3xl max-w-md w-full shadow-2xl border border-gray-200 overflow-hidden mb-4 animate-in slide-in-from-top-2 duration-150 text-right"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="bg-gradient-to-r from-teal-700 to-emerald-800 p-4 text-white flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <h3 className="font-extrabold text-sm truncate">{printPreviewDoc.title}</h3>
+                <p className="text-[11px] text-teal-100 font-mono truncate mt-0.5" dir="ltr">
+                  {printPreviewDoc.subtitle}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPrintPreviewDoc(null)}
+                className="p-1.5 bg-white/15 hover:bg-white/25 text-white rounded-xl transition-colors cursor-pointer shrink-0"
+                title="إغلاق المعاينة"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {isEmbeddedIframe() && (
+              <div className="bg-amber-50 border-b border-amber-200 px-4 py-2.5 text-[11px] text-amber-900 font-bold leading-relaxed">
+                تم تجهيز {printPreviewDoc.kind === 'receipt' ? 'الإيصال' : 'الملصق'} وإرسال أمر الطباعة. إذا حظر متصفح المعاينة المدمج فتح الطابعة تلقائياً، استخدم زر <span className="underline">تنزيل نسخة للطباعة</span> أو افتح التطبيق في متصفح مستقل.
+              </div>
+            )}
+
+            <div className="p-4 bg-slate-100 flex items-center justify-center">
+              <div className="w-full bg-white rounded-2xl border border-slate-200 shadow-inner overflow-hidden">
+                <iframe
+                  title={printPreviewDoc.title}
+                  srcDoc={printPreviewDoc.fullHtml}
+                  className="w-full border-0 bg-white"
+                  style={{ height: `${printPreviewDoc.previewMinHeightPx}px` }}
+                />
+              </div>
+            </div>
+
+            <div className="p-4 bg-white border-t border-gray-100 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => printPureContent(printPreviewDoc.contentHtml, printPreviewDoc.pageStyle)}
+                className="flex-1 min-w-[130px] py-2.5 px-3 bg-teal-700 hover:bg-teal-800 text-white font-extrabold text-xs rounded-xl flex items-center justify-center gap-1.5 shadow-sm transition-all cursor-pointer"
+              >
+                <Printer className="w-4 h-4" />
+                <span>طباعة الآن</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => downloadPrintableHtml(printPreviewDoc.filename, printPreviewDoc.fullHtml)}
+                className="py-2.5 px-3 bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-200 font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 transition-all cursor-pointer"
+                title="حفظ الملف لطباعته من المتصفح أو تطبيق الطباعة"
+              >
+                <Download className="w-4 h-4" />
+                <span>تنزيل HTML</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setPrintPreviewDoc(null)}
+                className="py-2.5 px-3 bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold text-xs rounded-xl transition-all cursor-pointer"
+              >
+                إغلاق
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       </div>

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Search, Calendar, Sliders, X, FileText, Smartphone, LayoutDashboard, Clock } from 'lucide-react';
 import { NotificationLog } from '../types';
+import { StatusSnapshotBadges } from './StatusSnapshotBadges';
 
 interface LogsViewProps {
   notificationLogs: NotificationLog[];
@@ -221,6 +222,7 @@ export const LogsView: React.FC<LogsViewProps> = ({ notificationLogs, onViewCust
                     <div className="bg-gray-50 border border-gray-100 rounded-xl p-3 text-xs text-gray-700 leading-relaxed font-sans whitespace-pre-wrap mt-2 line-clamp-2">
                       {log.content}
                     </div>
+                    <StatusSnapshotBadges snapshot={log.variablesSnapshot} compact hideMessagePreview />
                   </div>
                 </div>
               </div>
@@ -286,6 +288,7 @@ export const LogsView: React.FC<LogsViewProps> = ({ notificationLogs, onViewCust
                 <div className="bg-gray-50 border border-gray-100 rounded-xl p-4 text-sm text-gray-800 leading-relaxed font-sans whitespace-pre-wrap">
                   {selectedLog.content}
                 </div>
+                <StatusSnapshotBadges snapshot={selectedLog.variablesSnapshot} hideMessagePreview />
               </div>
             </div>
             

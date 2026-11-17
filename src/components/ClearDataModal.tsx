@@ -34,22 +34,34 @@ export const ClearDataModal: React.FC<ClearDataModalProps> = ({ onClose, onClear
   const executeClear = async () => {
     try {
       if (selOrders && onClearAllOrders) {
-        onClearAllOrders();
+        await onClearAllOrders();
       }
 
       if (selContacts && onClearNames) {
-        // If we are also clearing orders, we might just wipe everything in the orders collection
-        onClearNames(true);
+        await onClearNames(true);
       }
 
       if (selLogs && onClearLogs) {
-        onClearLogs();
+        await onClearLogs();
       }
 
       if (selSettings) {
+        const preservedKeys = new Set([
+          'centerName',
+          'centerMobile',
+          'notification_templates',
+          'isAppAuthenticated',
+          'appCurrentUser',
+          'appUsersList',
+          'app_registered_accounts',
+          'lastLoginEmail',
+          'centerEmail',
+          'engineerName',
+          'techno_device_uid'
+        ]);
         for (let i = localStorage.length - 1; i >= 0; i--) {
           const key = localStorage.key(i);
-          if (key && !key.startsWith('db_') && key !== 'centerName' && key !== 'centerMobile' && key !== 'notification_templates') {
+          if (key && !key.startsWith('db_') && !preservedKeys.has(key)) {
             localStorage.removeItem(key);
           }
         }

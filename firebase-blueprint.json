@@ -6,6 +6,8 @@
       "type": "object",
       "properties": {
         "id": { "type": "string" },
+        "customerId": { "type": "string" },
+        "customerBarcode": { "type": "string" },
         "customerName": { "type": "string" },
         "customerPhone": { "type": "string" },
         "deviceType": { "type": "string" },
@@ -13,18 +15,43 @@
         "serialNumber": { "type": "string" },
         "faultDescription": { "type": "string" },
         "estimatedCost": { "type": "number" },
+        "extraCost": { "type": "number" },
+        "extraCostReason": { "type": "string" },
         "actualCost": { "type": "number" },
+        "advancePayment": { "type": "number" },
+        "currency": { "type": "string" },
+        "waitingPartsDetails": { "type": "string" },
+        "waitingPartsExpectedDate": { "type": "string" },
+        "customVariables": { "type": "array" },
         "expectedDeliveryDate": { "type": "string" },
         "status": { "type": "string" },
+        "statusUpdateText": { "type": "string" },
         "notes": { "type": "string" },
         "technician": { "type": "string" },
         "createdAt": { "type": "number" },
         "updatedAt": { "type": "number" },
         "statusHistory": { "type": "array" },
+        "photos": { "type": "array" },
         "deviceBarcode": { "type": "string" },
-        "deliveryInfo": { "type": "object" }
+        "deliveryInfo": { "type": "object" },
+        "customerFeedback": { "type": "object" }
       },
       "required": ["id", "customerName", "customerPhone", "deviceType", "brandModel", "status", "createdAt", "updatedAt"]
+    },
+    "customer": {
+      "title": "CustomerProfile",
+      "description": "Represents a customer linked with their own unique persistent Alphanumeric Mode QR code.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "phone": { "type": "string" },
+        "customerBarcode": { "type": "string" },
+        "notes": { "type": "string" },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["id", "name", "customerBarcode", "createdAt", "updatedAt"]
     },
     "notification_log": {
       "title": "NotificationLog",
@@ -39,7 +66,8 @@
         "content": { "type": "string" },
         "status": { "type": "string" },
         "timestamp": { "type": "number" },
-        "triggerEvent": { "type": "string" }
+        "triggerEvent": { "type": "string" },
+        "variablesSnapshot": { "type": "object" }
       },
       "required": ["id", "orderId", "customerName", "customerPhone", "type", "content", "status", "timestamp"]
     },
@@ -65,7 +93,10 @@
         "userId": { "type": "string" },
         "displayName": { "type": "string" },
         "email": { "type": "string" },
-        "updatedAt": { "type": "number" }
+        "phoneNumber": { "type": "string" },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" },
+        "role": { "type": "string" }
       },
       "required": ["userId"]
     }
@@ -74,6 +105,10 @@
     "users/{userId}": {
       "schema": "user_profile",
       "description": "Root document for each isolated user account."
+    },
+    "users/{userId}/customers/{customerId}": {
+      "schema": "customer",
+      "description": "Subcollection of customers with unique linked barcodes strictly isolated per user."
     },
     "users/{userId}/orders/{orderId}": {
       "schema": "order",

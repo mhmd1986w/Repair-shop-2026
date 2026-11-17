@@ -54,57 +54,77 @@ export const CameraCaptureModal: React.FC<CameraCaptureModalProps> = ({
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+
+  const stopActiveStream = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => {
+        try { track.stop(); } catch (_) {}
+      });
+      streamRef.current = null;
+    }
+  };
 
   // Instant scroll to top
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: 'instant' });
   }, []);
 
-  // Initialize camera stream
-  const startCamera = async (mode: 'environment' | 'user') => {
-    try {
-      setCameraError(null);
-      if (stream) {
-        stream.getTracks().forEach(track => track.stop());
-      }
-
-      // Check support
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        setCameraError('المتصفح لا يدعم الوصول للكاميرا المباشرة، يمكنك استخدام خيار رفع الصورة من المعرض بالأسفل.');
-        return;
-      }
-
-      const newStream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: mode,
-          width: { ideal: 1280 },
-          height: { ideal: 720 }
-        },
-        audio: false
-      });
-
-      setStream(newStream);
-      if (videoRef.current) {
-        videoRef.current.srcObject = newStream;
-      }
-    } catch (err: any) {
-      console.warn("Camera access failed or denied:", err);
-      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        setCameraError('تم رفض صلاحية الوصول للكاميرا. يرجى تفعيل الإذن من المتصفح أو رفع صورة مباشرة.');
-      } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
-        setCameraError('لم يتم العثور على كاميرا في هذا الجهاز. يمكنك اختيار صورة من المعرض أو المستندات.');
-      } else {
-        setCameraError('تعذر تشغيل الكاميرا المباشرة. يمكنك التقاط أو رفع الصورة عبر زر "فتح كاميرا الهاتف / رفع ملف".');
-      }
-    }
-  };
-
+  // Initialize camera stream safely with unmount cancellation
   useEffect(() => {
-    startCamera(facingMode);
-    return () => {
-      if (stream) {
-        stream.getTracks().forEach(track => track.stop());
+    let active = true;
+
+    const initCamera = async (mode: 'environment' | 'user') => {
+      try {
+        setCameraError(null);
+        stopActiveStream();
+
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          if (active) {
+            setCameraError('المتصفح لا يدعم الوصول للكاميرا المباشرة، يمكنك استخدام خيار رفع الصورة من المعرض بالأسفل.');
+          }
+          return;
+        }
+
+        const newStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: mode,
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          },
+          audio: false
+        });
+
+        if (!active) {
+          newStream.getTracks().forEach(track => {
+            try { track.stop(); } catch (_) {}
+          });
+          return;
+        }
+
+        streamRef.current = newStream;
+        setStream(newStream);
+        if (videoRef.current) {
+          videoRef.current.srcObject = newStream;
+        }
+      } catch (err: any) {
+        if (!active) return;
+        console.warn("Camera access failed or denied:", err);
+        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+          setCameraError('تم رفض صلاحية الوصول للكاميرا. يرجى تفعيل الإذن من المتصفح أو رفع صورة مباشرة.');
+        } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+          setCameraError('لم يتم العثور على كاميرا في هذا الجهاز. يمكنك اختيار صورة من المعرض أو المستندات.');
+        } else {
+          setCameraError('تعذر تشغيل الكاميرا المباشرة. يمكنك التقاط أو رفع الصورة عبر زر "فتح كاميرا الهاتف / رفع ملف".');
+        }
       }
+    };
+
+    initCamera(facingMode);
+
+    return () => {
+      active = false;
+      stopActiveStream();
     };
   }, [facingMode]);
 
@@ -191,8 +211,9 @@ export const CameraCaptureModal: React.FC<CameraCaptureModalProps> = ({
   // Retake photo
   const handleRetake = () => {
     setCapturedDataUrl(null);
-    if (videoRef.current && stream) {
-      videoRef.current.srcObject = stream;
+    const activeStream = streamRef.current || stream;
+    if (videoRef.current && activeStream) {
+      videoRef.current.srcObject = activeStream;
     }
   };
 
@@ -213,6 +234,7 @@ export const CameraCaptureModal: React.FC<CameraCaptureModalProps> = ({
       takenBy: technicianName.trim()
     };
 
+    stopActiveStream();
     onPhotoCaptured(newPhoto);
     onClose();
   };

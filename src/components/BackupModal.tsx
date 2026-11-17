@@ -1,9 +1,10 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Download, Upload, CheckSquare, Square, FileJson, FileSpreadsheet, X, AlertTriangle, CheckCircle2, RefreshCw, FolderDown, Share2, ExternalLink } from 'lucide-react';
+import { Download, Upload, CheckSquare, Square, FileJson, FileSpreadsheet, X, AlertTriangle, CheckCircle2, RefreshCw, FolderDown, Share2, ExternalLink, HardDrive, ShieldCheck } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { dbService, LocalStorageDB } from '../lib/firebase';
 import { isContactOrder } from '../types';
 import { saveFileToDevice, excelWorkbookToBlob, shareFile, isRunningInIframe, SaveFileResult } from '../utils/fileSaver';
+import { AllFilesPermissionStatus, checkAllFilesAccessPermission, requestAllFilesAccessPermission } from '../utils/storagePermissions';
 
 interface BackupModalProps {
   onClose: () => void;
@@ -27,9 +28,17 @@ export const BackupModal: React.FC<BackupModalProps> = ({ onClose, onSuccess }) 
   const [exportResult, setExportResult] = useState<SaveFileResult | null>(null);
   const [exportBlob, setExportBlob] = useState<{ blob: Blob; mime: string; name: string } | null>(null);
   const [exportNotice, setExportNotice] = useState<string | null>(null);
+  const [allFilesStatus, setAllFilesStatus] = useState<AllFilesPermissionStatus | null>(null);
+  const [isRequestingFilesPerm, setIsRequestingFilesPerm] = useState(false);
 
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: 'instant' });
+    const refresh = () => {
+      checkAllFilesAccessPermission().then(setAllFilesStatus).catch(() => {});
+    };
+    refresh();
+    window.addEventListener('focus', refresh);
+    return () => window.removeEventListener('focus', refresh);
   }, []);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -84,7 +93,7 @@ export const BackupModal: React.FC<BackupModalProps> = ({ onClose, onSuccess }) 
       }
       
       if (selTemplates) {
-        const tpls = localStorage.getItem('notification_templates');
+        const tpls = localStorage.getItem('db_templates') || localStorage.getItem('notification_templates');
         dataToExport.templates = tpls ? JSON.parse(tpls) : [];
       }
       
@@ -110,11 +119,6 @@ export const BackupModal: React.FC<BackupModalProps> = ({ onClose, onSuccess }) 
         );
 
         setIsExporting(false);
-
-        if (result.userCancelled) {
-          setExportNotice('تم إغلاق نافذة اختيار مكان الحفظ دون حفظ الملف.');
-          return;
-        }
 
         if (result.success) {
           setExportResult(result);
@@ -176,11 +180,6 @@ export const BackupModal: React.FC<BackupModalProps> = ({ onClose, onSuccess }) 
         );
 
         setIsExporting(false);
-
-        if (result.userCancelled) {
-          setExportNotice('تم إغلاق نافذة اختيار مكان الحفظ دون حفظ الملف.');
-          return;
-        }
 
         if (result.success) {
           setExportResult(result);
@@ -269,16 +268,18 @@ export const BackupModal: React.FC<BackupModalProps> = ({ onClose, onSuccess }) 
         
         if ((selContacts && importedData.contacts) || (selOrders && importedData.orders)) {
            LocalStorageDB.setCollection('orders', updatedOrders);
-           updatedOrders.forEach(o => dbService.saveOrder(o));
+           await Promise.all(updatedOrders.map(o => dbService.saveOrder(o)));
         }
         
         if (selTemplates && importedData.templates) {
-          localStorage.setItem('notification_templates', JSON.stringify(importedData.templates));
+          const tplsJson = JSON.stringify(importedData.templates);
+          localStorage.setItem('db_templates', tplsJson);
+          localStorage.setItem('notification_templates', tplsJson);
         }
         
         if (selLogs && importedData.logs) {
           LocalStorageDB.setCollection('notification_logs', importedData.logs);
-          importedData.logs.forEach((l: any) => dbService.saveNotificationLog(l));
+          await Promise.all(importedData.logs.map((l: any) => dbService.saveNotificationLog(l)));
         }
         
         alert('تم الاستيراد بنجاح! سيتم إعادة تحميل النظام.');
@@ -457,6 +458,46 @@ export const BackupModal: React.FC<BackupModalProps> = ({ onClose, onSuccess }) 
                   <div className="text-sm opacity-80 font-medium">استرجاع البيانات من ملف سابق</div>
                 </div>
               </button>
+
+              <div className={`p-3.5 rounded-2xl border text-right space-y-2 ${
+                allFilesStatus?.granted ? 'bg-emerald-50 border-emerald-200' : 'bg-slate-50 border-slate-200'
+              }`}>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-xs font-bold text-gray-800">
+                    {allFilesStatus?.granted ? (
+                      <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+                    ) : (
+                      <HardDrive className="w-4 h-4 text-teal-600 shrink-0" />
+                    )}
+                    <span>صلاحية الوصول إلى جميع الملفات</span>
+                  </div>
+                  <span className={`px-2 py-0.5 rounded-md text-[10px] font-bold ${
+                    allFilesStatus?.granted ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'
+                  }`}>
+                    {allFilesStatus?.granted ? 'مفعّلة' : 'غير مفعّلة'}
+                  </span>
+                </div>
+                {allFilesStatus?.message && (
+                  <p className="text-[11px] text-gray-600 leading-relaxed">{allFilesStatus.message}</p>
+                )}
+                <button
+                  type="button"
+                  disabled={isRequestingFilesPerm}
+                  onClick={async () => {
+                    setIsRequestingFilesPerm(true);
+                    try {
+                      const res = await requestAllFilesAccessPermission();
+                      setAllFilesStatus(res);
+                    } finally {
+                      setIsRequestingFilesPerm(false);
+                    }
+                  }}
+                  className="w-full py-2 px-3 rounded-xl bg-slate-800 hover:bg-slate-900 disabled:opacity-60 text-white text-xs font-bold transition-colors flex items-center justify-center gap-1.5"
+                >
+                  <HardDrive className="w-3.5 h-3.5" />
+                  <span>{isRequestingFilesPerm ? 'جاري طلب الصلاحية...' : 'طلب صلاحية الوصول إلى الملفات'}</span>
+                </button>
+              </div>
             </div>
           ) : (
             /* 3. EXPORT / IMPORT CONFIG VIEW */
@@ -509,7 +550,7 @@ export const BackupModal: React.FC<BackupModalProps> = ({ onClose, onSuccess }) 
                     </button>
                   </div>
                   <p className="text-[11px] text-gray-400 mt-2 text-right">
-                    💡 سيقوم المتصفح بفتح نافذة اختيار مكان حفظ الملف على ذاكرة جهازك (Save As) لتحديد المجلد المطلوب مباشرة.
+                    💡 سيتم حفظ وتنزيل ملف النسخة الاحتياطية مباشرة إلى ذاكرة جهازك (مجلد التنزيلات Downloads).
                   </p>
                 </div>
               )}

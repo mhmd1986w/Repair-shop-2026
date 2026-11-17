@@ -9,8 +9,10 @@ export interface SaveFileOptions {
 
 export interface SaveFileResult {
   success: boolean;
-  method?: 'picker' | 'download' | 'share';
+  method?: 'picker' | 'download' | 'dataurl' | 'share';
   url?: string;
+  dataUrl?: string;
+  textContent?: string;
   fileName: string;
   fileSizeFormatted?: string;
   error?: string;
@@ -23,7 +25,7 @@ export interface SaveFileResult {
 export function isRunningInIframe(): boolean {
   try {
     return window.self !== window.top;
-  } catch (e) {
+  } catch {
     return true;
   }
 }
@@ -41,138 +43,283 @@ export function formatBytes(bytes: number, decimals: number = 2): string {
 }
 
 /**
- * Converts XLSX WorkBook to a binary Blob safely, ensuring no empty workbook crashes
+ * Synchronously encode UTF-8 text into a base64 data URL (safe for Arabic & Unicode).
  */
-export function excelWorkbookToBlob(wb: XLSX.WorkBook): Blob {
-  // Ensure workbook has at least one sheet
-  if (!wb.SheetNames || wb.SheetNames.length === 0) {
-    const ws = XLSX.utils.json_to_sheet([{ "حالة البيانات": "لا توجد سجلات مطابقة" }]);
-    XLSX.utils.book_append_sheet(wb, ws, "البيانات");
+export function textToDataUrl(text: string, mimeType: string): string | undefined {
+  try {
+    if (text.length > 4 * 1024 * 1024) return undefined;
+    const bytes = new TextEncoder().encode(text);
+    return uint8ArrayToDataUrl(bytes, mimeType);
+  } catch (err) {
+    console.warn('textToDataUrl failed:', err);
+    return undefined;
   }
-
-  const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
-  return new Blob([wbout], {
-    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-  });
 }
 
 /**
- * Robustly saves a file to the user's device memory/disk.
- * 1. Attempts File System Access API (window.showSaveFilePicker) to let user choose folder/path on device.
- * 2. If unsupported or restricted by iframe/security policies, falls back to direct browser download.
- * 3. Keeps Object URL alive and returns it so UI can also provide a direct clickable download button.
+ * Synchronously encode a Uint8Array into a base64 data URL.
  */
-export async function saveFileToDevice(
-  blob: Blob,
-  fileName: string,
-  mimeType: string,
-  description: string = 'ملف بيانات'
-): Promise<SaveFileResult> {
-  const sizeFormatted = formatBytes(blob.size);
-
-  // 1. Try File System Access API (Native "Save As" / اختيار مكان الحفظ dialog)
-  if (typeof (window as any).showSaveFilePicker === 'function') {
-    try {
-      const ext = fileName.includes('.') ? `.${fileName.split('.').pop()}` : '';
-      const handle = await (window as any).showSaveFilePicker({
-        suggestedName: fileName,
-        types: [{
-          description: description,
-          accept: {
-            [mimeType || 'application/octet-stream']: ext ? [ext] : []
-          }
-        }]
-      });
-
-      const writable = await handle.createWritable();
-      await writable.write(blob);
-      await writable.close();
-
-      return {
-        success: true,
-        method: 'picker',
-        fileName,
-        fileSizeFormatted: sizeFormatted
-      };
-    } catch (err: any) {
-      if (err.name === 'AbortError') {
-        // User closed or cancelled the picker dialog
-        return {
-          success: false,
-          userCancelled: true,
-          fileName,
-          fileSizeFormatted: sizeFormatted
-        };
-      }
-      console.warn('showSaveFilePicker threw or is blocked by iframe policy. Falling back to direct download:', err);
+export function uint8ArrayToDataUrl(bytes: Uint8Array, mimeType: string): string | undefined {
+  try {
+    if (bytes.byteLength > 6 * 1024 * 1024) return undefined;
+    const chunkSize = 0x8000;
+    const parts: string[] = [];
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const slice = bytes.subarray(i, i + chunkSize);
+      parts.push(String.fromCharCode(...slice));
     }
+    const base64 = btoa(parts.join(''));
+    return `data:${mimeType};base64,${base64}`;
+  } catch (err) {
+    console.warn('uint8ArrayToDataUrl failed:', err);
+    return undefined;
+  }
+}
+
+/**
+ * Converts XLSX WorkBook to a binary Blob + optional Data URL synchronously.
+ */
+export function excelWorkbookToBlobAndDataUrl(wb: XLSX.WorkBook): {
+  blob: Blob;
+  dataUrl?: string;
+} {
+  if (!wb.SheetNames || wb.SheetNames.length === 0) {
+    const ws = XLSX.utils.json_to_sheet([{ 'حالة البيانات': 'لا توجد سجلات مطابقة' }]);
+    XLSX.utils.book_append_sheet(wb, ws, 'البيانات');
   }
 
-  // 2. Direct browser download fallback with DOM attachment and persistent Blob URL
+  const mimeType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+  const bytes = new Uint8Array(wbout);
+  const blob = new Blob([bytes], { type: mimeType });
+  const dataUrl = uint8ArrayToDataUrl(bytes, mimeType);
+  return { blob, dataUrl };
+}
+
+/**
+ * Converts XLSX WorkBook to a binary Blob safely, ensuring no empty workbook crashes.
+ */
+export function excelWorkbookToBlob(wb: XLSX.WorkBook): Blob {
+  return excelWorkbookToBlobAndDataUrl(wb).blob;
+}
+
+/**
+ * Detect if the client is on mobile, tablet, Android, iOS, or inside a WebView / WebAPK
+ */
+export function isMobileOrWebView(): boolean {
+  if (typeof navigator === 'undefined' || typeof window === 'undefined') return false;
+  const ua = navigator.userAgent || '';
+  const isMobileUA = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile|mobile|wv|SamsungBrowser/i.test(ua);
+  const isTouchDevice = (typeof navigator.maxTouchPoints === 'number' && navigator.maxTouchPoints > 1) || ('ontouchstart' in window);
+  const isSmallScreen = typeof window.innerWidth === 'number' && window.innerWidth <= 1024;
+  return isMobileUA || (isTouchDevice && isSmallScreen);
+}
+
+/**
+ * Trigger an anchor download synchronously within the active user gesture.
+ */
+export function triggerAnchorDownloadSync(href: string, fileName: string): boolean {
   try {
-    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.style.display = 'none';
-    a.href = url;
+    a.href = href;
+    a.download = fileName;
     a.setAttribute('download', fileName);
+    a.rel = 'noopener noreferrer';
     document.body.appendChild(a);
-
-    // Simulate user click
     a.click();
 
-    // Clean up anchor tag, keep blob URL alive for 5 minutes for direct download button
     setTimeout(() => {
       try {
         if (document.body.contains(a)) {
           document.body.removeChild(a);
         }
-      } catch (e) {}
-    }, 1000);
+      } catch {}
+    }, 1500);
+    return true;
+  } catch (err) {
+    console.warn('triggerAnchorDownloadSync failed:', err);
+    return false;
+  }
+}
 
+/**
+ * Synchronously saves and downloads a file directly from the current interface.
+ * Does NOT await anything before calling `a.click()` so browser UserActivation
+ * is preserved inside iframes, WebAPKs, Android Chrome, and desktop browsers.
+ */
+export function saveFileToDeviceSync(
+  blob: Blob,
+  fileName: string,
+  mimeType: string,
+  options?: {
+    dataUrl?: string;
+    textContent?: string;
+  }
+): SaveFileResult {
+  const sizeFormatted = formatBytes(blob.size);
+  let dataUrl = options?.dataUrl;
+
+  if (!dataUrl && options?.textContent !== undefined) {
+    dataUrl = textToDataUrl(options.textContent, mimeType);
+  }
+
+  try {
+    const url = URL.createObjectURL(blob);
+
+    // Keep object URL alive for 10 minutes so the user can re-download from the same UI
     setTimeout(() => {
       try {
         URL.revokeObjectURL(url);
-      } catch (e) {}
-    }, 300000); // 5 minutes
+      } catch {}
+    }, 600000);
+
+    const triggered = triggerAnchorDownloadSync(url, fileName);
+
+    if (!triggered && dataUrl) {
+      triggerAnchorDownloadSync(dataUrl, fileName);
+    }
 
     return {
       success: true,
-      method: 'download',
+      method: triggered ? 'download' : dataUrl ? 'dataurl' : 'download',
       url,
+      dataUrl,
+      textContent: options?.textContent,
       fileName,
-      fileSizeFormatted: sizeFormatted
+      fileSizeFormatted: sizeFormatted,
     };
   } catch (err: any) {
-    console.error('Direct download fallback failed:', err);
+    console.error('Direct download failed:', err);
+    if (dataUrl) {
+      triggerAnchorDownloadSync(dataUrl, fileName);
+      return {
+        success: true,
+        method: 'dataurl',
+        dataUrl,
+        textContent: options?.textContent,
+        fileName,
+        fileSizeFormatted: sizeFormatted,
+      };
+    }
     return {
       success: false,
-      error: err.message || 'فشل حفظ الملف على الجهاز',
+      error: err?.message || 'فشل حفظ الملف على الجهاز',
       fileName,
-      fileSizeFormatted: sizeFormatted
+      fileSizeFormatted: sizeFormatted,
+      textContent: options?.textContent,
     };
   }
 }
 
 /**
- * Share file using Web Share API (especially on Android / iOS mobile devices to save to files/storage)
+ * Backwards-compatible wrapper around synchronous download trigger.
+ * Runs synchronously up through `a.click()` before resolving.
  */
-export async function shareFile(blob: Blob, fileName: string, mimeType: string): Promise<boolean> {
-  if (typeof navigator !== 'undefined' && 'canShare' in navigator) {
+export function saveFileToDevice(
+  blob: Blob,
+  fileName: string,
+  mimeType: string,
+  _description: string = 'ملف بيانات',
+  options?: {
+    dataUrl?: string;
+    textContent?: string;
+  }
+): Promise<SaveFileResult> {
+  return Promise.resolve(saveFileToDeviceSync(blob, fileName, mimeType, options));
+}
+
+/**
+ * Optional "Save As" picker when supported by the current context (top-level desktop Chrome/Edge).
+ */
+export async function saveFileWithPicker(
+  blob: Blob,
+  fileName: string,
+  mimeType: string
+): Promise<{ saved: boolean; cancelled?: boolean; error?: string }> {
+  const anyWin = window as any;
+  if (typeof anyWin.showSaveFilePicker !== 'function') {
+    return { saved: false, error: 'غير مدعوم في هذا المتصفح' };
+  }
+  try {
+    const ext = fileName.includes('.') ? '.' + fileName.split('.').pop() : '';
+    const handle = await anyWin.showSaveFilePicker({
+      suggestedName: fileName,
+      types: ext
+        ? [
+            {
+              description: fileName,
+              accept: { [mimeType]: [ext] },
+            },
+          ]
+        : undefined,
+    });
+    const writable = await handle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+    return { saved: true };
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      return { saved: false, cancelled: true };
+    }
+    return { saved: false, error: err?.message || 'تعذر فتح نافذة اختيار المجلد في هذا العرض' };
+  }
+}
+
+/**
+ * Share or save file using Web Share API (works on Android / iOS / WebAPK directly from the same UI).
+ * Handles Android Chrome restrictions on `application/json` and `text/vcard` by falling back to `text/plain`
+ * or sharing text directly when needed.
+ */
+export async function shareFile(
+  blob: Blob,
+  fileName: string,
+  mimeType: string,
+  textContent?: string
+): Promise<{ shared: boolean; reason?: string }> {
+  if (typeof navigator === 'undefined' || typeof navigator.share !== 'function') {
+    return { shared: false, reason: 'المشاركة المباشرة غير مدعومة في هذا المتصفح' };
+  }
+
+  const candidateTypes = [mimeType];
+  if (mimeType !== 'text/plain' && (mimeType.includes('json') || mimeType.includes('vcard') || mimeType.includes('csv'))) {
+    candidateTypes.push('text/plain');
+  }
+
+  for (const type of candidateTypes) {
     try {
-      const file = new File([blob], fileName, { type: mimeType });
-      if (navigator.canShare({ files: [file] })) {
-        await navigator.share({
-          files: [file],
-          title: fileName,
-          text: `ملف النسخة الاحتياطية: ${fileName}`
-        });
-        return true;
+      const file = new File([blob], fileName, { type });
+      const shareData: ShareData = {
+        files: [file],
+        title: fileName,
+        text: `ملف النسخة الاحتياطية: ${fileName}`,
+      };
+      if (typeof navigator.canShare !== 'function' || navigator.canShare({ files: [file] })) {
+        await navigator.share(shareData);
+        return { shared: true };
       }
     } catch (e: any) {
-      if (e.name !== 'AbortError') {
-        console.warn('navigator.share failed:', e);
+      if (e?.name === 'AbortError') {
+        return { shared: false, reason: 'تم إلغاء المشاركة' };
+      }
+      console.warn(`navigator.share failed for ${type}:`, e);
+    }
+  }
+
+  // Fallback for text backups inside restricted WebViews where file sharing isn't permitted
+  if (textContent && textContent.length <= 200000) {
+    try {
+      await navigator.share({
+        title: fileName,
+        text: textContent,
+      });
+      return { shared: true };
+    } catch (e: any) {
+      if (e?.name === 'AbortError') {
+        return { shared: false, reason: 'تم إلغاء المشاركة' };
       }
     }
   }
-  return false;
+
+  return { shared: false, reason: 'المشاركة غير متاحة داخل هذا الإطار، يمكنك التنزيل المباشر أو نسخ المحتوى أدناه' };
 }

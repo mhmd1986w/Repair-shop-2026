@@ -18,13 +18,13 @@ export const ARABIC_FONTS = [
 
 export const LINE_HEIGHT_OPTIONS = [1.0, 1.2, 1.4, 1.6, 1.8, 2.0];
 
-export const RECEIPT_FONT_SIZES = [10, 11, 12, 13, 14, 16, 18];
-export const LABEL_FONT_SIZES = [6, 7, 8, 9, 10, 11, 12, 14];
+export const RECEIPT_FONT_SIZES = [10, 11, 12, 13, 14, 16, 18, 24];
+export const LABEL_FONT_SIZES = [10, 11, 12, 13, 14, 16, 18, 24];
 
 export function getStoredReceiptFormat(): PrintFormatConfig {
   return {
     fontFamily: localStorage.getItem('rcptFontFamily') || 'Cairo',
-    fontSize: Number(localStorage.getItem('rcptFontSize')) || 12,
+    fontSize: Math.max(10, Math.min(99, Number(localStorage.getItem('rcptFontSize')) || 12)),
     textAlign: 'center',
     verticalAlign: 'center',
     lineHeight: Number(localStorage.getItem('rcptLineHeight')) || 1.3,
@@ -35,7 +35,7 @@ export function getStoredReceiptFormat(): PrintFormatConfig {
 export function getStoredLabelFormat(): PrintFormatConfig {
   return {
     fontFamily: localStorage.getItem('lblFontFamily') || 'Cairo',
-    fontSize: Number(localStorage.getItem('lblFontSize')) || 8,
+    fontSize: Math.max(10, Math.min(99, Number(localStorage.getItem('lblFontSize')) || 10)),
     textAlign: 'center',
     verticalAlign: 'center',
     lineHeight: Number(localStorage.getItem('lblLineHeight')) || 1.15,
