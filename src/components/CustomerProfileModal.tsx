@@ -44,7 +44,7 @@ import { buildTrackingUrl, getEffectiveAppUrl } from '../utils/appDomain';
 import {
   printHtmlViaIframe,
   printPureContent,
-  downloadPrintableHtml,
+  downloadPrintablePdf,
   isEmbeddedIframe
 } from '../lib/printUtils';
 import { renderPrintableBarcodeSvg } from '../utils/barcode';
@@ -111,7 +111,10 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
     fullHtml: string;
     kind: 'label' | 'receipt' | 'sticker' | 'report';
     previewMinHeightPx: number;
+    widthMm?: number;
+    heightMm?: number;
   } | null>(null);
+  const [isDownloadingPdf, setIsDownloadingPdf] = useState(false);
   const currencyName = localStorage.getItem('currencyName') || 'دينار';
   const centerName = localStorage.getItem('centerName') || 'مركز الصيانة الذكي';
 
@@ -309,12 +312,14 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
     setPrintPreviewDoc({
       title: 'ملصق QR الزبون (38×25 مم)',
       subtitle: primaryOrderId ? `${displayName} · ${primaryOrderId}` : displayName,
-      filename: `customer-qr-${primaryOrderId || 'profile'}.html`,
+      filename: `customer-qr-${primaryOrderId || 'profile'}.pdf`,
       contentHtml: bodyContent,
       pageStyle: stickerStyle,
       fullHtml: html,
       kind: 'sticker',
       previewMinHeightPx: 190,
+      widthMm: 38,
+      heightMm: 25,
     });
   };
 
@@ -800,7 +805,7 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
         <head>
           <meta charset="utf-8">
           <title>ملصق صيانة - ${order.id}</title>
-          <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800;900&family=Tajawal:wght@400;500;700;800;900&display=swap" />
+          <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800;900&family=Tajawal:wght@400;500;700;800;900&display=swap" crossorigin="anonymous" />
           <style>
             html, body {
               margin: 0;
@@ -828,12 +833,14 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
     setPrintPreviewDoc({
       title: `ملصق الباركود الحراري (${widthLabel} × ${heightLabel})`,
       subtitle: `طلب ${order.id} · ${order.brandModel}`,
-      filename: `label-${order.id}.html`,
+      filename: `label-${order.id}.pdf`,
       contentHtml,
       pageStyle: labelStyle,
       fullHtml,
       kind: 'label',
       previewMinHeightPx: 210,
+      widthMm: containerStyles.widthMm,
+      heightMm: containerStyles.heightMm,
     });
   };
 
@@ -1083,7 +1090,7 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
         <head>
           <meta charset="utf-8">
           <title>إيصال استلام صيانة - ${order.id}</title>
-          <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800;900&display=swap" />
+          <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800;900&display=swap" crossorigin="anonymous" />
           <style>
             html, body { margin: 0; padding: 8px; background: #ffffff; }
             ${receiptStyle}
@@ -1102,12 +1109,13 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
     setPrintPreviewDoc({
       title: `إيصال استلام الصيانة (${rcptSize})`,
       subtitle: `طلب ${order.id} · ${order.customerName}`,
-      filename: `receipt-${order.id}.html`,
+      filename: `receipt-${order.id}.pdf`,
       contentHtml,
       pageStyle: receiptStyle,
       fullHtml,
       kind: 'receipt',
       previewMinHeightPx: 430,
+      widthMm: rcptSize === '58mm' ? 58 : rcptSize === 'A4' ? 210 : 80,
     });
   };
 
@@ -1737,7 +1745,7 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
 
             {isEmbeddedIframe() && (
               <div className="bg-amber-50 border-b border-amber-200 px-4 py-2.5 text-[11px] text-amber-900 font-bold leading-relaxed">
-                تم تجهيز {printPreviewDoc.kind === 'receipt' ? 'الإيصال' : 'الملصق'} وإرسال أمر الطباعة. إذا حظر متصفح المعاينة المدمج فتح الطابعة تلقائياً، استخدم زر <span className="underline">تنزيل نسخة للطباعة</span> أو افتح التطبيق في متصفح مستقل.
+                تم تجهيز {printPreviewDoc.kind === 'receipt' ? 'الإيصال' : 'الملصق'} وإرسال أمر الطباعة. إذا حظر متصفح المعاينة المدمج فتح الطابعة تلقائياً، استخدم زر <span className="underline">PDF</span> لتنزيل نسخة للطباعة أو افتح التطبيق في متصفح مستقل.
               </div>
             )}
 
@@ -1763,12 +1771,28 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
               </button>
               <button
                 type="button"
-                onClick={() => downloadPrintableHtml(printPreviewDoc.filename, printPreviewDoc.fullHtml)}
-                className="py-2.5 px-3 bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-200 font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 transition-all cursor-pointer"
-                title="حفظ الملف لطباعته من المتصفح أو تطبيق الطباعة"
+                disabled={isDownloadingPdf}
+                onClick={async () => {
+                  if (isDownloadingPdf) return;
+                  setIsDownloadingPdf(true);
+                  try {
+                    await downloadPrintablePdf({
+                      filename: printPreviewDoc.filename,
+                      contentHtml: printPreviewDoc.contentHtml,
+                      pageStyle: printPreviewDoc.pageStyle,
+                      widthMm: printPreviewDoc.widthMm,
+                      heightMm: printPreviewDoc.heightMm,
+                      kind: printPreviewDoc.kind,
+                    });
+                  } finally {
+                    setIsDownloadingPdf(false);
+                  }
+                }}
+                className="py-2.5 px-4 bg-amber-50 hover:bg-amber-100 disabled:opacity-60 text-amber-900 border border-amber-200 font-extrabold text-xs rounded-xl flex items-center justify-center gap-1.5 transition-all cursor-pointer"
+                title="تنزيل الملف بصيغة PDF"
               >
                 <Download className="w-4 h-4" />
-                <span>تنزيل HTML</span>
+                <span dir="ltr">{isDownloadingPdf ? '...' : 'PDF'}</span>
               </button>
               <button
                 type="button"
