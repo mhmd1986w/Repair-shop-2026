@@ -29,6 +29,8 @@ interface DashboardViewProps {
   onSendWhatsAppReminder: (order: MaintenanceOrder) => void;
   overdueOrders?: MaintenanceOrder[];
   onScanClick?: () => void;
+  initialSearchTerm?: string;
+  onClearInitialSearch?: () => void;
   onViewCustomer?: (name: string, phone?: string) => void;
   onAddOrderClick?: () => void;
   canAddOrder?: boolean;
@@ -41,6 +43,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onSendWhatsAppReminder,
   overdueOrders = [],
   onScanClick,
+  initialSearchTerm,
+  onClearInitialSearch,
   onViewCustomer,
   onAddOrderClick,
   canAddOrder = true
@@ -161,6 +165,15 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const recognitionRef = React.useRef<any>(null);
 
   React.useEffect(() => {
+    if (initialSearchTerm) {
+      setSearchTerm(initialSearchTerm);
+      if (onClearInitialSearch) {
+        onClearInitialSearch();
+      }
+    }
+  }, [initialSearchTerm, onClearInitialSearch]);
+
+  React.useEffect(() => {
     return () => {
       if (recognitionRef.current) {
         try { recognitionRef.current.stop(); } catch (_) {}
@@ -251,9 +264,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     const term = searchTerm.trim().toLowerCase();
     const cleanTerm = term.replace(/[\s-+]/g, '');
     return orders.filter(o => 
-      o.id.toLowerCase().includes(term) ||
-      o.customerName.toLowerCase().includes(term) ||
-      (o.customerPhone && o.customerPhone.replace(/[\s-+]/g, '').includes(cleanTerm)) ||
+      (o.id || '').toLowerCase().includes(term) ||
+      (o.customerName || '').toLowerCase().includes(term) ||
+      (Boolean(cleanTerm) && o.customerPhone && o.customerPhone.replace(/[\s-+]/g, '').includes(cleanTerm)) ||
       (o.brandModel && o.brandModel.toLowerCase().includes(term)) ||
       (o.serialNumber && o.serialNumber.toLowerCase().includes(term))
     );
@@ -262,10 +275,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!searchTerm.trim()) return;
+    const isOrderCompleted = (o: MaintenanceOrder) =>
+      o.status === DeviceStatus.DELIVERED || o.status === DeviceStatus.UNREPAIRABLE;
     if (dashboardSearchResults.length === 1) {
-      onNavigateToOrders('orders', 'all', dashboardSearchResults[0].id);
+      const targetTab = isOrderCompleted(dashboardSearchResults[0]) ? 'completed' : 'orders';
+      onNavigateToOrders(targetTab, 'all', dashboardSearchResults[0].id);
     } else if (dashboardSearchResults.length > 0) {
-      onNavigateToOrders('orders', 'all', searchTerm.trim());
+      const allCompleted = dashboardSearchResults.every(isOrderCompleted);
+      onNavigateToOrders(allCompleted ? 'completed' : 'orders', 'all', searchTerm.trim());
     } else {
       onNavigateToOrders('orders', 'all', searchTerm.trim());
     }
@@ -363,7 +380,12 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               {dashboardSearchResults.length > 0 && (
                 <button
                   type="button"
-                  onClick={() => onNavigateToOrders('orders', 'all', searchTerm.trim())}
+                  onClick={() => {
+                    const allCompleted = dashboardSearchResults.every(
+                      (o) => o.status === DeviceStatus.DELIVERED || o.status === DeviceStatus.UNREPAIRABLE
+                    );
+                    onNavigateToOrders(allCompleted ? 'completed' : 'orders', 'all', searchTerm.trim());
+                  }}
                   className="text-teal-700 hover:text-teal-900 font-bold underline cursor-pointer text-xs flex items-center gap-1"
                 >
                   <span>عرض جميع النتائج في جدول طلبات الصيانة</span>
@@ -381,7 +403,12 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 {dashboardSearchResults.slice(0, 9).map((item) => (
                   <div
                     key={item.id}
-                    onClick={() => onNavigateToOrders('orders', 'all', item.id)}
+                    onClick={() => {
+                      const isCompleted =
+                        item.status === DeviceStatus.DELIVERED ||
+                        item.status === DeviceStatus.UNREPAIRABLE;
+                      onNavigateToOrders(isCompleted ? 'completed' : 'orders', 'all', item.id);
+                    }}
                     className="p-3.5 bg-gray-50 hover:bg-teal-50/60 border border-gray-200/70 hover:border-teal-200 rounded-2xl transition-all cursor-pointer flex flex-col justify-between gap-2.5 text-right group shadow-xs hover:shadow-sm"
                   >
                     <div className="flex justify-between items-start gap-2">

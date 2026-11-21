@@ -44,6 +44,8 @@ interface ContactsViewProps {
   onSaveCustomer?: (customer: CustomerProfile) => Promise<void>;
   onDeleteCustomer?: (customerId: string) => Promise<void>;
   onScanClick?: () => void;
+  initialSearchTerm?: string;
+  onClearInitialSearch?: () => void;
   currentUser: AppUser | null;
   onClearNames?: (clearAll: boolean) => void;
   onViewCustomer?: (name: string, phone?: string, customer?: CustomerProfile) => void;
@@ -69,12 +71,23 @@ export const ContactsView: React.FC<ContactsViewProps> = ({
   onSaveCustomer,
   onDeleteCustomer,
   onScanClick,
+  initialSearchTerm,
+  onClearInitialSearch,
   currentUser,
   onClearNames,
   onViewCustomer,
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [showAddModal, setShowAddModal] = useState(false);
+
+  useEffect(() => {
+    if (initialSearchTerm) {
+      setSearchTerm(initialSearchTerm);
+      if (onClearInitialSearch) {
+        onClearInitialSearch();
+      }
+    }
+  }, [initialSearchTerm, onClearInitialSearch]);
   const [newName, setNewName] = useState('');
   const [newPhone, setNewPhone] = useState('');
   const [newBarcode, setNewBarcode] = useState('');
@@ -147,14 +160,14 @@ export const ContactsView: React.FC<ContactsViewProps> = ({
       }
 
       if (!targetKey) {
-        targetKey = order.customerPhone.trim() || order.customerName.trim();
+        targetKey = (order.customerPhone || '').trim() || (order.customerName || '').trim();
         if (!targetKey) return;
         if (!itemsMap.has(targetKey)) {
           itemsMap.set(targetKey, {
             id: targetKey,
             profile: null,
-            name: order.customerName,
-            phone: order.customerPhone,
+            name: order.customerName || 'بدون اسم',
+            phone: order.customerPhone || '',
             customerBarcode: order.customerBarcode || '',
             totalDevices: 0,
             latestOrderDate: order.createdAt || 0,
@@ -179,9 +192,9 @@ export const ContactsView: React.FC<ContactsViewProps> = ({
       .filter((c) => {
         if (!q) return true;
         return (
-          c.name.toLowerCase().includes(q) ||
-          c.phone.toLowerCase().includes(q) ||
-          c.orders.some((o) => o.id.toLowerCase().includes(q))
+          (c.name || '').toLowerCase().includes(q) ||
+          (c.phone || '').toLowerCase().includes(q) ||
+          c.orders.some((o) => (o.id || '').toLowerCase().includes(q))
         );
       })
       .sort((a, b) => b.latestOrderDate - a.latestOrderDate);

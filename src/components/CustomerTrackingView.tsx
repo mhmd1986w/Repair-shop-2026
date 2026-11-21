@@ -5,6 +5,7 @@ import { Search, MapPin, Calendar, CreditCard, Clock, Wrench, ShieldCheck, HelpC
 import { QRCodeGenerator } from './QRCodeGenerator';
 import { buildTrackingUrl } from '../utils/appDomain';
 import { extractScannedBarcodeId } from '../utils/barcode';
+import { resolveScannedOrderId } from '../utils/customerBarcode';
 import { StatusSnapshotBadges } from './StatusSnapshotBadges';
 
 interface CustomerTrackingViewProps {
@@ -49,17 +50,24 @@ export const CustomerTrackingView: React.FC<CustomerTrackingViewProps> = ({
     setSearched(true);
     setCustomerHistory([]); // Clear past history
     setDeviceOrders([]);
+    setReviewRating(0);
+    setReviewComment('');
+    setReviewSuccess(false);
     try {
       const allOrders = await dbService.getOrders();
-      const extracted = extractScannedBarcodeId(idToSearch);
+      const resolvedId = resolveScannedOrderId(idToSearch, allOrders);
+      if (resolvedId && resolvedId !== idToSearch.trim()) {
+        setOrderId(resolvedId);
+      }
+      const extracted = resolvedId || extractScannedBarcodeId(idToSearch);
       const term = (extracted || idToSearch.trim()).toUpperCase();
       
       // Find orders matching the ID, phone, serial number, or customer name
       const cleanTerm = term.replace(/[\s-+]/g, '');
       const matched = allOrders.filter(
         (o: MaintenanceOrder) => 
-          ((o.id.toUpperCase() === term || 
-          (o.customerPhone && o.customerPhone.replace(/[\s-+]/g, '') === cleanTerm) ||
+          (((o.id || '').toUpperCase() === term || 
+          (Boolean(cleanTerm) && o.customerPhone && o.customerPhone.replace(/[\s-+]/g, '') === cleanTerm) ||
           (o.serialNumber && o.serialNumber.toUpperCase() === term) ||
           (o.customerName && o.customerName.toUpperCase().includes(term)))) &&
           !isContactOrder(o)
@@ -85,12 +93,15 @@ export const CustomerTrackingView: React.FC<CustomerTrackingViewProps> = ({
 
         // Fetch customer history (excluding current device orders to prevent duplication)
         const devOrderIds = new Set(devOrders.map(o => o.id));
-        const history = allOrders.filter(
-          (o: MaintenanceOrder) => 
-            o.customerPhone === latestMatching.customerPhone && 
-            !devOrderIds.has(o.id) &&
-            !isContactOrder(o)
-        );
+        const hasPhone = Boolean(latestMatching.customerPhone?.trim());
+        const history = hasPhone
+          ? allOrders.filter(
+              (o: MaintenanceOrder) => 
+                o.customerPhone === latestMatching.customerPhone && 
+                !devOrderIds.has(o.id) &&
+                !isContactOrder(o)
+            )
+          : [];
         setCustomerHistory(history);
       } else {
         setOrder(null);

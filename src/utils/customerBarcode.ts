@@ -281,8 +281,8 @@ export function linkOrderWithCustomer(
 } {
   const usedIds = new Set(existingCustomers.map((c) => c.id));
   const usedBarcodes = new Set<string>([
-    ...existingCustomers.map((c) => c.customerBarcode.toUpperCase()),
-    ...allOrders.map((o) => o.id.toUpperCase()),
+    ...existingCustomers.map((c) => (c.customerBarcode || '').toUpperCase()).filter(Boolean),
+    ...allOrders.map((o) => (o.id || '').toUpperCase()).filter(Boolean),
   ]);
 
   let matched: CustomerProfile | undefined;
@@ -291,7 +291,7 @@ export function linkOrderWithCustomer(
   }
   if (!matched && order.customerBarcode) {
     const code = sanitizeCustomCustomerBarcode(order.customerBarcode);
-    matched = existingCustomers.find((c) => c.customerBarcode.toUpperCase() === code);
+    matched = existingCustomers.find((c) => (c.customerBarcode || '').toUpperCase() === code);
   }
   if (!matched && order.customerPhone) {
     matched = existingCustomers.find((c) => phonesMatch(c.phone, order.customerPhone));
@@ -364,7 +364,7 @@ export function resolveScannedBarcodeTarget(
       .filter((o) => {
         if (cust) {
           if (o.customerId && o.customerId === cust.id) return true;
-          if (o.customerBarcode && o.customerBarcode.toUpperCase() === cust.customerBarcode.toUpperCase()) return true;
+          if (o.customerBarcode && cust.customerBarcode && o.customerBarcode.toUpperCase() === cust.customerBarcode.toUpperCase()) return true;
           if (cust.phone && phonesMatch(o.customerPhone, cust.phone)) return true;
           if (!cust.phone && normalizeCustomerNameKey(o.customerName) === normalizeCustomerNameKey(cust.name)) return true;
         }
@@ -380,7 +380,7 @@ export function resolveScannedBarcodeTarget(
       if (byId) return byId;
     }
     if (ord.customerBarcode) {
-      const byCode = customers.find((c) => c.customerBarcode.toUpperCase() === ord.customerBarcode!.toUpperCase());
+      const byCode = customers.find((c) => (c.customerBarcode || '').toUpperCase() === ord.customerBarcode!.toUpperCase());
       if (byCode) return byCode;
     }
     if (ord.customerPhone) {
@@ -408,7 +408,7 @@ export function resolveScannedBarcodeTarget(
 
   // 1. Exact Customer Barcode match
   const matchedCustomer = customers.find(
-    (c) => c.customerBarcode.trim().toUpperCase() === normalizedCode
+    (c) => (c.customerBarcode || '').trim().toUpperCase() === normalizedCode
   );
   if (matchedCustomer) {
     const custOrders = getOrdersForCustomer(matchedCustomer);
@@ -426,7 +426,7 @@ export function resolveScannedBarcodeTarget(
   // 2. Exact Order ID or Device Barcode match
   const matchedOrder = realOrders.find(
     (o) =>
-      o.id.trim().toUpperCase() === normalizedCode ||
+      (o.id || '').trim().toUpperCase() === normalizedCode ||
       (o.deviceBarcode && o.deviceBarcode.trim().toUpperCase() === normalizedCode)
   );
   if (matchedOrder) {
@@ -737,4 +737,521 @@ export function buildOrderCustomerQrPayload({
     lineCost,
   ].join('\n');
 }
+
+export interface ParsedOrderCustomerQrPayload {
+  isStructured: boolean;
+  explicitOrderId: string | null;
+  embeddedOrderIds: string[];
+  customerCode: string | null;
+  customerName: string | null;
+  customerPhone: string | null;
+  fault: string | null;
+  receivedDate: string | null;
+  cost: number | null;
+}
+
+function normalizeArabicDigitsAndBidi(text: string): string {
+  return (text || '')
+    .replace(/[\u0660-\u0669]/g, (d) => String(d.charCodeAt(0) - 0x0660))
+    .replace(/[\u06F0-\u06F9]/g, (d) => String(d.charCodeAt(0) - 0x06F0))
+    .replace(/[\u200E\u200F\u202A-\u202E\uFEFF]/g, '')
+    .trim();
+}
+
+function normalizeArabicTextForMatch(text?: string): string {
+  if (!text) return '';
+  return normalizeArabicDigitsAndBidi(text)
+    .replace(/[\u064B-\u065F\u0670\u0640]/g, '') // diacritics + tatweel
+    .replace(/[أإآٱ]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/[ىئ]/g, 'ي')
+    .replace(/ؤ/g, 'و')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function normalizeDateToYmd(raw?: string): string {
+  if (!raw) return '';
+  const cleaned = normalizeArabicDigitsAndBidi(raw);
+  const ymd = cleaned.match(/(\d{4})[\/\-.\s](\d{1,2})[\/\-.\s](\d{1,2})/);
+  if (ymd) {
+    return `${ymd[1]}-${ymd[2].padStart(2, '0')}-${ymd[3].padStart(2, '0')}`;
+  }
+  const dmy = cleaned.match(/(\d{1,2})[\/\-.\s](\d{1,2})[\/\-.\s](\d{4})/);
+  if (dmy) {
+    return `${dmy[3]}-${dmy[2].padStart(2, '0')}-${dmy[1].padStart(2, '0')}`;
+  }
+  return '';
+}
+
+function safeDecodeUriSegment(val: string): string {
+  try {
+    return decodeURIComponent(val);
+  } catch {
+    return val;
+  }
+}
+
+function extractUrlOrderParam(text: string): string | null {
+  const cleaned = normalizeArabicDigitsAndBidi(text).replace(/[\r\n]/g, '').trim();
+  if (!cleaned) return null;
+  try {
+    if (/^https?:\/\//i.test(cleaned) || /[?&](?:track|order|id|code)=/i.test(cleaned)) {
+      const url = new URL(cleaned.startsWith('http') ? cleaned : `https://example.com/${cleaned.replace(/^\/+/, '')}`);
+      const paramId =
+        url.searchParams.get('track') ||
+        url.searchParams.get('order') ||
+        url.searchParams.get('id') ||
+        url.searchParams.get('code');
+      if (paramId && paramId.trim()) {
+        return paramId.trim().toUpperCase();
+      }
+      const pathMatch = url.pathname.match(/\/(?:track|ticket|order)\/([^/?#]+)/i);
+      if (pathMatch?.[1]) {
+        return safeDecodeUriSegment(pathMatch[1]).trim().toUpperCase();
+      }
+    }
+  } catch {
+    // Fall through to regex
+  }
+  const queryFallback = cleaned.match(/[?&](?:track|order|id|code)=([^&#\s]+)/i);
+  if (queryFallback?.[1]) {
+    return safeDecodeUriSegment(queryFallback[1]).trim().toUpperCase();
+  }
+  return null;
+}
+
+export function parseOrderCustomerQrPayload(rawCode: string): ParsedOrderCustomerQrPayload {
+  const normalized = normalizeArabicDigitsAndBidi(rawCode);
+  const splitNormalized = normalized.replace(
+    /\s+(?=(?:اسم العميل|اسم الزبون|الاسم|رقم الموبايل|موبايل العميل|الموبايل|رقم الهاتف|هاتف العميل|الهاتف|رقم الجوال|جوال العميل|الجوال|العطل|المشكلة|وصف العطل|تاريخ الاستلام|التاريخ|التكلفة|السعر|المبلغ|رقم الطلب|باركود الطلب|كود الزبون|رمز الزبون|الأجهزة|Order\s*ID|Customer\s*Code|Customer\s*Name|Phone|Mobile|Fault|Date|Cost)\s*[:：])/gi,
+    '\n'
+  );
+  const lines = splitNormalized.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+  const hasLabeledField = /(?:اسم العميل|الاسم|رقم الموبايل|الموبايل|رقم الهاتف|الهاتف|الجوال|العطل|تاريخ الاستلام|التكلفة|رقم الطلب|باركود الطلب|كود الزبون|ملف الزبون|Order\s*ID|Customer\s*Code)\s*[:：\-]?/i.test(
+    normalized
+  );
+  const isStructured = lines.length > 1 || hasLabeledField;
+
+  let explicitOrderId: string | null = null;
+  const embeddedOrderIds: string[] = [];
+  let customerCode: string | null = null;
+  let customerName: string | null = null;
+  let customerPhone: string | null = null;
+  let fault: string | null = null;
+  let receivedDate: string | null = null;
+  let cost: number | null = null;
+
+  for (const line of lines) {
+    const orderMatch = line.match(/^(?:رقم الطلب|باركود الطلب|Order(?:\s*ID)?)\s*[:：]\s*(.+)$/i);
+    if (orderMatch?.[1]?.trim()) {
+      explicitOrderId = orderMatch[1].trim().toUpperCase();
+      continue;
+    }
+
+    const codeMatch = line.match(/^(?:كود الزبون|رمز الزبون|الكود|Customer\s*Code)\s*[:：]\s*(.+)$/i);
+    if (codeMatch?.[1]?.trim()) {
+      customerCode = codeMatch[1].trim().toUpperCase();
+      continue;
+    }
+
+    const nameMatch = line.match(/^(?:اسم العميل|اسم الزبون|العميل|الزبون|الاسم|Customer\s*Name|Name)\s*[:：]\s*(.+)$/i);
+    if (nameMatch?.[1]?.trim()) {
+      const val = nameMatch[1].trim();
+      if (val && val !== 'بدون اسم') customerName = val;
+      continue;
+    }
+
+    const phoneMatch = line.match(/^(?:رقم الموبايل|موبايل العميل|الموبايل|رقم الهاتف|هاتف العميل|الهاتف|رقم الجوال|جوال العميل|الجوال|Phone|Mobile)\s*[:：]\s*(.+)$/i);
+    if (phoneMatch?.[1]?.trim()) {
+      const val = phoneMatch[1].trim();
+      if (val && !val.includes('غير مسجل')) {
+        const digits = normalizeCustomerPhone(val);
+        if (digits.length >= 6) customerPhone = digits;
+      }
+      continue;
+    }
+
+    const faultMatch = line.match(/^(?:العطل|المشكلة|وصف العطل|Fault)\s*[:：]\s*(.+)$/i);
+    if (faultMatch?.[1]?.trim()) {
+      const val = faultMatch[1].trim();
+      if (val && val !== 'غير محدد') fault = val;
+      continue;
+    }
+
+    const dateMatch = line.match(/^(?:تاريخ الاستلام|التاريخ|Date)\s*[:：]\s*(.+)$/i);
+    if (dateMatch?.[1]?.trim()) {
+      const ymd = normalizeDateToYmd(dateMatch[1].trim());
+      if (ymd) receivedDate = ymd;
+      continue;
+    }
+
+    const costMatch = line.match(/^(?:التكلفة|السعر|المبلغ|Cost)\s*[:：]\s*(.+)$/i);
+    if (costMatch?.[1]?.trim()) {
+      const numMatch = costMatch[1].replace(/,/g, '').match(/(\d+(?:\.\d+)?)/);
+      if (numMatch?.[1]) {
+        const parsedNum = Number(numMatch[1]);
+        if (!Number.isNaN(parsedNum)) cost = parsedNum;
+      }
+      continue;
+    }
+
+    // Customer profile QR device lines: "- TEC2611160001 | هاتف | ..."
+    const bulletOrderMatch = line.match(/^[-•*]\s*([A-Z0-9][A-Z0-9\-_]{3,})\b/i);
+    if (bulletOrderMatch?.[1]) {
+      const candidate = bulletOrderMatch[1].trim().toUpperCase();
+      if (!embeddedOrderIds.includes(candidate)) {
+        embeddedOrderIds.push(candidate);
+      }
+    }
+  }
+
+  // Also capture any known order ID tokens anywhere in the text
+  const knownTokenMatches = normalized.match(/\b(?:TEC|TCH|FIX|REP|SRV|DEV|WRK|MOB|ORD)[A-Z0-9\-]{4,}\b/gi);
+  if (knownTokenMatches) {
+    for (const token of knownTokenMatches) {
+      const upper = token.trim().toUpperCase();
+      if (!embeddedOrderIds.includes(upper)) {
+        embeddedOrderIds.push(upper);
+      }
+    }
+  }
+
+  return {
+    isStructured,
+    explicitOrderId,
+    embeddedOrderIds,
+    customerCode,
+    customerName,
+    customerPhone,
+    fault,
+    receivedDate,
+    cost,
+  };
+}
+
+function pickPreferredOrder(candidates: MaintenanceOrder[]): MaintenanceOrder | null {
+  if (!candidates || candidates.length === 0) return null;
+  const sorted = [...candidates].sort((a, b) => {
+    const aActive = a.status !== DeviceStatus.DELIVERED && a.status !== DeviceStatus.UNREPAIRABLE ? 1 : 0;
+    const bActive = b.status !== DeviceStatus.DELIVERED && b.status !== DeviceStatus.UNREPAIRABLE ? 1 : 0;
+    if (aActive !== bActive) return bActive - aActive;
+    return (b.createdAt || 0) - (a.createdAt || 0);
+  });
+  return sorted[0];
+}
+
+/**
+ * Resolves any scanned QR/barcode payload back to the matching MaintenanceOrder in records.
+ * Supports:
+ * - Direct order ID / device barcode / tracking URL
+ * - 5-field Arabic Order QR (اسم العميل / رقم الموبايل / العطل / تاريخ الاستلام / التكلفة)
+ * - Customer Profile QR (ملف الزبون / الأجهزة / الهاتف / كود الزبون)
+ * - Serial number / customer barcode / phone number
+ */
+export function resolveScannedOrderFromRecords(
+  rawCode: string,
+  orders: MaintenanceOrder[],
+  customers: CustomerProfile[] = []
+): MaintenanceOrder | null {
+  const normalizedRaw = normalizeArabicDigitsAndBidi(rawCode);
+  if (!normalizedRaw) return null;
+
+  const realOrders = (orders || []).filter((o) => o && !isContactOrder(o));
+  if (realOrders.length === 0) return null;
+
+  const parsed = parseOrderCustomerQrPayload(normalizedRaw);
+  const urlParam = extractUrlOrderParam(normalizedRaw);
+
+  const findExactOrderById = (code?: string | null): MaintenanceOrder | null => {
+    if (!code) return null;
+    const upper = code.trim().toUpperCase();
+    if (!upper) return null;
+    return (
+      realOrders.find(
+        (o) =>
+          (o.id || '').trim().toUpperCase() === upper ||
+          (o.deviceBarcode && o.deviceBarcode.trim().toUpperCase() === upper)
+      ) || null
+    );
+  };
+
+  // 1. Direct Order ID / Device Barcode / URL param / Explicit QR Order ID
+  const directCandidates = [
+    parsed.explicitOrderId,
+    urlParam,
+    !parsed.isStructured ? normalizedRaw.toUpperCase() : null,
+    !parsed.isStructured ? extractScannedBarcodeId(normalizedRaw) : null,
+  ];
+  for (const candidate of directCandidates) {
+    const exact = findExactOrderById(candidate);
+    if (exact) return exact;
+  }
+
+  // 2. Embedded Order IDs inside multi-line QR (e.g., Customer Profile QR "- TEC...")
+  if (parsed.embeddedOrderIds.length > 0) {
+    const matchedEmbedded = parsed.embeddedOrderIds
+      .map((id) => findExactOrderById(id))
+      .filter((o): o is MaintenanceOrder => Boolean(o));
+    if (matchedEmbedded.length > 0) {
+      return matchedEmbedded[0];
+    }
+  }
+
+  // Also check if any existing order.id appears verbatim inside the scanned payload (supports any custom ID format)
+  if (parsed.isStructured) {
+    const upperPayload = normalizedRaw.toUpperCase();
+    const containedOrders = realOrders.filter((o) => {
+      const id = (o.id || '').trim().toUpperCase();
+      if (id.length < 4) return false;
+      const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return new RegExp(`(?:^|[^A-Z0-9])${escaped}(?:$|[^A-Z0-9])`).test(upperPayload);
+    });
+    if (containedOrders.length > 0) {
+      return pickPreferredOrder(containedOrders);
+    }
+  }
+
+  // 3. Structured 5-field Order QR or Customer Profile QR matching against order records
+  if (
+    parsed.isStructured &&
+    (parsed.customerName || parsed.customerPhone || parsed.fault || parsed.receivedDate || parsed.cost !== null || parsed.customerCode)
+  ) {
+    const parsedNameNorm = normalizeArabicTextForMatch(parsed.customerName || '');
+    const parsedFaultRaw = (parsed.fault || '').replace(/\.{2,}$/, '').trim();
+    const parsedFaultNorm = normalizeArabicTextForMatch(parsedFaultRaw);
+
+    const matchedCustomer = (customers || []).find((c) => {
+      if (parsed.customerCode && c.customerBarcode?.trim().toUpperCase() === parsed.customerCode) return true;
+      if (parsed.customerPhone && phonesMatch(c.phone, parsed.customerPhone)) return true;
+      if (parsedNameNorm && normalizeArabicTextForMatch(c.name) === parsedNameNorm) return true;
+      return false;
+    }) || null;
+
+    let bestOrder: MaintenanceOrder | null = null;
+    let bestScore = 0;
+
+    for (const o of realOrders) {
+      let score = 0;
+      let hasIdentityMatch = false;
+      let hasDateMatch = false;
+      let hasFaultMatch = false;
+
+      if (parsed.customerPhone) {
+        if (o.customerPhone && phonesMatch(o.customerPhone, parsed.customerPhone)) {
+          score += 45;
+          hasIdentityMatch = true;
+        } else if (o.customerPhone && normalizeCustomerPhone(o.customerPhone).length >= 6) {
+          score -= 35;
+        }
+      }
+
+      const orderNameNorm = normalizeArabicTextForMatch(o.customerName);
+      if (parsedNameNorm) {
+        if (orderNameNorm === parsedNameNorm) {
+          score += 40;
+          hasIdentityMatch = true;
+        } else if (
+          orderNameNorm &&
+          (orderNameNorm.includes(parsedNameNorm) || parsedNameNorm.includes(orderNameNorm))
+        ) {
+          score += 22;
+          hasIdentityMatch = true;
+        } else if (
+          !matchedCustomer ||
+          (o.customerId !== matchedCustomer.id &&
+            o.customerBarcode?.toUpperCase() !== matchedCustomer.customerBarcode?.toUpperCase())
+        ) {
+          score -= 25;
+        }
+      }
+
+      if (matchedCustomer) {
+        const linkedToCust =
+          (o.customerId && o.customerId === matchedCustomer.id) ||
+          (o.customerBarcode &&
+            matchedCustomer.customerBarcode &&
+            o.customerBarcode.toUpperCase() === matchedCustomer.customerBarcode.toUpperCase()) ||
+          (matchedCustomer.phone && phonesMatch(o.customerPhone, matchedCustomer.phone));
+        if (linkedToCust) {
+          score += 20;
+          hasIdentityMatch = true;
+        }
+      }
+
+      if (parsed.receivedDate) {
+        const orderCountryYmd = normalizeDateToYmd(formatCountryDateYmd(o.createdAt));
+        const orderLocalYmd = normalizeDateToYmd(formatQrShortDate(o.createdAt));
+        if (
+          (orderCountryYmd && orderCountryYmd === parsed.receivedDate) ||
+          (orderLocalYmd && orderLocalYmd === parsed.receivedDate)
+        ) {
+          score += 30;
+          hasDateMatch = true;
+        } else {
+          score -= 10;
+        }
+      }
+
+      if (parsedFaultNorm) {
+        const orderFaultNorm = normalizeArabicTextForMatch(o.faultDescription);
+        if (orderFaultNorm) {
+          if (orderFaultNorm === parsedFaultNorm) {
+            score += 30;
+            hasFaultMatch = true;
+          } else if (
+            orderFaultNorm.startsWith(parsedFaultNorm) ||
+            parsedFaultNorm.startsWith(orderFaultNorm)
+          ) {
+            score += 24;
+            hasFaultMatch = true;
+          } else if (
+            parsedFaultNorm.length >= 4 &&
+            (orderFaultNorm.includes(parsedFaultNorm) || parsedFaultNorm.includes(orderFaultNorm))
+          ) {
+            score += 15;
+            hasFaultMatch = true;
+          } else {
+            score -= 8;
+          }
+        }
+      }
+
+      if (parsed.cost !== null) {
+        const orderEffectiveCost = Number(
+          o.actualCost !== undefined ? o.actualCost : (o.estimatedCost || 0)
+        );
+        const orderEstCost = Number(o.estimatedCost || 0);
+        if (orderEffectiveCost === parsed.cost || orderEstCost === parsed.cost) {
+          score += 15;
+        } else {
+          score -= 5;
+        }
+      }
+
+      const validAnchor = hasIdentityMatch || (hasDateMatch && hasFaultMatch);
+      if (!validAnchor || score <= 0) continue;
+
+      if (!bestOrder || score > bestScore) {
+        bestOrder = o;
+        bestScore = score;
+      } else if (score === bestScore) {
+        const currentActive =
+          o.status !== DeviceStatus.DELIVERED && o.status !== DeviceStatus.UNREPAIRABLE ? 1 : 0;
+        const bestActive =
+          bestOrder.status !== DeviceStatus.DELIVERED && bestOrder.status !== DeviceStatus.UNREPAIRABLE ? 1 : 0;
+        if (
+          currentActive > bestActive ||
+          (currentActive === bestActive && (o.createdAt || 0) > (bestOrder.createdAt || 0))
+        ) {
+          bestOrder = o;
+        }
+      }
+    }
+
+    if (bestOrder) return bestOrder;
+  }
+
+  // 4. Exact Serial Number match
+  const cleanSingleCode = (extractScannedBarcodeId(normalizedRaw) || normalizedRaw).toUpperCase();
+  const serialMatches = realOrders.filter(
+    (o) => o.serialNumber && o.serialNumber.trim().toUpperCase() === cleanSingleCode
+  );
+  if (serialMatches.length > 0) {
+    return pickPreferredOrder(serialMatches);
+  }
+
+  // 5. Customer Barcode match -> return that customer's preferred order from records
+  const custCodeCandidate = parsed.customerCode || cleanSingleCode;
+  if (custCodeCandidate) {
+    const matchedCustByCode = (customers || []).find(
+      (c) => c.customerBarcode && c.customerBarcode.trim().toUpperCase() === custCodeCandidate
+    );
+    const byCustOrders = realOrders.filter((o) => {
+      if (o.customerBarcode && o.customerBarcode.trim().toUpperCase() === custCodeCandidate) return true;
+      if (matchedCustByCode) {
+        if (o.customerId && o.customerId === matchedCustByCode.id) return true;
+        if (matchedCustByCode.phone && phonesMatch(o.customerPhone, matchedCustByCode.phone)) return true;
+        if (
+          !matchedCustByCode.phone &&
+          normalizeCustomerNameKey(o.customerName) === normalizeCustomerNameKey(matchedCustByCode.name)
+        ) {
+          return true;
+        }
+      }
+      return false;
+    });
+    if (byCustOrders.length > 0) {
+      return pickPreferredOrder(byCustOrders);
+    }
+  }
+
+  // 6. Phone number match -> return preferred order from records
+  const phoneDigits = parsed.customerPhone || normalizeCustomerPhone(cleanSingleCode);
+  if (phoneDigits.length >= 6) {
+    const phoneMatches = realOrders.filter((o) => phonesMatch(o.customerPhone, phoneDigits));
+    if (phoneMatches.length > 0) {
+      return pickPreferredOrder(phoneMatches);
+    }
+    const phoneCust = (customers || []).find((c) => phonesMatch(c.phone, phoneDigits));
+    if (phoneCust) {
+      const custPhoneOrders = realOrders.filter(
+        (o) =>
+          (o.customerId && o.customerId === phoneCust.id) ||
+          (o.customerBarcode &&
+            phoneCust.customerBarcode &&
+            o.customerBarcode.toUpperCase() === phoneCust.customerBarcode.toUpperCase())
+      );
+      if (custPhoneOrders.length > 0) {
+        return pickPreferredOrder(custPhoneOrders);
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Resolves any scanned QR/barcode payload strictly to an orderId string (nothing else).
+ * Returns null if the scanned QR payload is structured customer/order text with no matching order record.
+ */
+export function resolveScannedOrderId(
+  rawCode: string,
+  orders: MaintenanceOrder[],
+  customers: CustomerProfile[] = []
+): string | null {
+  const normalizedRaw = normalizeArabicDigitsAndBidi(rawCode);
+  if (!normalizedRaw) return null;
+
+  // 1. Always prefer resolving to an actual order record in the system
+  const matchedOrder = resolveScannedOrderFromRecords(normalizedRaw, orders, customers);
+  if (matchedOrder?.id) {
+    return matchedOrder.id;
+  }
+
+  // 2. If not in local records, allow explicit order IDs from QR/URL/barcode
+  const parsed = parseOrderCustomerQrPayload(normalizedRaw);
+  if (parsed.explicitOrderId) return parsed.explicitOrderId;
+  if (parsed.embeddedOrderIds.length > 0) return parsed.embeddedOrderIds[0];
+
+  const urlOrder = extractUrlOrderParam(normalizedRaw);
+  if (urlOrder) return urlOrder;
+
+  // For structured multi-line Arabic QR codes with no matching record, do not leak raw text or phone
+  if (parsed.isStructured) {
+    return null;
+  }
+
+  // Plain single-line barcode / order ID typed or scanned directly
+  const cleaned = extractScannedBarcodeId(normalizedRaw);
+  if (!cleaned) return null;
+  // Avoid returning pure phone numbers if we couldn't resolve them to any orderId
+  if (/^\+?\d{7,}$/.test(cleaned) && (orders || []).length > 0) {
+    return null;
+  }
+  return cleaned;
+}
+
 

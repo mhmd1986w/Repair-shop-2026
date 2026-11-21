@@ -719,10 +719,23 @@ export function extractScannedBarcodeId(rawText: string): string {
       const digits = phoneMatch[1].replace(/[^\d+]/g, '');
       if (digits.length >= 6) return digits;
     }
+
+    const nameMatch = withNormalizedDigits.match(/(?:^|\r?\n)\s*(?:اسم العميل|العميل|الاسم|Customer\s*Name|Name)\s*[:：]\s*([^\r\n]+)/i);
+    if (nameMatch?.[1]?.trim() && !nameMatch[1].includes('بدون اسم')) {
+      return nameMatch[1].trim().toUpperCase();
+    }
   }
 
   const cleaned = withNormalizedDigits.replace(/[\r\n]/g, '').trim();
   if (!cleaned) return '';
+
+  const safeDecodeUri = (val: string): string => {
+    try {
+      return decodeURIComponent(val);
+    } catch {
+      return val;
+    }
+  };
 
   // Handle QR tracking URLs like https://domain/?track=TEC26112112 or /track/TEC26112112
   try {
@@ -738,7 +751,7 @@ export function extractScannedBarcodeId(rawText: string): string {
       }
       const pathMatch = url.pathname.match(/\/(?:track|ticket|order)\/([^/?#]+)/i);
       if (pathMatch?.[1]) {
-        return decodeURIComponent(pathMatch[1]).trim().toUpperCase();
+        return safeDecodeUri(pathMatch[1]).trim().toUpperCase();
       }
     }
   } catch {
@@ -747,7 +760,7 @@ export function extractScannedBarcodeId(rawText: string): string {
 
   const queryFallback = cleaned.match(/[?&](?:track|order|id|code)=([^&#\s]+)/i);
   if (queryFallback?.[1]) {
-    return decodeURIComponent(queryFallback[1]).trim().toUpperCase();
+    return safeDecodeUri(queryFallback[1]).trim().toUpperCase();
   }
 
   return cleaned.toUpperCase();

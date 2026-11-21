@@ -11,6 +11,7 @@ import {
   getLabelElementMetrics,
   fitLabelLayoutToPaper,
   getSplitThermalLabelMetrics,
+  getVerticalOrderIdSvgSpec,
   FIXED_LABEL_PAPER_SIZE
 } from '../utils/labelDesigner';
 import { BarcodeGenerator } from './BarcodeGenerator';
@@ -331,7 +332,7 @@ export const LabelDesigner: React.FC<LabelDesignerProps> = ({ onLayoutChange, mo
                 <div
                   ref={stickerRef}
                   dir="rtl"
-                  className="bg-white border border-dashed border-teal-500 rounded-sm select-none overflow-hidden shadow-sm"
+                  className="bg-white outline outline-1 outline-dashed outline-teal-500 rounded-sm select-none overflow-hidden shadow-sm"
                   style={{
                     position: 'absolute',
                     top: 0,
@@ -392,20 +393,27 @@ export const LabelDesigner: React.FC<LabelDesignerProps> = ({ onLayoutChange, mo
                           onDrop={(e) => handleDrop(el.id, e)}
                           onDragEnd={handleDragEnd}
                           onClick={() => setSelectedId(selectedId === el.id ? null : el.id)}
-                          className={`${splitMetrics.hasQrSide ? 'max-h-full' : 'w-fit max-w-full'} relative group cursor-grab active:cursor-grabbing ${
+                          className={`${splitMetrics.hasQrSide ? (el.id === 'barcode' ? 'h-full flex items-center justify-center shrink-0' : 'max-h-full') : 'w-fit max-w-full'} relative group cursor-grab active:cursor-grabbing ${
                             isBeingDragged ? 'opacity-30' : ''
                           } ${isHovered ? 'bg-teal-100/40 outline outline-1 outline-teal-500' : ''} ${
                             isSelected
                               ? 'bg-teal-50/20 outline outline-1 outline-teal-600'
                               : 'hover:outline hover:outline-1 hover:outline-teal-400 hover:bg-teal-50/20'
                           }`}
-                          style={splitMetrics.hasQrSide ? {
+                          style={splitMetrics.hasQrSide ? (el.id === 'barcode' ? {
+                            margin: 0,
+                            height: '100%',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            boxSizing: 'border-box',
+                          } : {
                             writingMode: 'vertical-rl',
                             textOrientation: 'mixed',
                             margin: 0,
                             textAlign: 'center',
                             boxSizing: 'border-box',
-                          } : {
+                          }) : {
                             marginTop: `${mTopMm}mm`,
                             marginBottom: `${mBotMm}mm`,
                             textAlign: containerStyles.textAlign,
@@ -527,19 +535,49 @@ export const LabelDesigner: React.FC<LabelDesignerProps> = ({ onLayoutChange, mo
                           )}
 
                           {el.id === 'barcode' && (
-                            <div
-                              dir="ltr"
-                              className={`${splitMetrics.hasQrSide ? 'max-h-full whitespace-nowrap overflow-hidden' : 'max-w-full whitespace-nowrap'} font-black text-black tabular-nums`}
-                              style={{
-                                fontSize: `${splitMetrics.hasQrSide ? splitMetrics.getVerticalCodeFontPt(orderData.id) : splitMetrics.getCodeFontPt(orderData.id, baseFontPt)}pt`,
-                                fontFamily: "system-ui, -apple-system, 'Cairo', sans-serif",
-                                fontVariantNumeric: 'tabular-nums',
-                                letterSpacing: splitMetrics.hasQrSide ? '0px' : '-0.2px',
-                                lineHeight: 1
-                              }}
-                            >
-                              {orderData.id}
-                            </div>
+                            splitMetrics.hasQrSide ? (() => {
+                              const spec = getVerticalOrderIdSvgSpec(orderData.id, splitMetrics);
+                              return (
+                                <svg
+                                  xmlns="http://www.w3.org/2000/svg"
+                                  width={`${spec.widthMm}mm`}
+                                  height={`${spec.heightMm}mm`}
+                                  viewBox={`0 0 ${spec.viewBoxWidth} ${spec.viewBoxHeight}`}
+                                  style={{ width: `${spec.widthMm}mm`, height: `${spec.heightMm}mm`, display: 'block', flexShrink: 0, overflow: 'visible' }}
+                                >
+                                  <text
+                                    x={spec.cx}
+                                    y={spec.cy}
+                                    dy={spec.dyUnits}
+                                    transform={`rotate(90 ${spec.cx} ${spec.cy})`}
+                                    textAnchor="middle"
+                                    textLength={spec.textLengthUnits}
+                                    lengthAdjust={spec.textLengthUnits ? 'spacingAndGlyphs' : undefined}
+                                    fill="#000000"
+                                    fontFamily="system-ui, -apple-system, 'Cairo', Arial, sans-serif"
+                                    fontSize={spec.fontSizeUnits}
+                                    fontWeight={900}
+                                    style={{ fontVariantNumeric: 'tabular-nums' }}
+                                  >
+                                    {spec.code}
+                                  </text>
+                                </svg>
+                              );
+                            })() : (
+                              <div
+                                dir="ltr"
+                                className="max-w-full whitespace-nowrap font-black text-black tabular-nums"
+                                style={{
+                                  fontSize: `${splitMetrics.getCodeFontPt(orderData.id, baseFontPt)}pt`,
+                                  fontFamily: "system-ui, -apple-system, 'Cairo', sans-serif",
+                                  fontVariantNumeric: 'tabular-nums',
+                                  letterSpacing: '-0.2px',
+                                  lineHeight: 1
+                                }}
+                              >
+                                {orderData.id}
+                              </div>
+                            )
                           )}
 
                           {el.id === 'custom_text' && (

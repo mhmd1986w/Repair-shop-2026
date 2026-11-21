@@ -33,6 +33,7 @@ import {
 import {
   buildCustomerQrPayload,
   resolveScannedBarcodeTarget,
+  resolveScannedOrderId,
   ScannedBarcodeResolution,
 } from '../utils/customerBarcode';
 
@@ -104,11 +105,16 @@ export const ScannerModal: React.FC<ScannerModalProps> = ({
   const loopTimerRef = useRef<number | null>(null);
   const isMountedRef = useRef(true);
   const hasLockedRef = useRef(false);
+  const lastUnmatchedRef = useRef<{ raw: string; at: number }>({ raw: '', at: 0 });
   const fileInputRef = useRef<HTMLInputElement>(null);
   const usbInputRef = useRef<HTMLInputElement>(null);
 
   const onScanRef = useRef(onScan);
   onScanRef.current = onScan;
+  const ordersRef = useRef(orders);
+  ordersRef.current = orders;
+  const customersRef = useRef(customers);
+  customersRef.current = customers;
 
   const stopCameraStream = useCallback(() => {
     if (loopTimerRef.current !== null) {
@@ -137,44 +143,34 @@ export const ScannerModal: React.FC<ScannerModalProps> = ({
   const handleDetectedCode = useCallback(
     (decodedText: string) => {
       if (hasLockedRef.current) return;
-      const normalized = extractScannedBarcodeId(decodedText) || decodedText.trim();
-      if (!normalized) return;
+      const rawText = (decodedText || '').trim();
+      if (!rawText) return;
 
-      hasLockedRef.current = true;
-      playScanSuccessFeedback();
-      stopCameraStream();
-
-      if (!enableResolution) {
-        onScanRef.current(normalized);
-        return;
-      }
-
-      const resolved = resolveScannedBarcodeTarget(
-        normalized,
-        customers || [],
-        orders || []
+      const resolvedOrderId = resolveScannedOrderId(
+        rawText,
+        ordersRef.current || [],
+        customersRef.current || []
       );
 
-      // Direct Customer Profile summon when scanning a customer's Alphanumeric QR code
-      if (
-        autoOpenRef.current &&
-        resolved.matchType === 'customer_barcode' &&
-        resolved.customer &&
-        onOpenCustomerProfile
-      ) {
-        onOpenCustomerProfile(resolved.customer);
+      if (!resolvedOrderId) {
+        const now = Date.now();
+        if (
+          lastUnmatchedRef.current.raw !== rawText ||
+          now - lastUnmatchedRef.current.at > 1500
+        ) {
+          lastUnmatchedRef.current = { raw: rawText, at: now };
+          setScanHint('لم يتم العثور على رقم طلب مطابق لهذا الرمز في السجلات.');
+        }
         return;
       }
 
-      setResolution(resolved);
+      hasLockedRef.current = true;
       setScanHint(null);
-      setLinkMode('none');
-      setSelectedLinkCustomerId('');
-      setCustomerSearchQuery('');
-      setNewCustName('');
-      setNewCustPhone('');
+      playScanSuccessFeedback();
+      stopCameraStream();
+      onScanRef.current(resolvedOrderId);
     },
-    [customers, enableResolution, onOpenCustomerProfile, orders, stopCameraStream]
+    [stopCameraStream]
   );
 
   // Re-evaluate resolution dynamically if customers or orders update while card is open
@@ -321,8 +317,8 @@ export const ScannerModal: React.FC<ScannerModalProps> = ({
               const videoInputs = devices
                 .filter((d) => d.kind === 'videoinput')
                 .map((d, i) => ({ deviceId: d.deviceId, label: d.label || `كاميرا ${i + 1}` }));
-              if (videoInputs.length > 0 && cameras.length === 0) {
-                setCameras(videoInputs);
+              if (videoInputs.length > 0) {
+                setCameras((prev) => (prev.length === 0 ? videoInputs : prev));
               }
             })
             .catch(() => {});
@@ -361,7 +357,7 @@ export const ScannerModal: React.FC<ScannerModalProps> = ({
             });
             if (result && !cancelled && !hasLockedRef.current) {
               handleDetectedCode(result);
-              return;
+              if (hasLockedRef.current) return;
             }
           }
 
@@ -396,6 +392,19 @@ export const ScannerModal: React.FC<ScannerModalProps> = ({
   useEffect(() => {
     let hidBuffer = '';
     let lastKeyTime = 0;
+    let flushTimer: number | null = null;
+
+    const flushHidBuffer = () => {
+      if (flushTimer !== null) {
+        window.clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      const scanned = hidBuffer.trim();
+      hidBuffer = '';
+      if (scanned.length >= 4) {
+        handleDetectedCode(scanned);
+      }
+    };
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -409,21 +418,31 @@ export const ScannerModal: React.FC<ScannerModalProps> = ({
       }
 
       const now = Date.now();
-      if (now - lastKeyTime > 120) {
+      if (now - lastKeyTime > 220 && !flushTimer) {
         hidBuffer = '';
       }
       lastKeyTime = now;
 
       if (e.key === 'Enter' && hidBuffer.length >= 4) {
         e.preventDefault();
-        const scanned = hidBuffer;
-        hidBuffer = '';
-        handleDetectedCode(scanned);
+        // Multi-line structured QR payloads over USB HID send Enter between lines
+        const looksStructured = /[:：]/.test(hidBuffer) && !/^https?:\/\//i.test(hidBuffer.trim());
+        if (looksStructured) {
+          hidBuffer += '\n';
+          if (flushTimer !== null) window.clearTimeout(flushTimer);
+          flushTimer = window.setTimeout(flushHidBuffer, 180);
+        } else {
+          flushHidBuffer();
+        }
         return;
       }
 
       if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
         hidBuffer += e.key;
+        if (flushTimer !== null) {
+          window.clearTimeout(flushTimer);
+          flushTimer = window.setTimeout(flushHidBuffer, 180);
+        }
       }
     };
 
@@ -445,6 +464,7 @@ export const ScannerModal: React.FC<ScannerModalProps> = ({
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('paste', handlePaste);
     return () => {
+      if (flushTimer !== null) window.clearTimeout(flushTimer);
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('paste', handlePaste);
     };
@@ -458,6 +478,8 @@ export const ScannerModal: React.FC<ScannerModalProps> = ({
       const decoded = await decodeImageFileBarcode(blob);
       if (decoded) {
         handleDetectedCode(decoded);
+        if (hasLockedRef.current) return;
+        if (inputMode === 'camera') setRestartCounter((c) => c + 1);
         return;
       }
       setScanHint('تعذر قراءة الباركود من هذه الصورة. تأكد من وضوح الخطوط ووجود فراغ أبيض حول الأطراف ثم أعد المحاولة.');
@@ -524,12 +546,12 @@ export const ScannerModal: React.FC<ScannerModalProps> = ({
 
   const handleManualSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    const cleaned = extractScannedBarcodeId(manualCode) || manualCode.trim();
-    if (!cleaned) {
-      setScanHint('يرجى إدخال أو مسح رقم باركود صحيح.');
+    const rawInput = manualCode.trim();
+    if (!rawInput) {
+      setScanHint('يرجى إدخال أو مسح رقم طلب صحيح.');
       return;
     }
-    handleDetectedCode(cleaned);
+    handleDetectedCode(rawInput);
   };
 
   const handleCopyCode = async (code: string) => {
@@ -549,9 +571,9 @@ export const ScannerModal: React.FC<ScannerModalProps> = ({
     return list
       .filter(
         (c) =>
-          c.name.toLowerCase().includes(q) ||
-          c.phone.includes(q) ||
-          c.customerBarcode.toLowerCase().includes(q)
+          (c.name || '').toLowerCase().includes(q) ||
+          (c.phone || '').includes(q) ||
+          (c.customerBarcode || '').toLowerCase().includes(q)
       )
       .slice(0, 25);
   }, [customers, customerSearchQuery]);
@@ -617,8 +639,8 @@ export const ScannerModal: React.FC<ScannerModalProps> = ({
           <div className="flex items-center gap-2">
             <QrCode className="w-5 h-5 text-teal-400" />
             <div>
-              <h3 className="font-sans font-bold text-sm leading-tight">قارئ QR والباركود الذكي للزبائن</h3>
-              <p className="text-[10px] text-gray-400 font-sans">QR رقم الطلب · كاميرا · صورة · USB</p>
+              <h3 className="font-sans font-bold text-sm leading-tight">قارئ QR لرقم الطلب</h3>
+              <p className="text-[10px] text-gray-400 font-sans">مسح QR لإدخال رقم الطلب مباشرة · كاميرا · صورة · USB</p>
             </div>
           </div>
 
@@ -709,29 +731,6 @@ export const ScannerModal: React.FC<ScannerModalProps> = ({
                 <span>USB / يدوي</span>
               </button>
             </div>
-
-            {enableResolution && onOpenCustomerProfile && (
-              <label className="px-4 py-2 bg-teal-50/70 border-b border-teal-100 flex items-center justify-between gap-2 text-[11px] font-bold text-teal-900 cursor-pointer select-none">
-                <span className="flex items-center gap-1.5">
-                  <QrCode className="w-3.5 h-3.5 text-teal-700" />
-                  <span>استدعاء الملف الشخصي للزبون تلقائياً عند مسح QR الخاص به</span>
-                </span>
-                <input
-                  type="checkbox"
-                  checked={autoOpenCustomerProfile}
-                  onChange={(e) => {
-                    const checked = e.target.checked;
-                    setAutoOpenCustomerProfile(checked);
-                    try {
-                      localStorage.setItem('scanner_auto_open_customer_qr', checked ? 'true' : 'false');
-                    } catch {
-                      // ignore
-                    }
-                  }}
-                  className="w-4 h-4 accent-teal-700 rounded cursor-pointer"
-                />
-              </label>
-            )}
           </>
         )}
 

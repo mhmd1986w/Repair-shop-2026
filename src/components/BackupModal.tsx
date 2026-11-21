@@ -94,7 +94,12 @@ export const BackupModal: React.FC<BackupModalProps> = ({ onClose, onSuccess }) 
       
       if (selTemplates) {
         const tpls = localStorage.getItem('db_templates') || localStorage.getItem('notification_templates');
-        dataToExport.templates = tpls ? JSON.parse(tpls) : [];
+        try {
+          const parsed = tpls ? JSON.parse(tpls) : [];
+          dataToExport.templates = Array.isArray(parsed) ? parsed : [];
+        } catch {
+          dataToExport.templates = [];
+        }
       }
       
       if (selLogs) {

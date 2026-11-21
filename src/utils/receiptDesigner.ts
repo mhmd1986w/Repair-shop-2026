@@ -160,21 +160,28 @@ export function getDefaultReceiptLayout(): ReceiptLayoutConfig {
 }
 
 export function getStoredReceiptLayout(): ReceiptLayoutConfig {
-  const saved = localStorage.getItem('receipt_layout_config');
+  let saved: string | null = null;
+  try {
+    saved = localStorage.getItem('receipt_layout_config');
+  } catch {
+    saved = null;
+  }
   if (saved) {
     try {
       const parsed: ReceiptLayoutConfig = JSON.parse(saved);
-      const existingIds = new Set(parsed.elements.map(e => e.id));
-      const missing = DEFAULT_RECEIPT_ELEMENTS.filter(d => !existingIds.has(d.id));
-      if (missing.length > 0) {
-        parsed.elements = [...parsed.elements, ...missing];
+      if (parsed && Array.isArray(parsed.elements)) {
+        const existingIds = new Set(parsed.elements.map(e => e.id));
+        const missing = DEFAULT_RECEIPT_ELEMENTS.filter(d => !existingIds.has(d.id));
+        if (missing.length > 0) {
+          parsed.elements = [...parsed.elements, ...missing];
+        }
+        parsed.elements = parsed.elements.map(el => ({
+          ...el,
+          fontSize: el.fontSize !== undefined ? Math.max(10, Math.min(99, el.fontSize)) : undefined,
+          height: el.height !== undefined ? Math.max(10, Math.min(99, el.height)) : undefined,
+        }));
+        return parsed;
       }
-      parsed.elements = parsed.elements.map(el => ({
-        ...el,
-        fontSize: el.fontSize !== undefined ? Math.max(10, Math.min(99, el.fontSize)) : undefined,
-        height: el.height !== undefined ? Math.max(10, Math.min(99, el.height)) : undefined,
-      }));
-      return parsed;
     } catch (e) {
       console.error('Failed to parse receipt_layout_config', e);
     }

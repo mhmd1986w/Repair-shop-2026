@@ -74,6 +74,8 @@ import {
   getLabelContainerStyles,
   getLabelElementMetrics,
   getSplitThermalLabelMetrics,
+  getVerticalOrderIdSvgSpec,
+  renderVerticalOrderIdSvg,
   FIXED_LABEL_PAPER_SIZE
 } from '../utils/labelDesigner';
 import { LabelDesigner } from './LabelDesigner';
@@ -181,6 +183,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
         (c) =>
           (order.customerId && c.id === order.customerId) ||
           (order.customerBarcode &&
+            c.customerBarcode &&
             c.customerBarcode.toUpperCase() === order.customerBarcode.toUpperCase()) ||
           (order.customerPhone && phonesMatch(c.phone, order.customerPhone)) ||
           (order.customerName &&
@@ -192,6 +195,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
         if (o.customerId && o.customerId === matchedCustomer.id) return true;
         if (
           o.customerBarcode &&
+          matchedCustomer.customerBarcode &&
           o.customerBarcode.toUpperCase() === matchedCustomer.customerBarcode.toUpperCase()
         ) {
           return true;
@@ -221,44 +225,16 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [deviceFilter, setDeviceFilter] = useState<string>('all');
 
-  // Automatically detect barcode scans (exact order ID, serial, or customer barcode)
-  useEffect(() => {
-    const cleanTerm = (extractScannedBarcodeId(searchTerm) || searchTerm.trim()).toLowerCase();
-    if (!cleanTerm || cleanTerm.length < 4) return;
-
-    const exactOrder = orders.find(
-      (o) =>
-        !isContactOrder(o) &&
-        (o.id.toLowerCase() === cleanTerm ||
-          (o.deviceBarcode && o.deviceBarcode.toLowerCase() === cleanTerm) ||
-          (o.serialNumber && o.serialNumber.toLowerCase() === cleanTerm))
-    );
-
-    if (exactOrder) {
-      setSelectedOrder(exactOrder);
-    }
-  }, [searchTerm, orders]);
-
   useEffect(() => {
     if (initialSearchTerm) {
       setSearchTerm(initialSearchTerm);
-      const cleanTerm = (extractScannedBarcodeId(initialSearchTerm) || initialSearchTerm.trim()).toLowerCase();
-      const exactMatch = orders.find(
-        (o) =>
-          !isContactOrder(o) &&
-          (o.id.toLowerCase() === cleanTerm ||
-            o.customerPhone === cleanTerm ||
-            (o.customerBarcode && o.customerBarcode.toLowerCase() === cleanTerm) ||
-            (o.serialNumber && o.serialNumber.toLowerCase() === cleanTerm))
-      );
-      if (exactMatch) {
-        setSelectedOrder(exactMatch);
-      }
+      setStatusFilter('all');
+      setDeviceFilter('all');
       if (onClearInitialSearch) {
         onClearInitialSearch();
       }
     }
-  }, [initialSearchTerm, orders, onClearInitialSearch]);
+  }, [initialSearchTerm, onClearInitialSearch]);
 
   useEffect(() => {
     if (initialStatusFilter) {
@@ -285,6 +261,16 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
   
   // Modals / Selection states
   const [selectedOrder, setSelectedOrder] = useState<MaintenanceOrder | null>(null);
+
+  // Keep selectedOrder synced when orders update (e.g., delivery confirmation or cloud sync)
+  useEffect(() => {
+    setSelectedOrder((prev) => {
+      if (!prev) return null;
+      const fresh = orders.find((o) => o.id === prev.id);
+      if (!fresh) return null;
+      return fresh === prev ? prev : fresh;
+    });
+  }, [orders]);
   const [showAddModal, setShowAddModal] = useState(false);
   const [showPrintLabel, setShowPrintLabel] = useState<MaintenanceOrder | null>(null);
   const [showSimplePrintLabel, setShowSimplePrintLabel] = useState<MaintenanceOrder | null>(null);
@@ -456,15 +442,17 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
       if (savedPrinters) {
         try {
           const parsed = JSON.parse(savedPrinters);
-          setAvailablePrinters(parsed);
-          
-          const defLabel = parsed.find((p: any) => p.isDefaultLabels) || parsed[0];
-          if (defLabel) {
-            setSelectedLabelPrinterId(prev => prev || defLabel.id);
-          }
-          const defInvoice = parsed.find((p: any) => p.isDefaultInvoices) || parsed[0];
-          if (defInvoice) {
-            setSelectedInvoicePrinterId(prev => prev || defInvoice.id);
+          if (Array.isArray(parsed)) {
+            setAvailablePrinters(parsed);
+            
+            const defLabel = parsed.find((p: any) => p.isDefaultLabels) || parsed[0];
+            if (defLabel) {
+              setSelectedLabelPrinterId(prev => prev || defLabel.id);
+            }
+            const defInvoice = parsed.find((p: any) => p.isDefaultInvoices) || parsed[0];
+            if (defInvoice) {
+              setSelectedInvoicePrinterId(prev => prev || defInvoice.id);
+            }
           }
         } catch (e) {
           console.error(e);
@@ -512,10 +500,12 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
       const saved = localStorage.getItem('maintenance_printers');
       if (saved) {
         const printersList = JSON.parse(saved);
-        const found = forType === 'invoices' 
-          ? printersList.find((p: any) => p.isDefaultInvoices)
-          : printersList.find((p: any) => p.isDefaultLabels);
-        return found || printersList[0] || { name: 'طابعة النظام الافتراضية (عبر المتصفح)', type: 'browser' };
+        if (Array.isArray(printersList)) {
+          const found = forType === 'invoices' 
+            ? printersList.find((p: any) => p.isDefaultInvoices)
+            : printersList.find((p: any) => p.isDefaultLabels);
+          return found || printersList[0] || { name: 'طابعة النظام الافتراضية (عبر المتصفح)', type: 'browser' };
+        }
       }
     } catch (e) {
       console.error(e);
@@ -758,12 +748,12 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
           return `<div class="center-mobile" dir="ltr" style="${baseItemStyle} text-overflow: clip !important; font-family: system-ui, -apple-system, 'Cairo', sans-serif !important; font-variant-numeric: tabular-nums !important; font-size: ${mobileFontPt}pt !important; font-weight: ${hasQrSide ? 900 : (el.bold ? 700 : 600)} !important; letter-spacing: ${hasQrSide ? '0px' : '-0.1px'} !important; direction: ltr !important;">${cleanMob}</div>`;
         }
         case 'customer_name': {
-          const txt = `العميل: ${order.customerName}`;
+          const txt = `العميل: ${order.customerName || ''}`;
           const fPt = hasQrSide ? splitMetrics.getVerticalInfoFontPt(txt) : fontPt;
           return `<div dir="auto" style="${baseItemStyle} font-size: ${fPt}pt !important; font-weight: ${el.bold ? 800 : 600} !important;">${txt}</div>`;
         }
         case 'device_model': {
-          const txt = `الجهاز: ${order.brandModel}`;
+          const txt = `الجهاز: ${order.brandModel || ''}`;
           const fPt = hasQrSide ? splitMetrics.getVerticalInfoFontPt(txt) : fontPt;
           return `<div dir="auto" style="${baseItemStyle} font-size: ${fPt}pt !important; font-weight: ${el.bold ? 800 : 600} !important;">${txt}</div>`;
         }
@@ -773,10 +763,11 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
           return `<div dir="auto" style="${baseItemStyle} font-size: ${fPt}pt !important; font-weight: ${el.bold ? 700 : 400} !important;">${txt}</div>`;
         }
         case 'barcode': {
-          const codeFontPt = hasQrSide
-            ? splitMetrics.getVerticalCodeFontPt(order.id)
-            : splitMetrics.getCodeFontPt(order.id, fontPt);
-          return `<div class="barcode-number-readable" dir="ltr" style="${baseItemStyle} text-overflow: clip !important; font-size: ${codeFontPt}pt !important; font-family: system-ui, -apple-system, 'Cairo', sans-serif !important; font-variant-numeric: tabular-nums !important; font-weight: 900 !important; letter-spacing: ${hasQrSide ? '0px' : '-0.2px'} !important; direction: ltr !important; line-height: 1 !important;">${order.id}</div>`;
+          if (hasQrSide) {
+            return `<div class="barcode-number-readable" dir="ltr" style="margin: 0 !important; padding: 0 !important; height: 100% !important; display: flex !important; align-items: center !important; justify-content: center !important; flex: 0 0 auto !important; overflow: visible !important;">${renderVerticalOrderIdSvg(order.id, splitMetrics)}</div>`;
+          }
+          const codeFontPt = splitMetrics.getCodeFontPt(order.id, fontPt);
+          return `<div class="barcode-number-readable" dir="ltr" style="${baseItemStyle} overflow: visible !important; text-overflow: clip !important; font-size: ${codeFontPt}pt !important; font-family: system-ui, -apple-system, 'Cairo', sans-serif !important; font-variant-numeric: tabular-nums !important; font-weight: 900 !important; letter-spacing: -0.2px !important; direction: ltr !important; line-height: 1 !important;">${order.id}</div>`;
         }
         case 'custom_text': {
           const txt = el.customContent || 'يرجى إبراز هذا الملصق عند الاستلام';
@@ -1060,7 +1051,12 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
 
   // History of other orders for the currently selected customer
   const selectedCustomerHistory = selectedOrder 
-    ? orders.filter(o => o.customerPhone === selectedOrder.customerPhone && o.id !== selectedOrder.id && !isContactOrder(o))
+    ? orders.filter(o => {
+        if (o.id === selectedOrder.id || isContactOrder(o)) return false;
+        if (selectedOrder.customerId && o.customerId && o.customerId === selectedOrder.customerId) return true;
+        if (selectedOrder.customerPhone?.trim() && phonesMatch(o.customerPhone, selectedOrder.customerPhone)) return true;
+        return false;
+      })
     : [];
 
   // Voice Input for form fields
@@ -1489,7 +1485,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
       (order.customerName || '').toLowerCase().includes(q) ||
       (order.customerPhone || '').toLowerCase().includes(q) ||
       phonesMatch(order.customerPhone, searchTerm) ||
-      order.id.toLowerCase().includes(q) ||
+      (order.id || '').toLowerCase().includes(q) ||
       (order.brandModel || '').toLowerCase().includes(q) ||
       (order.serialNumber && order.serialNumber.toLowerCase().includes(q)) ||
       (order.customerBarcode && order.customerBarcode.toLowerCase().includes(q)) ||
@@ -2276,7 +2272,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                         >
                           <div
                             dir="rtl"
-                            className="bg-white border border-gray-300 rounded-sm select-none overflow-hidden shadow-xs"
+                            className="bg-white ring-1 ring-gray-300 rounded-sm select-none overflow-hidden shadow-xs"
                             style={{
                               position: 'absolute',
                               top: 0,
@@ -2330,16 +2326,23 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                                       setDraggedModalId(null);
                                       setDragOverModalId(null);
                                     }}
-                                    className={`${splitMetrics.hasQrSide ? 'max-h-full' : 'w-fit max-w-full'} cursor-grab active:cursor-grabbing ${
+                                    className={`${splitMetrics.hasQrSide ? (el.id === 'barcode' ? 'h-full flex items-center justify-center shrink-0' : 'max-h-full') : 'w-fit max-w-full'} cursor-grab active:cursor-grabbing ${
                                       isBeingDragged ? 'opacity-30' : ''
                                     } ${isOver ? 'outline outline-1 outline-teal-500 bg-teal-100/40' : 'hover:outline hover:outline-1 hover:outline-teal-400 hover:bg-teal-50/20'}`}
-                                    style={splitMetrics.hasQrSide ? {
+                                    style={splitMetrics.hasQrSide ? (el.id === 'barcode' ? {
+                                      margin: 0,
+                                      height: '100%',
+                                      display: 'flex',
+                                      alignItems: 'center',
+                                      justifyContent: 'center',
+                                      boxSizing: 'border-box',
+                                    } : {
                                       writingMode: 'vertical-rl',
                                       textOrientation: 'mixed',
                                       margin: 0,
                                       textAlign: 'center',
                                       boxSizing: 'border-box',
-                                    } : {
+                                    }) : {
                                       marginTop: `${mTopMm}mm`,
                                       marginBottom: `${mBotMm}mm`,
                                       textAlign: containerStyles.textAlign,
@@ -2422,19 +2425,49 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                                     )}
 
                                     {el.id === 'barcode' && (
-                                      <div
-                                        dir="ltr"
-                                        className={`${splitMetrics.hasQrSide ? 'max-h-full whitespace-nowrap overflow-hidden' : 'max-w-full whitespace-nowrap'} font-black text-black tabular-nums`}
-                                        style={{
-                                          fontSize: `${splitMetrics.hasQrSide ? splitMetrics.getVerticalCodeFontPt(showPrintLabel.id) : splitMetrics.getCodeFontPt(showPrintLabel.id, baseFontPt)}pt`,
-                                          fontFamily: "system-ui, -apple-system, 'Cairo', sans-serif",
-                                          fontVariantNumeric: 'tabular-nums',
-                                          letterSpacing: splitMetrics.hasQrSide ? '0px' : '-0.2px',
-                                          lineHeight: 1
-                                        }}
-                                      >
-                                        {showPrintLabel.id}
-                                      </div>
+                                      splitMetrics.hasQrSide ? (() => {
+                                        const spec = getVerticalOrderIdSvgSpec(showPrintLabel.id, splitMetrics);
+                                        return (
+                                          <svg
+                                            xmlns="http://www.w3.org/2000/svg"
+                                            width={`${spec.widthMm}mm`}
+                                            height={`${spec.heightMm}mm`}
+                                            viewBox={`0 0 ${spec.viewBoxWidth} ${spec.viewBoxHeight}`}
+                                            style={{ width: `${spec.widthMm}mm`, height: `${spec.heightMm}mm`, display: 'block', flexShrink: 0, overflow: 'visible' }}
+                                          >
+                                            <text
+                                              x={spec.cx}
+                                              y={spec.cy}
+                                              dy={spec.dyUnits}
+                                              transform={`rotate(90 ${spec.cx} ${spec.cy})`}
+                                              textAnchor="middle"
+                                              textLength={spec.textLengthUnits}
+                                              lengthAdjust={spec.textLengthUnits ? 'spacingAndGlyphs' : undefined}
+                                              fill="#000000"
+                                              fontFamily="system-ui, -apple-system, 'Cairo', Arial, sans-serif"
+                                              fontSize={spec.fontSizeUnits}
+                                              fontWeight={900}
+                                              style={{ fontVariantNumeric: 'tabular-nums' }}
+                                            >
+                                              {spec.code}
+                                            </text>
+                                          </svg>
+                                        );
+                                      })() : (
+                                        <div
+                                          dir="ltr"
+                                          className="max-w-full whitespace-nowrap font-black text-black tabular-nums"
+                                          style={{
+                                            fontSize: `${splitMetrics.getCodeFontPt(showPrintLabel.id, baseFontPt)}pt`,
+                                            fontFamily: "system-ui, -apple-system, 'Cairo', sans-serif",
+                                            fontVariantNumeric: 'tabular-nums',
+                                            letterSpacing: '-0.2px',
+                                            lineHeight: 1
+                                          }}
+                                        >
+                                          {showPrintLabel.id}
+                                        </div>
+                                      )
                                     )}
 
                                     {el.id === 'custom_text' && (

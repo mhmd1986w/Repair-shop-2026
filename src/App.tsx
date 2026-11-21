@@ -34,6 +34,8 @@ import {
   buildCustomerId,
   normalizeCustomerNameKey,
   phonesMatch,
+  resolveScannedOrderFromRecords,
+  resolveScannedOrderId,
 } from './utils/customerBarcode';
 
 // Import Lucide Icons
@@ -93,6 +95,8 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [scannedOrderId, setScannedOrderId] = useState<string | null>(null);
   const [isScannerOpen, setIsScannerOpen] = useState(false);
+  const [dashboardSearchTerm, setDashboardSearchTerm] = useState<string>('');
+  const [contactsSearchTerm, setContactsSearchTerm] = useState<string>('');
   const [ordersSearchTerm, setOrdersSearchTerm] = useState<string>('');
   const [ordersStatusFilter, setOrdersStatusFilter] = useState<string>('');
   const [openAddOrderModal, setOpenAddOrderModal] = useState<boolean>(false);
@@ -611,7 +615,7 @@ export default function App() {
         const rawLookup = (sp.get('customer') || sp.get('track') || sp.get('tracking') || sp.get('id') || '').trim().toUpperCase();
         if (rawLookup) {
           const matchedCust = reconciled.customers.find(
-            (c) => c.customerBarcode.trim().toUpperCase() === rawLookup
+            (c) => (c.customerBarcode || '').trim().toUpperCase() === rawLookup
           );
           if (matchedCust) {
             setSelectedCustomerProfile({ name: matchedCust.name, phone: matchedCust.phone, customer: matchedCust });
@@ -623,12 +627,15 @@ export default function App() {
       const storedTemplates = localStorage.getItem('db_templates');
       if (storedTemplates) {
         try {
-          let loaded = JSON.parse(storedTemplates);
+          const parsedTemplates = JSON.parse(storedTemplates);
+          if (!Array.isArray(parsedTemplates)) throw new Error('Invalid db_templates format');
+          let loaded = parsedTemplates;
           let needsUpdate = false;
           loaded = loaded.map((t: any) => {
-            const defaultTpl = DEFAULT_TEMPLATES.find(d => d.id === t.id);
+            const defaultTpl = DEFAULT_TEMPLATES.find(d => d.id === t?.id);
             if (defaultTpl && (t.id === 'received' || t.id === 'ready' || t.id === 'unrepairable' || t.id === 'reminder')) {
-              const hasWarning = t.whatsappContent.includes('14') || t.whatsappContent.includes('١٤');
+              const content = String(t.whatsappContent || '');
+              const hasWarning = content.includes('14') || content.includes('١٤');
               if (!hasWarning) {
                 needsUpdate = true;
                 return {
@@ -642,7 +649,7 @@ export default function App() {
           
           // Merge missing defaults (e.g. new overdue_48h template)
           DEFAULT_TEMPLATES.forEach(defaultTpl => {
-            if (!loaded.find((t: any) => t.id === defaultTpl.id)) {
+            if (!loaded.find((t: any) => t?.id === defaultTpl.id)) {
               loaded.push(defaultTpl);
               needsUpdate = true;
             }
@@ -2083,6 +2090,8 @@ export default function App() {
                       onSendWhatsAppReminder={handleSendWhatsAppReminder}
                       overdueOrders={getOverdueMaintenanceOrders()}
                       onScanClick={() => setIsScannerOpen(true)}
+                      initialSearchTerm={dashboardSearchTerm}
+                      onClearInitialSearch={() => setDashboardSearchTerm('')}
                       onViewCustomer={(name, phone) => openCustomerProfile(name, phone)}
                       canAddOrder={currentUser?.permissions ? currentUser.permissions.add_orders : true}
                       onAddOrderClick={() => {
@@ -2178,6 +2187,8 @@ export default function App() {
                       onSaveCustomer={handleSaveCustomer}
                       onDeleteCustomer={handleDeleteCustomer}
                       onScanClick={() => setIsScannerOpen(true)}
+                      initialSearchTerm={contactsSearchTerm}
+                      onClearInitialSearch={() => setContactsSearchTerm('')}
                       currentUser={currentUser}
                       onClearNames={handleClearNames}
                       onViewCustomer={(name, phone, customer) => openCustomerProfile(name, phone, customer)}
@@ -2223,7 +2234,10 @@ export default function App() {
                         const storedTemplates = localStorage.getItem('db_templates');
                         if (storedTemplates) {
                           try {
-                            setTemplates(JSON.parse(storedTemplates));
+                            const parsedTemplates = JSON.parse(storedTemplates);
+                            if (Array.isArray(parsedTemplates)) {
+                              setTemplates(parsedTemplates);
+                            }
                           } catch (e) {
                             console.error("Error reloading templates in onSettingsSaved:", e);
                           }
@@ -2252,61 +2266,32 @@ export default function App() {
           onClose={() => setIsScannerOpen(false)}
           customers={customers}
           orders={orders}
-          onOpenCustomerProfile={(cust) => {
-            setIsScannerOpen(false);
-            openCustomerProfile(cust.name, cust.phone, cust);
-          }}
-          onSelectOrder={(foundOrder) => {
-            setIsScannerOpen(false);
-            const isCompleted =
-              foundOrder.status === DeviceStatus.DELIVERED ||
-              foundOrder.status === DeviceStatus.UNREPAIRABLE;
-            setScannedOrderId(foundOrder.id);
-            setOrdersSearchTerm(foundOrder.id);
-            setActiveTab(isCompleted ? 'completed' : 'orders');
-          }}
-          onNewOrderForCustomer={(cust) => {
-            setIsScannerOpen(false);
-            setPrefillCustomerForAdd({ name: cust.name, phone: cust.phone });
-            setOrdersSearchTerm('');
-            setOrdersStatusFilter('all');
-            setOpenAddOrderModal(true);
-            setActiveTab('orders');
-          }}
-          onAssignBarcodeToCustomer={handleAssignBarcodeToCustomer}
-          onRegisterCustomerWithBarcode={handleRegisterCustomerWithBarcode}
           onScan={(result) => {
             setIsScannerOpen(false);
-            const scannedId = extractScannedBarcodeId(result);
-            if (!scannedId) return;
+            const foundOrder = resolveScannedOrderFromRecords(result, orders, customers);
+            const orderId = foundOrder?.id || resolveScannedOrderId(result, orders, customers);
+            if (!orderId) return;
 
-            const matchedCustomer = customers.find(
-              c =>
-                c.customerBarcode.trim().toUpperCase() === scannedId ||
-                phonesMatch(c.phone, scannedId)
-            );
-            if (matchedCustomer) {
-              openCustomerProfile(matchedCustomer.name, matchedCustomer.phone, matchedCustomer);
+            setScannedOrderId(orderId);
+
+            if (activeTab === 'dashboard') {
+              setDashboardSearchTerm(orderId);
               return;
             }
 
-            const foundOrder = orders.find(
-              o =>
-                o.id.toUpperCase() === scannedId ||
-                (o.serialNumber && o.serialNumber.toUpperCase() === scannedId) ||
-                (o.deviceBarcode && o.deviceBarcode.toUpperCase() === scannedId) ||
-                phonesMatch(o.customerPhone, scannedId)
-            );
+            if (activeTab === 'contacts') {
+              setContactsSearchTerm(orderId);
+              return;
+            }
 
-            setScannedOrderId(scannedId);
+            setOrdersStatusFilter('all');
+            setOrdersSearchTerm(orderId);
             if (foundOrder) {
               const isCompleted =
                 foundOrder.status === DeviceStatus.DELIVERED ||
                 foundOrder.status === DeviceStatus.UNREPAIRABLE;
-              setOrdersSearchTerm(foundOrder.id);
               setActiveTab(isCompleted ? 'completed' : 'orders');
-            } else {
-              setOrdersSearchTerm(scannedId);
+            } else if (activeTab !== 'orders' && activeTab !== 'completed') {
               setActiveTab('orders');
             }
           }}

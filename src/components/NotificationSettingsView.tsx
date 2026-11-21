@@ -24,6 +24,7 @@ import {
   getLabelContainerStyles,
   getLabelElementMetrics,
   getSplitThermalLabelMetrics,
+  getVerticalOrderIdSvgSpec,
   FIXED_LABEL_PAPER_SIZE
 } from '../utils/labelDesigner';
 import { printPureContent, printHtmlViaIframe } from '../lib/printUtils';
@@ -1046,6 +1047,8 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
           text-align: ${styles.textAlign} !important;
           font-family: ${styles.fontFamilyCss} !important;
           box-sizing: border-box !important;
+          border: none !important;
+          box-shadow: none !important;
           overflow: hidden !important;
           background: white !important;
           color: black !important;
@@ -1957,7 +1960,10 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
     const saved = localStorage.getItem('maintenance_printers');
     if (saved) {
       try {
-        setPrinters(JSON.parse(saved));
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) {
+          setPrinters(parsed);
+        }
       } catch (e) {
         console.error(e);
       }
@@ -3828,7 +3834,7 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
                           <div
                             id="test-label-print-modal"
                             dir="rtl"
-                            className="bg-white text-black rounded-sm border border-gray-300 overflow-hidden flex select-none"
+                            className="bg-white text-black rounded-sm ring-1 ring-gray-300 overflow-hidden flex select-none"
                             style={{
                               position: 'absolute',
                               top: 0,
@@ -3866,14 +3872,21 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
                                 return (
                                   <div
                                     key={el.id}
-                                    className={splitMetrics.hasQrSide ? 'max-h-full' : 'w-fit max-w-full'}
-                                    style={splitMetrics.hasQrSide ? {
+                                    className={splitMetrics.hasQrSide ? (el.id === 'barcode' ? 'h-full flex items-center justify-center shrink-0' : 'max-h-full') : 'w-fit max-w-full'}
+                                    style={splitMetrics.hasQrSide ? (el.id === 'barcode' ? {
+                                      margin: 0,
+                                      height: '100%',
+                                      display: 'flex',
+                                      alignItems: 'center',
+                                      justifyContent: 'center',
+                                      boxSizing: 'border-box',
+                                    } : {
                                       writingMode: 'vertical-rl',
                                       textOrientation: 'mixed',
                                       margin: 0,
                                       textAlign: 'center',
                                       boxSizing: 'border-box',
-                                    } : {
+                                    }) : {
                                       marginTop: `${mTopMm}mm`,
                                       marginBottom: `${mBotMm}mm`,
                                       textAlign: containerStyles.textAlign,
@@ -3907,9 +3920,39 @@ export const NotificationSettingsView: React.FC<NotificationSettingsViewProps> =
                                       </div>
                                     )}
                                     {el.id === 'barcode' && (
-                                      <div dir="ltr" className={`${splitMetrics.hasQrSide ? 'max-h-full whitespace-nowrap overflow-hidden' : 'max-w-full whitespace-nowrap'} font-black text-black tabular-nums`} style={{ fontSize: `${splitMetrics.hasQrSide ? splitMetrics.getVerticalCodeFontPt(currentLiveBarcode) : splitMetrics.getCodeFontPt(currentLiveBarcode, baseFontPt)}pt`, fontFamily: "system-ui, -apple-system, 'Cairo', sans-serif", fontVariantNumeric: 'tabular-nums', letterSpacing: splitMetrics.hasQrSide ? '0px' : '-0.2px', lineHeight: 1 }}>
-                                        {currentLiveBarcode}
-                                      </div>
+                                      splitMetrics.hasQrSide ? (() => {
+                                        const spec = getVerticalOrderIdSvgSpec(currentLiveBarcode, splitMetrics);
+                                        return (
+                                          <svg
+                                            xmlns="http://www.w3.org/2000/svg"
+                                            width={`${spec.widthMm}mm`}
+                                            height={`${spec.heightMm}mm`}
+                                            viewBox={`0 0 ${spec.viewBoxWidth} ${spec.viewBoxHeight}`}
+                                            style={{ width: `${spec.widthMm}mm`, height: `${spec.heightMm}mm`, display: 'block', flexShrink: 0, overflow: 'visible' }}
+                                          >
+                                            <text
+                                              x={spec.cx}
+                                              y={spec.cy}
+                                              dy={spec.dyUnits}
+                                              transform={`rotate(90 ${spec.cx} ${spec.cy})`}
+                                              textAnchor="middle"
+                                              textLength={spec.textLengthUnits}
+                                              lengthAdjust={spec.textLengthUnits ? 'spacingAndGlyphs' : undefined}
+                                              fill="#000000"
+                                              fontFamily="system-ui, -apple-system, 'Cairo', Arial, sans-serif"
+                                              fontSize={spec.fontSizeUnits}
+                                              fontWeight={900}
+                                              style={{ fontVariantNumeric: 'tabular-nums' }}
+                                            >
+                                              {spec.code}
+                                            </text>
+                                          </svg>
+                                        );
+                                      })() : (
+                                        <div dir="ltr" className="max-w-full whitespace-nowrap font-black text-black tabular-nums" style={{ fontSize: `${splitMetrics.getCodeFontPt(currentLiveBarcode, baseFontPt)}pt`, fontFamily: "system-ui, -apple-system, 'Cairo', sans-serif", fontVariantNumeric: 'tabular-nums', letterSpacing: '-0.2px', lineHeight: 1 }}>
+                                          {currentLiveBarcode}
+                                        </div>
+                                      )
                                     )}
                                     {el.id === 'custom_text' && (
                                       <div dir="auto" className={`${splitMetrics.hasQrSide ? 'max-h-full whitespace-nowrap overflow-hidden text-ellipsis' : 'max-w-full break-words'} text-black`} style={{ fontSize: `${splitMetrics.hasQrSide ? splitMetrics.getVerticalInfoFontPt(el.customContent || 'يرجى إبراز هذا الملصق عند الاستلام') : baseFontPt}pt`, fontWeight: el.bold ? 700 : 500, lineHeight: splitMetrics.hasQrSide ? 1 : splitMetrics.effectiveLineSpacing, textAlign: splitMetrics.hasQrSide ? 'center' : containerStyles.textAlign }}>

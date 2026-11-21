@@ -232,7 +232,14 @@ function createHighContrastCanvas(source: HTMLCanvasElement): HTMLCanvasElement 
 
 function normalizeDecodedResult(raw: string): string | null {
   if (!raw || !raw.trim()) return null;
-  return extractScannedBarcodeId(raw) || raw.trim();
+  const trimmed = raw.trim();
+  if (
+    /[\r\n]/.test(trimmed) ||
+    /(?:اسم العميل|الاسم|رقم الموبايل|رقم الهاتف|الهاتف|العطل|تاريخ الاستلام|التكلفة|ملف الزبون)\s*[:：\-]/i.test(trimmed)
+  ) {
+    return trimmed;
+  }
+  return extractScannedBarcodeId(trimmed) || trimmed;
 }
 
 export interface DecodeCanvasOptions {

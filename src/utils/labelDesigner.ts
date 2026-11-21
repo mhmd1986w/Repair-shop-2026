@@ -121,26 +121,37 @@ export function getDefaultLabelLayout(): LabelLayoutConfig {
 }
 
 export function getStoredLabelLayout(): LabelLayoutConfig {
-  if (localStorage.getItem('lblPaperSize') !== FIXED_LABEL_PAPER_SIZE) {
-    localStorage.setItem('lblPaperSize', FIXED_LABEL_PAPER_SIZE);
+  try {
+    if (localStorage.getItem('lblPaperSize') !== FIXED_LABEL_PAPER_SIZE) {
+      localStorage.setItem('lblPaperSize', FIXED_LABEL_PAPER_SIZE);
+    }
+  } catch {
+    // ignore storage write failures
   }
-  const saved = localStorage.getItem('label_layout_config');
+  let saved: string | null = null;
+  try {
+    saved = localStorage.getItem('label_layout_config');
+  } catch {
+    saved = null;
+  }
   if (saved) {
     try {
       const parsed: LabelLayoutConfig = JSON.parse(saved);
-      // Ensure all default elements exist in parsed config (in case new elements were added)
-      const existingIds = new Set(parsed.elements.map(e => e.id));
-      const missing = DEFAULT_LABEL_ELEMENTS.filter(d => !existingIds.has(d.id));
-      if (missing.length > 0) {
-        parsed.elements = [...parsed.elements, ...missing];
+      if (parsed && Array.isArray(parsed.elements)) {
+        // Ensure all default elements exist in parsed config (in case new elements were added)
+        const existingIds = new Set(parsed.elements.map(e => e.id));
+        const missing = DEFAULT_LABEL_ELEMENTS.filter(d => !existingIds.has(d.id));
+        if (missing.length > 0) {
+          parsed.elements = [...parsed.elements, ...missing];
+        }
+        parsed.paperSize = FIXED_LABEL_PAPER_SIZE;
+        parsed.elements = parsed.elements.map(el => ({
+          ...el,
+          fontSize: el.fontSize !== undefined ? Math.max(10, Math.min(99, el.fontSize)) : undefined,
+          height: el.height !== undefined ? Math.max(10, Math.min(99, el.height)) : undefined,
+        }));
+        return parsed;
       }
-      parsed.paperSize = FIXED_LABEL_PAPER_SIZE;
-      parsed.elements = parsed.elements.map(el => ({
-        ...el,
-        fontSize: el.fontSize !== undefined ? Math.max(10, Math.min(99, el.fontSize)) : undefined,
-        height: el.height !== undefined ? Math.max(10, Math.min(99, el.height)) : undefined,
-      }));
-      return parsed;
     } catch (e) {
       console.error('Failed to parse label_layout_config', e);
     }
@@ -456,6 +467,7 @@ export interface SplitThermalLabelMetrics {
   splitQrSizeMm: number | undefined;
   compactFontPt: number | undefined;
   verticalColGapMm: number;
+  verticalCodeColWidthMm: number;
   getCenterNameFontPt: (centerName: string, baseFontPt: number) => number;
   getCenterMobileFontPt: (mobile: string, baseFontPt: number) => number;
   getCodeFontPt: (code: string, baseFontPt: number) => number;
@@ -537,11 +549,36 @@ export function getSplitThermalLabelMetrics(
   const heightBudgetPt = effectiveInnerHeightMm / 0.352778;
   const colDensityScale = textLinesCount <= 3 ? 1 : 3 / textLinesCount;
 
-  const fitLengthPt = (len: number, idealPt: number, minPt: number, charAspect = 0.62) => {
+  const fitLengthPt = (
+    len: number,
+    idealPt: number,
+    minPt: number,
+    charAspect = 0.62,
+    heightFillRatio = 0.92
+  ) => {
     const safeLen = Math.max(1, len);
-    const maxForHeight = (heightBudgetPt * 0.96) / (safeLen * charAspect);
+    const maxForHeight = (heightBudgetPt * heightFillRatio) / (safeLen * charAspect);
     return Number(Math.max(minPt, Math.min(idealPt, maxForHeight)).toFixed(1));
   };
+
+  const measureCodeWeightedLen = (code: string): number => {
+    const clean = String(code || '').trim();
+    if (!clean) return 1;
+    let total = 0;
+    for (const ch of clean) {
+      if (/[A-Z]/.test(ch)) total += 1.06;
+      else if (/[0-9]/.test(ch)) total += 1.0;
+      else if (/[\-_./]/.test(ch)) total += 0.55;
+      else total += 0.9;
+    }
+    return Math.max(1, total);
+  };
+
+  const widthBudgetPt = effectiveInnerWidthMm / 0.352778;
+  const usableColWidthMm = usableColWidthPt * 0.352778;
+  const verticalCodeColWidthMm = Number(
+    Math.max(2.1, Math.min(3.2, usableColWidthMm * (textLinesCount <= 3 ? 0.275 : 0.9 / textLinesCount))).toFixed(2)
+  );
 
   return {
     hasQrSide,
@@ -556,6 +593,7 @@ export function getSplitThermalLabelMetrics(
     splitQrSizeMm,
     compactFontPt,
     verticalColGapMm,
+    verticalCodeColWidthMm,
     getCenterNameFontPt: (centerName: string, baseFontPt: number) => {
       const cleanName = String(centerName || '').trim();
       if (isNarrowWidth) {
@@ -578,38 +616,120 @@ export function getSplitThermalLabelMetrics(
     },
     getCodeFontPt: (code: string, baseFontPt: number) => {
       const cleanCode = String(code || '').trim();
-      if (isNarrowWidth) {
-        return cleanCode.length <= 11 ? 5.6 : cleanCode.length <= 13 ? 4.8 : 4.2;
-      }
-      if (isMediumCompact) {
-        return cleanCode.length <= 11 ? 6.2 : cleanCode.length <= 13 ? 5.1 : 4.5;
-      }
-      return Math.min(baseFontPt, 8.2);
+      const weightedLen = measureCodeWeightedLen(cleanCode);
+      const maxForWidth = (widthBudgetPt * 0.9) / (weightedLen * 0.72);
+      const baseCap = isNarrowWidth
+        ? (cleanCode.length <= 11 ? 5.6 : cleanCode.length <= 13 ? 4.8 : 4.2)
+        : isMediumCompact
+          ? (cleanCode.length <= 11 ? 6.2 : cleanCode.length <= 13 ? 5.1 : 4.5)
+          : Math.min(baseFontPt, 8.2);
+      return Number(Math.max(3.6, Math.min(baseCap, maxForWidth)).toFixed(1));
     },
     getVerticalCenterNameFontPt: (centerName: string) => {
       const clean = String(centerName || '').trim();
       const maxWidthShare = usableColWidthPt * 0.43;
       const ideal = Math.min(maxWidthShare, 15.0 * colDensityScale);
-      return fitLengthPt(clean.length, Math.max(7.0, ideal), 5.0, 0.72);
+      return fitLengthPt(clean.length, Math.max(7.0, ideal), 5.0, 0.72, 0.92);
     },
     getVerticalMobileFontPt: (mobile: string) => {
       const clean = String(mobile || '').trim();
       const maxWidthShare = usableColWidthPt * 0.31;
       const ideal = Math.min(maxWidthShare, 11.2 * colDensityScale);
-      return fitLengthPt(clean.length, Math.max(6.0, ideal), 4.8, 0.58);
+      return fitLengthPt(clean.length, Math.max(5.5, ideal), 4.2, 0.68, 0.9);
     },
     getVerticalCodeFontPt: (code: string) => {
-      const clean = String(code || '').trim();
-      const maxWidthShare = usableColWidthPt * 0.26;
-      const ideal = Math.min(maxWidthShare, 8.8 * colDensityScale);
-      return fitLengthPt(clean.length, Math.max(5.5, ideal), 4.5, 0.56);
+      const weightedLen = measureCodeWeightedLen(code);
+      const maxWidthShare = usableColWidthPt * 0.275;
+      const ideal = Math.min(maxWidthShare, 9.2 * colDensityScale);
+      return fitLengthPt(weightedLen, Math.max(5.5, ideal), 3.8, 0.63, 0.97);
     },
     getVerticalInfoFontPt: (text: string) => {
       const clean = String(text || '').trim();
       const maxPerCol = (usableColWidthPt / textLinesCount) * 0.92;
-      return fitLengthPt(clean.length, Math.min(maxPerCol, 7.8), 4.4, 0.54);
+      return fitLengthPt(clean.length, Math.min(maxPerCol, 7.8), 4.2, 0.6, 0.9);
     },
   };
 }
+
+export interface VerticalOrderIdSvgSpec {
+  code: string;
+  widthMm: number;
+  heightMm: number;
+  viewBoxWidth: number;
+  viewBoxHeight: number;
+  cx: number;
+  cy: number;
+  fontSizeUnits: number;
+  dyUnits: number;
+  textLengthUnits?: number;
+}
+
+/**
+ * Computes exact SVG dimensions so the vertical orderId fills the full inner height
+ * of the label column (aligned top-to-bottom with the QR code) without ever overflowing.
+ */
+export function getVerticalOrderIdSvgSpec(
+  code: string,
+  splitMetrics: SplitThermalLabelMetrics
+): VerticalOrderIdSvgSpec {
+  const cleanCode = String(code || '').trim();
+  const heightMm = splitMetrics.effectiveInnerHeightMm;
+  const maxColWidthMm = splitMetrics.verticalCodeColWidthMm;
+  const fontPt = splitMetrics.getVerticalCodeFontPt(cleanCode);
+  const fontMm = fontPt * 0.352778;
+  // Cap height of bold uppercase/digits is ~0.72em; keep column snug around glyph thickness
+  const widthMm = Number(
+    Math.max(2.0, Math.min(maxColWidthMm, Math.max(fontMm * 0.92, maxColWidthMm * 0.88))).toFixed(2)
+  );
+
+  // Use 10 viewBox units per mm for crisp vector precision
+  const viewBoxWidth = Number((widthMm * 10).toFixed(2));
+  const viewBoxHeight = Number((heightMm * 10).toFixed(2));
+  const cx = Number((viewBoxWidth / 2).toFixed(2));
+  const cy = Number((viewBoxHeight / 2).toFixed(2));
+
+  // Ensure glyph cap height fits cleanly inside the column width (leaving tiny side clearance)
+  const maxFontUnitsForCol = (viewBoxWidth * 0.96) / 0.72;
+  const fontSizeUnits = Number(Math.min(fontMm * 10, maxFontUnitsForCol).toFixed(2));
+  const dyUnits = Number((fontSizeUnits * 0.355).toFixed(2));
+
+  // Fill 98% of the column height edge-to-edge without ever overflowing for standard/long IDs
+  const targetFillUnits = Number((viewBoxHeight * 0.98).toFixed(2));
+  const shouldFitToFullHeight = cleanCode.length >= 8;
+
+  return {
+    code: cleanCode,
+    widthMm,
+    heightMm,
+    viewBoxWidth,
+    viewBoxHeight,
+    cx,
+    cy,
+    fontSizeUnits,
+    dyUnits,
+    textLengthUnits: shouldFitToFullHeight ? targetFillUnits : undefined,
+  };
+}
+
+function escapeXmlText(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+export function renderVerticalOrderIdSvg(
+  code: string,
+  splitMetrics: SplitThermalLabelMetrics
+): string {
+  const spec = getVerticalOrderIdSvgSpec(code, splitMetrics);
+  const textLenAttrs = spec.textLengthUnits
+    ? ` textLength="${spec.textLengthUnits}" lengthAdjust="spacingAndGlyphs"`
+    : '';
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${spec.widthMm}mm" height="${spec.heightMm}mm" viewBox="0 0 ${spec.viewBoxWidth} ${spec.viewBoxHeight}" style="width: ${spec.widthMm}mm !important; height: ${spec.heightMm}mm !important; display: block !important; flex-shrink: 0 !important; overflow: visible !important;"><text x="${spec.cx}" y="${spec.cy}" dy="${spec.dyUnits}" transform="rotate(90 ${spec.cx} ${spec.cy})" text-anchor="middle"${textLenAttrs} fill="#000000" font-family="system-ui, -apple-system, 'Cairo', Arial, sans-serif" font-size="${spec.fontSizeUnits}" font-weight="900" style="font-variant-numeric: tabular-nums;">${escapeXmlText(spec.code)}</text></svg>`;
+}
+
 
 

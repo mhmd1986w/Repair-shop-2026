@@ -37,6 +37,7 @@ import {
   getLabelContainerStyles,
   getLabelElementMetrics,
   getSplitThermalLabelMetrics,
+  renderVerticalOrderIdSvg,
   FIXED_LABEL_PAPER_SIZE
 } from '../utils/labelDesigner';
 import { buildTrackingUrl, getEffectiveAppUrl } from '../utils/appDomain';
@@ -147,7 +148,7 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
       if (isContactOrder(o)) return false;
       if (resolvedCustomer) {
         if (o.customerId && o.customerId === resolvedCustomer.id) return true;
-        if (o.customerBarcode && o.customerBarcode.toUpperCase() === resolvedCustomer.customerBarcode.toUpperCase()) return true;
+        if (o.customerBarcode && resolvedCustomer.customerBarcode && o.customerBarcode.toUpperCase() === resolvedCustomer.customerBarcode.toUpperCase()) return true;
       }
       const orderPhone = (o.customerPhone || '').replace(/[\s-+]/g, '');
       const orderName = (o.customerName || '').trim().toLowerCase();
@@ -673,10 +674,11 @@ export const CustomerProfileModal: React.FC<CustomerProfileModalProps> = ({
           return `<div class="order-date" dir="auto" style="${baseItemStyle} font-size: ${fPt}pt !important; font-weight: ${el.bold ? 700 : 400} !important;">${txt}</div>`;
         }
         case 'barcode': {
-          const codeFontPt = hasQrSide
-            ? splitMetrics.getVerticalCodeFontPt(order.id)
-            : splitMetrics.getCodeFontPt(order.id, fontPt);
-          return `<div class="barcode-code-text" dir="ltr" style="${baseItemStyle} text-overflow: clip !important; font-size: ${codeFontPt}pt !important; font-family: system-ui, -apple-system, 'Cairo', sans-serif !important; font-variant-numeric: tabular-nums !important; font-weight: 900 !important; letter-spacing: ${hasQrSide ? '0px' : '-0.2px'} !important; direction: ltr !important; line-height: 1 !important;">${order.id}</div>`;
+          if (hasQrSide) {
+            return `<div class="barcode-code-text" dir="ltr" style="margin: 0 !important; padding: 0 !important; height: 100% !important; display: flex !important; align-items: center !important; justify-content: center !important; flex: 0 0 auto !important; overflow: visible !important;">${renderVerticalOrderIdSvg(order.id, splitMetrics)}</div>`;
+          }
+          const codeFontPt = splitMetrics.getCodeFontPt(order.id, fontPt);
+          return `<div class="barcode-code-text" dir="ltr" style="${baseItemStyle} overflow: visible !important; text-overflow: clip !important; font-size: ${codeFontPt}pt !important; font-family: system-ui, -apple-system, 'Cairo', sans-serif !important; font-variant-numeric: tabular-nums !important; font-weight: 900 !important; letter-spacing: -0.2px !important; direction: ltr !important; line-height: 1 !important;">${order.id}</div>`;
         }
         case 'custom_text': {
           const txt = el.customContent || 'يرجى إبراز هذا الملصق عند الاستلام';
